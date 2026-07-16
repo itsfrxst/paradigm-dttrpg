@@ -1,6 +1,13 @@
-import React, { useState, useEffect, useCallback, useRef } from 'react';
+import React, { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
 
 const SIZE = 9;
+
+// Battle-row layout: reserved minimum width for each side panel (stats /
+// combat log) and the grid column's own horizontal padding, used to size the
+// grid square so it never grows wider than the space actually left for it.
+const SIDE_PANEL_MIN_WIDTH = 260;
+const MID_COL_H_PADDING = 24; // matches the middle column's `padding:'0 12px'`
+const GRID_MIN_SIZE = 240;
 
 const TILE_TYPES = {
   NORMAL:'normal', FIRE_BOOST:'fire_boost', WATER_BOOST:'water_boost',
@@ -316,6 +323,20 @@ const getFlankBonus = (atk,def,defFacing) => {
   return {bonus:0,label:''};
 };
 
+// Flat damage bonus for standing on the boost tile matching the base element
+// being cast (Fire/Water/Earth/Air only — fusions don't have a dedicated tile).
+// Advertised on TILE_LEGEND as "+20 dmg" but previously never wired up.
+const TILE_BOOST_DMG = 20;
+const getTileBoost = (tiles, pos, elementName) => {
+  const key = `${elementName.toLowerCase()}_boost`;
+  return tiles?.[pos.y]?.[pos.x] === key ? TILE_BOOST_DMG : 0;
+};
+
+// Damage floor for Earth and Air base skills: a landed hit always deals at
+// least this much, even on the worst roll + quarter accuracy. Fixes Earth's
+// low output and Air's tendency to fizzle to 0 when roll <= range.
+const RANGED_SKILL_MIN_DMG = 40;
+
 // The four tiles orthogonally adjacent to `def`, each tagged with the attack
 // bonus an attacker standing there would earn against the given facing, and
 // whether the tile is on-grid and unoccupied. Used by smarter enemy AI to pick
@@ -356,7 +377,7 @@ const pickApproachTile = (enemyPos, def, defFacing, tier, blockers) => {
 
 const makeCharacter = (name,hp,level,agi,ap,pos,element,elementCategory) => ({
   name,level,agi,health:hp,maxHealth:hp,actionpts:ap,boardPosition:pos,
-  playerXp:0,facing:'down',frozen:0,slowed:false,skillUsed:false,
+  playerXp:0,facing:'down',frozen:0,slowed:false,skillUsed:false,rotateUsed:false,
   element:element||null,elementCategory:elementCategory||null,energyRollover:0,
 });
 
@@ -741,7 +762,7 @@ const ElementPickerModal = ({selectedCategory,selectedElement,onSelect,onClose})
   );
 };
 
-const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedElement,onElementSelect,canAttack,canSkill,onMelee,onSkill,onEndTurn,onRollEnergy,energyPhase,onSurrender,enemy,enemyRolledEnergy,isPlayerTurn,playerClass,summons,canMastermind,onMastermind}) => {
+const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedElement,onElementSelect,canAttack,canSkill,onMelee,onSkill,onEndTurn,onRollEnergy,energyPhase,onSurrender,enemy,enemyRolledEnergy,isPlayerTurn,playerClass,summons,canMastermind,onMastermind,canRotate,onRotate}) => {
   const [showPicker,setShowPicker]=useState(false);
   const allEl={...ELEMENTS.base,...ELEMENTS.minor,...ELEMENTS.major};
   const elData=allEl[selectedElement];
@@ -842,6 +863,10 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
               <button onClick={onSkill} disabled={!canSkill}
                 style={{flex:hasSummoner?1:1.2,padding:'7px 4px',background:canSkill?'rgba(200,60,0,0.2)':'rgba(20,30,40,0.6)',border:`1px solid ${canSkill?'#cc3300':'#1e3a4a'}`,borderRadius:'4px',color:canSkill?'#ff6644':'#2a4a5e',fontSize:'11px',fontWeight:600,cursor:canSkill?'pointer':'not-allowed',letterSpacing:'.04em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
                 SKILL<div style={{fontSize:'8px',opacity:0.7}}>{player.skillUsed?'used':`${selectedElement.slice(0,4)}·${skillCost}E`}</div>
+              </button>
+              <button onClick={onRotate} disabled={!canRotate} title="Rotate facing — 0 Energy, once per turn"
+                style={{flex:0.6,padding:'7px 2px',background:canRotate?'rgba(0,200,255,0.12)':'rgba(20,30,40,0.6)',border:`1px solid ${canRotate?'#0090b0':'#1e3a4a'}`,borderRadius:'4px',color:canRotate?'#00c8ff':'#2a4a5e',fontSize:'13px',fontWeight:600,cursor:canRotate?'pointer':'not-allowed',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
+                ⟳<div style={{fontSize:'8px',opacity:0.7}}>{player.rotateUsed?'used':'0E'}</div>
               </button>
               {hasSummoner&&(
                 <button onClick={onMastermind} disabled={!canMastermind}
@@ -1023,7 +1048,9 @@ const FireDiceSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRollAcc
 // Earth Tremor — roll d6, choose range 1–floor(roll/2), accuracy, apply
 const EarthTremorSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRollAccuracy, earthRange, onSetEarthRange, onConfirmEarthRange, onApplyWithAccuracy, elColor, playerFacing}) => {
   const dieRoll  = rolls.length > 0 ? rolls[0].value : null;
-  const maxRange = dieRoll !== null ? Math.floor(dieRoll / 2) : 0;
+  // Always at least 1 tile of range, even on the worst roll (d6=1) — a Tremor
+  // should never be an unusable wasted turn.
+  const maxRange = dieRoll !== null ? Math.max(1, Math.floor(dieRoll / 2)) : 0;
   const baseDmg  = dieRoll !== null ? dieRoll * SKILL_DICE_MULT : null;
   const cost     = earthRange ? 1 + earthRange : null;
 
@@ -1051,31 +1078,23 @@ const EarthTremorSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRoll
                   Facing: <span style={{color:elColor,textTransform:'uppercase'}}>{playerFacing}</span>
                 </span>
               </div>
-              {maxRange === 0 ? (
-                <div style={{fontSize:'12px',color:'#ff4444',textAlign:'center',padding:'8px 0'}}>
-                  Roll too low — minimum 2 needed for any range.
-                </div>
-              ) : (
-                <>
-                  <div style={{fontSize:'11px',color:'#5a7a8a',marginBottom:8}}>
-                    Max range: <span style={{color:elColor,fontWeight:'bold'}}>{maxRange} tile{maxRange>1?'s':''}</span> forward. Choose range (cost = 1 + tiles):
-                  </div>
-                  <div style={{display:'flex',gap:6,flexWrap:'wrap',marginBottom:10}}>
-                    {Array.from({length:maxRange},(_,i)=>i+1).map(r=>(
-                      <button key={r} onClick={()=>onSetEarthRange(r)}
-                        style={{flex:1,padding:'8px 6px',background:earthRange===r?`${elColor}33`:'transparent',border:`1px solid ${earthRange===r?elColor:'#1e3a4a'}`,borderRadius:4,color:earthRange===r?elColor:'#5a7a8a',cursor:'pointer',fontSize:'12px',textAlign:'center',transition:'all 0.15s'}}>
-                        {r} tile{r>1?'s':''}
-                        <div style={{fontSize:'10px',marginTop:2,color:earthRange===r?elColor:'#3a6a8a'}}>{1+r} Energy</div>
-                      </button>
-                    ))}
-                  </div>
-                  {earthRange&&(
-                    <button onClick={onConfirmEarthRange}
-                      style={{width:'100%',padding:11,background:`${elColor}22`,color:elColor,border:`1px solid ${elColor}`,borderRadius:6,fontSize:14,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.08em'}}>
-                      Confirm {earthRange} tile{earthRange>1?'s':''} ({cost} Energy) — Roll Accuracy
-                    </button>
-                  )}
-                </>
+              <div style={{fontSize:'11px',color:'#5a7a8a',marginBottom:8}}>
+                Max range: <span style={{color:elColor,fontWeight:'bold'}}>{maxRange} tile{maxRange>1?'s':''}</span> forward. Choose range (cost = 1 + tiles):
+              </div>
+              <div style={{display:'flex',gap:6,flexWrap:'wrap',marginBottom:10}}>
+                {Array.from({length:maxRange},(_,i)=>i+1).map(r=>(
+                  <button key={r} onClick={()=>onSetEarthRange(r)}
+                    style={{flex:1,padding:'8px 6px',background:earthRange===r?`${elColor}33`:'transparent',border:`1px solid ${earthRange===r?elColor:'#1e3a4a'}`,borderRadius:4,color:earthRange===r?elColor:'#5a7a8a',cursor:'pointer',fontSize:'12px',textAlign:'center',transition:'all 0.15s'}}>
+                    {r} tile{r>1?'s':''}
+                    <div style={{fontSize:'10px',marginTop:2,color:earthRange===r?elColor:'#3a6a8a'}}>{1+r} Energy</div>
+                  </button>
+                ))}
+              </div>
+              {earthRange&&(
+                <button onClick={onConfirmEarthRange}
+                  style={{width:'100%',padding:11,background:`${elColor}22`,color:elColor,border:`1px solid ${elColor}`,borderRadius:6,fontSize:14,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.08em'}}>
+                  Confirm {earthRange} tile{earthRange>1?'s':''} ({cost} Energy) — Roll Accuracy
+                </button>
               )}
             </div>
           )}
@@ -1089,7 +1108,7 @@ const EarthTremorSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRoll
               Tremor: <span style={{color:elColor}}>{earthRange} tile{earthRange>1?'s':''} forward</span> — <span style={{color:elColor}}>{baseDmg} dmg</span> per hit
             </div>
             <div style={{fontSize:'11px',color:'#5a7a8a',marginBottom:2}}>Cost: <span style={{color:'#ffd700'}}>{cost} Energy</span></div>
-            <div style={{fontSize:'11px',color:'#5a7a8a'}}>Roll d100. ≥79 full · 40–78 half · under 40 quarter</div>
+            <div style={{fontSize:'11px',color:'#5a7a8a'}}>Roll d100. ≥79 full · 40–78 half · under 40 quarter · min {RANGED_SKILL_MIN_DMG} dmg on hit</div>
           </div>
           <div style={{display:'flex',justifyContent:'center',marginBottom:16}}>
             <DiceDisplay type="d100" value={accuracyRoll!==null?accuracyRoll:'--'} rolling={rolling} color="#ffd700" />
@@ -1098,7 +1117,7 @@ const EarthTremorSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRoll
             <div style={{textAlign:'center',marginBottom:14}}>
               <div style={{fontSize:22,fontWeight:'bold',color:'#ffd700'}}>{accuracyRoll}%</div>
               <div style={{fontSize:13,color:'#b0dff4',marginTop:4}}>
-                {baseDmg} → <strong style={{color:elColor}}>{applyAccuracy(baseDmg,accuracyRoll)} dmg</strong> ({accuracyTierLabel(accuracyRoll)})
+                {baseDmg} → <strong style={{color:elColor}}>{Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(baseDmg,accuracyRoll))} dmg</strong> ({accuracyTierLabel(accuracyRoll)})
                 <span style={{fontSize:'11px',color:'#5a7a8a',marginLeft:6}}>(if enemy in range)</span>
               </div>
             </div>
@@ -1180,13 +1199,13 @@ const AirGaleForceSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRol
               <span style={{color:'#3a6a8a'}}>base dmg</span>
             </div>
             {baseDmg===0&&(
-              <div style={{fontSize:'11px',color:'#ff6644',marginTop:4}}>
-                Roll did not exceed range — gust collapses. 2 Energy still spent.
+              <div style={{fontSize:'11px',color:'#ffaa44',marginTop:4}}>
+                Roll didn't exceed range — floors to a guaranteed {RANGED_SKILL_MIN_DMG} dmg on hit, still knocks back.
               </div>
             )}
             {baseDmg>0&&(
               <div style={{fontSize:'11px',color:'#5a7a8a',marginTop:4}}>
-                Hit knocks enemy back 1 tile (if space is clear).
+                Hit knocks enemy back 1 tile (if space is clear). Minimum {RANGED_SKILL_MIN_DMG} dmg guaranteed.
               </div>
             )}
           </div>
@@ -1201,9 +1220,9 @@ const AirGaleForceSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRol
         <>
           <div style={{textAlign:'center',marginBottom:14}}>
             <div style={{fontSize:13,color:'#7a9db5',marginBottom:4}}>
-              Gale Force: range <span style={{color:elColor}}>{airRange}</span>, d8={dieRoll} — <span style={{color:baseDmg>0?elColor:'#ff6644'}}>{baseDmg} base dmg</span>
+              Gale Force: range <span style={{color:elColor}}>{airRange}</span>, d8={dieRoll} — <span style={{color:baseDmg>0?elColor:'#ffaa44'}}>{baseDmg} base dmg</span>
             </div>
-            <div style={{fontSize:'11px',color:'#5a7a8a'}}>Roll d100. ≥79 full · 40–78 half · under 40 quarter</div>
+            <div style={{fontSize:'11px',color:'#5a7a8a'}}>Roll d100. ≥79 full · 40–78 half · under 40 quarter · min {RANGED_SKILL_MIN_DMG} dmg on hit</div>
           </div>
           <div style={{display:'flex',justifyContent:'center',marginBottom:16}}>
             <DiceDisplay type="d100" value={accuracyRoll!==null?accuracyRoll:'--'} rolling={rolling} color="#ffd700" />
@@ -1211,21 +1230,16 @@ const AirGaleForceSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRol
           {accuracyRoll!==null&&!rolling&&(
             <div style={{textAlign:'center',marginBottom:14}}>
               <div style={{fontSize:22,fontWeight:'bold',color:'#ffd700'}}>{accuracyRoll}%</div>
-              {baseDmg>0&&(
-                <div style={{fontSize:13,color:'#b0dff4',marginTop:4}}>
-                  {baseDmg} → <strong style={{color:elColor}}>{applyAccuracy(baseDmg,accuracyRoll)} dmg</strong> ({accuracyTierLabel(accuracyRoll)})
-                  <span style={{fontSize:'11px',color:'#5a7a8a',marginLeft:6}}> + knockback</span>
-                </div>
-              )}
-              {baseDmg===0&&(
-                <div style={{fontSize:'12px',color:'#ff6644',marginTop:4}}>No damage — gust fizzles on impact.</div>
-              )}
+              <div style={{fontSize:13,color:'#b0dff4',marginTop:4}}>
+                {baseDmg} → <strong style={{color:elColor}}>{Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(baseDmg,accuracyRoll))} dmg</strong> ({accuracyTierLabel(accuracyRoll)})
+                <span style={{fontSize:'11px',color:'#5a7a8a',marginLeft:6}}> + knockback</span>
+              </div>
             </div>
           )}
           {accuracyRoll===null
             ?<button onClick={onRollAccuracy} disabled={rolling} style={{width:'100%',padding:14,background:'#ffd70022',color:'#ffd700',border:'1px solid #ffd700',borderRadius:6,fontSize:16,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.1em'}}>Roll Accuracy (d100)</button>
             :<button onClick={()=>onApplyWithAccuracy(accuracyRoll)} style={{width:'100%',padding:14,background:`${elColor}22`,color:elColor,border:`1px solid ${elColor}`,borderRadius:6,fontSize:16,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.1em'}}>
-              {baseDmg>0?'Strike + Knockback':'Release Gust'}
+              Strike + Knockback
             </button>
           }
         </>
@@ -1518,6 +1532,15 @@ export default function GridBattlerGame() {
   const [awaitingPlacement, setAwaitingPlacement] = useState(false);
   // Direct (Compass Slash) targeting state: when true, grid clicks pick a target.
   const [compassTargeting, setCompassTargeting] = useState(false);
+  // Rotate: once-per-turn, 0-cost facing change. True while the direction
+  // picker banner is open.
+  const [rotateTargeting, setRotateTargeting] = useState(false);
+  // Grid square sizing — measured from the battle row so it's capped by
+  // whichever is smaller, available width or available height (see the
+  // ResizeObserver effect below).
+  const battleRowRef = useRef(null);
+  const gridSlotRef = useRef(null);
+  const [gridSize, setGridSize] = useState(480);
   // ── Player-directed summon-command sub-phase (A) ──
   const [summonPhaseActive, setSummonPhaseActive] = useState(false);
   const [selectedSummonId,  setSelectedSummonId]  = useState(null);
@@ -1539,6 +1562,9 @@ export default function GridBattlerGame() {
   // Mastermind: available to a Summoner during the act phase, once per turn,
   // if at least 2 Energy is available (fixed activation cost).
   const canMastermind = playerClass==='Summoner' && isPlayerTurn && energyPhase==='act' && !player.skillUsed && player.actionpts >= 2;
+  // Rotate: 0 Energy, once per turn — a free facing change for tactical
+  // repositioning (evade a flank, line up a ranged skill) without spending AP.
+  const canRotate = isPlayerTurn && energyPhase==='act' && !player.rotateUsed;
 
   const showReward = useCallback((html,ms)=>{
     setReward({show:true,html});
@@ -1666,7 +1692,7 @@ export default function GridBattlerGame() {
     setDiceRolls([]); setAbilities([]); setDicePhase('roll');
     setAccuracyRoll(null); setPendingAbility(null); setAirRange(null); setEarthRange(null); setWaterAoe(null);
     addLog(`=== Round ${nextRound} ===`);
-    const rP = { ...latestPlayer, actionpts:0, frozen:latestPlayer.frozen||0, skillUsed:false };
+    const rP = { ...latestPlayer, actionpts:0, frozen:latestPlayer.frozen||0, skillUsed:false, rotateUsed:false };
     const rE = { ...latestEnemy,  actionpts:0, frozen:latestEnemy.frozen||0, skillUsed:false,
       energyRollover: (latestEnemy.energyRollover||0) + (latestEnemy.actionpts||0) };
     setPlayer(rP);
@@ -1771,24 +1797,22 @@ export default function GridBattlerGame() {
           dmg=applyAccuracy(base,acc);
           const flank=getFlankBonus(currentEnemy.boardPosition,currentPlayer.boardPosition,currentPlayer.facing);
           if(flank.bonus>0) dmg+=flank.bonus;
-          addLog(`${currentEnemy.name} Ember Strike [${pulses} pulses x ${dmgEach*SKILL_DICE_MULT} = ${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg`);
+          const tileBoost=getTileBoost(tiles,currentEnemy.boardPosition,'Fire');
+          if(tileBoost>0) dmg+=tileBoost;
+          addLog(`${currentEnemy.name} Ember Strike [${pulses} pulses x ${dmgEach*SKILL_DICE_MULT} = ${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${tileBoost>0?' [Fire tile +20]':''}`);
         } else if(elData.isEarth){
           const dieRoll=rolls[0].value;
-          const maxRange=Math.floor(dieRoll/2);
-          if(maxRange>0){
-            const avail=Math.max(1,Math.min(maxRange, currentEnemy.actionpts-1));
-            const chosenRange=avail;
-            const line=getForwardTiles(currentEnemy.boardPosition,castFacing,chosenRange);
-            const hit=line.some(t=>t.x===currentPlayer.boardPosition.x&&t.y===currentPlayer.boardPosition.y);
-            const base=dieRoll*SKILL_DICE_MULT;
-            const acc=rollD100Accuracy();
-            dmg=hit?applyAccuracy(base,acc):0;
-            eCost=1+chosenRange;
-            addLog(`${currentEnemy.name} Tremor [d6=${dieRoll}, ${chosenRange} tile${chosenRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg':'MISS'}`);
-          } else {
-            addLog(`${currentEnemy.name} Tremor roll too low — no range`);
-            eCost=1;
-          }
+          const maxRange=Math.max(1,Math.floor(dieRoll/2));
+          const avail=Math.max(1,Math.min(maxRange, currentEnemy.actionpts-1));
+          const chosenRange=avail;
+          const line=getForwardTiles(currentEnemy.boardPosition,castFacing,chosenRange);
+          const hit=line.some(t=>t.x===currentPlayer.boardPosition.x&&t.y===currentPlayer.boardPosition.y);
+          const base=dieRoll*SKILL_DICE_MULT;
+          const acc=rollD100Accuracy();
+          const tileBoost=getTileBoost(tiles,currentEnemy.boardPosition,'Earth');
+          dmg=hit?Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost:0;
+          eCost=1+chosenRange;
+          addLog(`${currentEnemy.name} Tremor [d6=${dieRoll}, ${chosenRange} tile${chosenRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg'+(tileBoost>0?' [Earth tile +20]':''):'MISS'}`);
         } else if(elData.isAir){
           const dieRoll=rolls[0].value;
           const maxLine=getForwardTiles(currentEnemy.boardPosition,castFacing,SIZE);
@@ -1800,19 +1824,20 @@ export default function GridBattlerGame() {
           const line=getForwardTiles(currentEnemy.boardPosition,castFacing,chosenRange);
           const hit=line.some(t=>t.x===currentPlayer.boardPosition.x&&t.y===currentPlayer.boardPosition.y);
           const acc=rollD100Accuracy();
-          dmg=hit&&base>0?applyAccuracy(base,acc):0;
+          const tileBoost=getTileBoost(tiles,currentEnemy.boardPosition,'Air');
+          dmg=hit?Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost:0;
           eCost=2;
-          if(hit&&base>0){
+          if(hit){
             const kbPos=getKnockbackPos(currentPlayer.boardPosition,castFacing);
             const kbBlocked=!kbPos||(kbPos.x===currentEnemy.boardPosition.x&&kbPos.y===currentEnemy.boardPosition.y);
             if(kbPos&&!kbBlocked){
               updatedPlayer={...currentPlayer,boardPosition:kbPos};
-              addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}, range ${chosenRange}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg + knockback`);
+              addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}, range ${chosenRange}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} + knockback`);
             } else {
-              addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}, range ${chosenRange}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg (knockback blocked)`);
+              addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}, range ${chosenRange}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} (knockback blocked)`);
             }
           } else {
-            addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}, range ${chosenRange}] -> ${hit?'0 dmg (gust collapsed)':'MISS'}`);
+            addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}, range ${chosenRange}] -> MISS`);
           }
         } else if(elData.isWater){
           const dieRoll=rolls[0].value;
@@ -1833,8 +1858,9 @@ export default function GridBattlerGame() {
             const footprint=getTorrentFootprint(anchor,chosen.aoe);
             const hit=footprint.some(t=>t.x===currentPlayer.boardPosition.x&&t.y===currentPlayer.boardPosition.y);
             const acc=rollD100Accuracy();
-            dmg=hit?applyAccuracy(res.damage,acc):0;
-            addLog(`${currentEnemy.name} Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[chosen.aoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg':'MISS'}`);
+            const tileBoost=getTileBoost(tiles,currentEnemy.boardPosition,'Water');
+            dmg=hit?applyAccuracy(res.damage,acc)+tileBoost:0;
+            addLog(`${currentEnemy.name} Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[chosen.aoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS'}`);
           }
         }
 
@@ -1972,7 +1998,7 @@ export default function GridBattlerGame() {
     const nextWave = wave + 1;
     const enemyLevel = nextWave;
     const freshEnemy = newGoblin(enemyLevel, curPlayer.boardPosition);
-    const resetPlayer = { ...curPlayer, actionpts:0, frozen:0, skillUsed:false, energyRollover:0,
+    const resetPlayer = { ...curPlayer, actionpts:0, frozen:0, skillUsed:false, rotateUsed:false, energyRollover:0,
       boardPosition: rollBackRowPosition(8) };
     const newTiles = makeTiles(resetPlayer.boardPosition, freshEnemy.boardPosition);
     setWave(nextWave);
@@ -2158,14 +2184,16 @@ export default function GridBattlerGame() {
     let dmg=applyAccuracy(base,acc);
     const flank=getFlankBonus(player.boardPosition,enemy.boardPosition,enemy.facing);
     if(flank.bonus>0) dmg+=flank.bonus;
+    const tileBoost=getTileBoost(tiles,player.boardPosition,'Fire');
+    if(tileBoost>0) dmg+=tileBoost;
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-3),skillUsed:true};
     const updatedEnemy={...enemy,health:Math.max(0,enemy.health-dmg)};
-    addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}`);
+    addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tileBoost>0?' [Fire tile +20]':''}`);
     resetDiceModal();
     if(updatedEnemy.health<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[diceRolls,player,enemy,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction]);
+  },[diceRolls,player,enemy,tiles,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction]);
 
   // Earth handlers
   const handleSetEarthRange = useCallback((r)=>setEarthRange(r),[]);
@@ -2175,16 +2203,18 @@ export default function GridBattlerGame() {
     const base=dieRoll*SKILL_DICE_MULT;
     const line=getForwardTiles(player.boardPosition,player.facing,earthRange);
     const hit=line.some(t=>t.x===enemy.boardPosition.x&&t.y===enemy.boardPosition.y);
-    const dmg=hit?applyAccuracy(base,acc):0;
+    const tileBoost=getTileBoost(tiles,player.boardPosition,'Earth');
+    // Guaranteed floor on a landed hit — Earth should never tick for single digits.
+    const dmg=hit?Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost:0;
     const cost=1+earthRange;
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
     const updatedEnemy={...enemy,health:Math.max(0,enemy.health-dmg)};
-    addLog(`Tremor [d6=${dieRoll}, ${earthRange} tile${earthRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg':'MISS (enemy not in line)'}`);
+    addLog(`Tremor [d6=${dieRoll}, ${earthRange} tile${earthRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg'+(tileBoost>0?' [Earth tile +20]':''):'MISS (enemy not in line)'}`);
     resetDiceModal();
     if(updatedEnemy.health<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[diceRolls,player,enemy,earthRange,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction]);
+  },[diceRolls,player,enemy,tiles,earthRange,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction]);
 
   // Air handlers
   const handleSetAirRange = useCallback((r)=>setAirRange(r),[]);
@@ -2194,22 +2224,25 @@ export default function GridBattlerGame() {
     const base=Math.max(0,(dieRoll-airRange)*SKILL_DICE_MULT);
     const line=getForwardTiles(player.boardPosition,player.facing,airRange);
     const hit=line.some(t=>t.x===enemy.boardPosition.x&&t.y===enemy.boardPosition.y);
-    let dmg=hit&&base>0?applyAccuracy(base,acc):0;
+    const tileBoost=getTileBoost(tiles,player.boardPosition,'Air');
+    // Guaranteed floor on any landed hit — a gust that connects no longer
+    // "collapses" to 0 just because roll <= range.
+    let dmg=hit?Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost:0;
     let updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),skillUsed:true};
     let updatedEnemy={...enemy,health:Math.max(0,enemy.health-dmg)};
-    if(hit&&base>0){
+    if(hit){
       const kbPos=getKnockbackPos(enemy.boardPosition,player.facing);
       const kbBlocked=!kbPos||(kbPos.x===player.boardPosition.x&&kbPos.y===player.boardPosition.y);
-      if(kbPos&&!kbBlocked){ updatedEnemy.boardPosition=kbPos; addLog(`Gale Force [d8=${dieRoll}, range ${airRange}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg + knockback`); }
-      else addLog(`Gale Force [d8=${dieRoll}, range ${airRange}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg (knockback blocked)`);
+      if(kbPos&&!kbBlocked){ updatedEnemy.boardPosition=kbPos; addLog(`Gale Force [d8=${dieRoll}, range ${airRange}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} + knockback`); }
+      else addLog(`Gale Force [d8=${dieRoll}, range ${airRange}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} (knockback blocked)`);
     } else {
-      addLog(`Gale Force [d8=${dieRoll}, range ${airRange}] -> ${hit?'0 dmg (gust collapsed)':'MISS'}`);
+      addLog(`Gale Force [d8=${dieRoll}, range ${airRange}] -> MISS`);
     }
     resetDiceModal();
     if(updatedEnemy.health<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[diceRolls,player,enemy,airRange,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction]);
+  },[diceRolls,player,enemy,tiles,airRange,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction]);
 
   // Water handlers
   const handleSetWaterAoe = useCallback((aoe)=>setWaterAoe(aoe),[]);
@@ -2220,16 +2253,31 @@ export default function GridBattlerGame() {
     const anchor=getTorrentAnchor(player.boardPosition,player.facing);
     const footprint=getTorrentFootprint(anchor,waterAoe);
     const hit=footprint.some(t=>t.x===enemy.boardPosition.x&&t.y===enemy.boardPosition.y);
-    const dmg=hit?applyAccuracy(res.damage,acc):0;
+    const tileBoost=getTileBoost(tiles,player.boardPosition,'Water');
+    const dmg=hit?applyAccuracy(res.damage,acc)+tileBoost:0;
     const cost=TORRENT_AOE_COST[waterAoe];
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
     const updatedEnemy={...enemy,health:Math.max(0,enemy.health-dmg)};
-    addLog(`Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[waterAoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg':'MISS (enemy outside blast)'}`);
+    addLog(`Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[waterAoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS (enemy outside blast)'}`);
     resetDiceModal();
     if(updatedEnemy.health<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[diceRolls,player,enemy,waterAoe,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction]);
+  },[diceRolls,player,enemy,tiles,waterAoe,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction]);
+
+  // ── ROTATE (0 cost, once per turn) ──
+  const handleRotateOpen = useCallback(()=>{
+    if(!canRotate) return;
+    setRotateTargeting(true);
+  },[canRotate]);
+
+  const handleRotateConfirm = useCallback((direction)=>{
+    const updatedPlayer={...player,facing:direction,rotateUsed:true};
+    addLog(`You rotate to face ${direction}.`);
+    setPlayer(updatedPlayer);
+    setRotateTargeting(false);
+  },[player,addLog]);
+
   // ── MASTERMIND (Summoner skill) ──
   const deployTiles = getDeployTiles(tiles, player.boardPosition, enemy.boardPosition, summons);
   const canDeploy = summons.length < BANDWIDTH && deployTiles.length > 0 && player.actionpts >= 2;
@@ -2420,6 +2468,29 @@ export default function GridBattlerGame() {
     };
   },[]);
 
+  // Grid square sizing: the battle row previously sized the grid purely off
+  // available height (aspectRatio + height:100%), so a taller window grew the
+  // square without any horizontal cap — it overflowed into the stat panel
+  // (painted on top, since it's earlier in DOM) and under the combat log
+  // (painted under, since it's later in DOM). Measure both the row's actual
+  // width and the vertical slot's height, and size the square to the smaller
+  // of the two so it can never exceed the space either column has.
+  useLayoutEffect(()=>{
+    const recompute = () => {
+      if(!battleRowRef.current || !gridSlotRef.current) return;
+      const rowWidth = battleRowRef.current.clientWidth;
+      const availableHeight = gridSlotRef.current.clientHeight;
+      const availableWidth = rowWidth - SIDE_PANEL_MIN_WIDTH*2 - MID_COL_H_PADDING;
+      const next = Math.max(GRID_MIN_SIZE, Math.floor(Math.min(availableHeight, availableWidth)));
+      setGridSize(prev => Math.abs(prev-next)>1 ? next : prev);
+    };
+    recompute();
+    const ro = new ResizeObserver(recompute);
+    if(battleRowRef.current) ro.observe(battleRowRef.current);
+    window.addEventListener('resize', recompute);
+    return () => { ro.disconnect(); window.removeEventListener('resize', recompute); };
+  },[]);
+
   const enemyDistanceForAir = (()=>{
     const line=getForwardTiles(player.boardPosition,player.facing,SIZE);
     const idx=line.findIndex(t=>t.x===enemy.boardPosition.x&&t.y===enemy.boardPosition.y);
@@ -2478,58 +2549,63 @@ export default function GridBattlerGame() {
             Grid, Combat Log) separated by vertical dividers instead of gaps
             between floating boxes — reclaims the inter-panel gutters for the
             cramped stat sections. Grid stays a height-limited square. */}
-        <PanelBox style={{height:'calc(100dvh - 92px)',minHeight:320,padding:'12px',display:'flex',minWidth:0,overflow:'hidden'}}>
-          {/* Left section: Proxy + Enemy stats + action buttons */}
-          <div style={{flex:1,minWidth:0,display:'flex',flexDirection:'column',minHeight:0,paddingRight:12}}>
-            <PlayerStatsPanel
-              player={player} playerRolledEnergy={playerRolledEnergy}
-              selectedCategory={selCategory} selectedElement={selElement}
-              onElementSelect={(c,e)=>{setSelCategory(c);setSelElement(e);}}
-              canAttack={canAttack} canSkill={canSkill}
-              onMelee={handleMelee} onSkill={handleSkill} onEndTurn={handleEndTurn}
-              onRollEnergy={handleRollEnergy} energyPhase={energyPhase}
-              onSurrender={handleSurrender} enemy={enemy} enemyRolledEnergy={enemyRolledEnergy}
-              isPlayerTurn={isPlayerTurn}
-              playerClass={playerClass} summons={summons}
-              canMastermind={canMastermind} onMastermind={handleMastermind}
-            />
-          </div>
+        <PanelBox style={{height:'calc(100dvh - 92px)',minHeight:320,padding:'12px',overflow:'hidden'}}>
+          <div ref={battleRowRef} style={{display:'flex',minWidth:0,height:'100%'}}>
+            {/* Left section: Proxy + Enemy stats + action buttons */}
+            <div style={{flex:1,minWidth:SIDE_PANEL_MIN_WIDTH,display:'flex',flexDirection:'column',minHeight:0,paddingRight:12}}>
+              <PlayerStatsPanel
+                player={player} playerRolledEnergy={playerRolledEnergy}
+                selectedCategory={selCategory} selectedElement={selElement}
+                onElementSelect={(c,e)=>{setSelCategory(c);setSelElement(e);}}
+                canAttack={canAttack} canSkill={canSkill}
+                onMelee={handleMelee} onSkill={handleSkill} onEndTurn={handleEndTurn}
+                onRollEnergy={handleRollEnergy} energyPhase={energyPhase}
+                onSurrender={handleSurrender} enemy={enemy} enemyRolledEnergy={enemyRolledEnergy}
+                isPlayerTurn={isPlayerTurn}
+                playerClass={playerClass} summons={summons}
+                canMastermind={canMastermind} onMastermind={handleMastermind}
+                canRotate={canRotate} onRotate={handleRotateOpen}
+              />
+            </div>
 
-          {/* Middle section: grid (height-limited square) + tile legend.
-              Pinned to full panel height so the inner square's aspect-ratio has a
-              firm height to size its width against (avoids the circular
-              height→content→height dependency that distorted the grid). */}
-          <div style={{flexShrink:0,height:'100%',display:'flex',flexDirection:'column',minHeight:0,alignItems:'center',padding:'0 12px'}}>
-            <div style={{flex:1,minHeight:0,display:'flex',alignItems:'center',justifyContent:'center'}}>
-              <div style={{height:'100%',aspectRatio:'1 / 1',display:'flex'}}>
-                <Grid
-                  playerPos={player.boardPosition} enemyPos={enemy.boardPosition}
-                  validSquares={validSquares} onSquareClick={handleSquareClick}
-                  playerSelected={playerSel} tiles={tiles}
-                  playerFacing={player.facing} enemyFacing={enemy.facing}
-                  aoeTiles={aoeTiles} summons={summons} deployTiles={gridDeployHighlights}
-                />
+            {/* Middle section: grid + tile legend. The square is sized in JS
+                (gridSize, see the ResizeObserver effect above) to the smaller
+                of the row's available width and the slot's available height,
+                so it can never overflow into the side columns as the window
+                is resized — previously it was sized purely off height, which
+                let it grow past its column's width and overlap the neighbors. */}
+            <div style={{flexShrink:0,width:gridSize+MID_COL_H_PADDING,height:'100%',display:'flex',flexDirection:'column',minHeight:0,alignItems:'center',padding:'0 12px'}}>
+              <div ref={gridSlotRef} style={{flex:1,minHeight:0,width:'100%',display:'flex',alignItems:'center',justifyContent:'center'}}>
+                <div style={{width:gridSize,height:gridSize,flexShrink:0,display:'flex'}}>
+                  <Grid
+                    playerPos={player.boardPosition} enemyPos={enemy.boardPosition}
+                    validSquares={validSquares} onSquareClick={handleSquareClick}
+                    playerSelected={playerSel} tiles={tiles}
+                    playerFacing={player.facing} enemyFacing={enemy.facing}
+                    aoeTiles={aoeTiles} summons={summons} deployTiles={gridDeployHighlights}
+                  />
+                </div>
+              </div>
+              <div style={{display:'grid',gridTemplateColumns:'repeat(3, auto)',gap:'3px 12px',justifyContent:'center',alignItems:'center',marginTop:6,paddingTop:6,borderTop:'1px solid #1e3a4a',flexShrink:0}}>
+                {TILE_LEGEND.map(l=>(
+                  <div key={l.type} style={{display:'flex',alignItems:'center',gap:4,fontSize:'9px',color:'#5a7a8a',whiteSpace:'nowrap'}}>
+                    <span style={{width:10,height:10,borderRadius:2,border:`1px solid ${l.border}`,background:l.bg,display:'inline-block',flexShrink:0}} />
+                    {l.label}
+                  </div>
+                ))}
+                {summons.length>0&&(
+                  <div style={{display:'flex',alignItems:'center',gap:4,fontSize:'9px',color:'#b08cff',whiteSpace:'nowrap'}}>
+                    <span style={{width:10,height:10,borderRadius:2,border:'1px solid #9b6cff',background:'rgba(155,108,255,0.2)',display:'inline-block',flexShrink:0}} />
+                    Summon
+                  </div>
+                )}
               </div>
             </div>
-            <div style={{display:'grid',gridTemplateColumns:'repeat(3, auto)',gap:'3px 12px',justifyContent:'center',alignItems:'center',marginTop:6,paddingTop:6,borderTop:'1px solid #1e3a4a',flexShrink:0}}>
-              {TILE_LEGEND.map(l=>(
-                <div key={l.type} style={{display:'flex',alignItems:'center',gap:4,fontSize:'9px',color:'#5a7a8a',whiteSpace:'nowrap'}}>
-                  <span style={{width:10,height:10,borderRadius:2,border:`1px solid ${l.border}`,background:l.bg,display:'inline-block',flexShrink:0}} />
-                  {l.label}
-                </div>
-              ))}
-              {summons.length>0&&(
-                <div style={{display:'flex',alignItems:'center',gap:4,fontSize:'9px',color:'#b08cff',whiteSpace:'nowrap'}}>
-                  <span style={{width:10,height:10,borderRadius:2,border:'1px solid #9b6cff',background:'rgba(155,108,255,0.2)',display:'inline-block',flexShrink:0}} />
-                  Summon
-                </div>
-              )}
-            </div>
-          </div>
 
-          {/* Right section: Combat Log */}
-          <div style={{flex:1,minWidth:0,display:'flex',flexDirection:'column',minHeight:0,paddingLeft:12}}>
-            <CombatLog logs={logs} gridHeight />
+            {/* Right section: Combat Log */}
+            <div style={{flex:1,minWidth:SIDE_PANEL_MIN_WIDTH,display:'flex',flexDirection:'column',minHeight:0,paddingLeft:12}}>
+              <CombatLog logs={logs} gridHeight />
+            </div>
           </div>
         </PanelBox>
 
@@ -2544,11 +2620,11 @@ export default function GridBattlerGame() {
               </div>
               <div>
                 <div style={{color:'#ffd700',fontWeight:'bold',marginBottom:4}}>Positioning</div>
-                Flanking +5, back attack +10. Face your target — attacks rotate you toward it. Healing nodes restore 100 HP and relocate.
+                Flanking +5, back attack +10. Face your target — attacks rotate you toward it. Rotate (⟳) freely faces you any direction for 0 Energy, once per turn. Healing nodes restore 100 HP and relocate. Standing on your element's boost tile adds +20 dmg.
               </div>
               <div>
                 <div style={{color:'#ff6644',fontWeight:'bold',marginBottom:4}}>Skills</div>
-                Once per round. Fire (3E pulses), Earth (1+tiles, ranged line), Air (2E, knockback), Water (2/6/10, AoE matrix). Roll locks for the round. Accuracy d100: ≥79 full · 40–78 half · under 40 quarter.
+                Once per round. Fire (3E pulses), Earth (1+tiles, ranged line, min {RANGED_SKILL_MIN_DMG} dmg on hit), Air (2E, knockback, min {RANGED_SKILL_MIN_DMG} dmg on hit), Water (2/6/10, AoE matrix). Roll locks for the round. Accuracy d100: ≥79 full · 40–78 half · under 40 quarter.
               </div>
               {playerClass==='Summoner'&&(
                 <div style={{borderLeft:'2px solid #9b6cff',paddingLeft:10}}>
@@ -2596,6 +2672,19 @@ export default function GridBattlerGame() {
       {compassTargeting&&(
         <div style={{position:'fixed',bottom:20,left:'50%',transform:'translateX(-50%)',background:'#080e14',border:'1px solid #9b6cff',borderRadius:8,padding:'10px 18px',color:'#b08cff',fontSize:13,zIndex:1500,boxShadow:'0 0 24px rgba(155,108,255,0.4)'}}>
           ⚔ Compass Slash — click a highlighted tile · <span onClick={()=>setCompassTargeting(false)} style={{color:'#5a7a8a',cursor:'pointer',textDecoration:'underline'}}>cancel</span>
+        </div>
+      )}
+      {/* Rotate direction-picker banner */}
+      {rotateTargeting&&(
+        <div style={{position:'fixed',bottom:20,left:'50%',transform:'translateX(-50%)',background:'#080e14',border:'1px solid #00c8ff',borderRadius:8,padding:'10px 18px',color:'#00c8ff',fontSize:13,zIndex:1500,boxShadow:'0 0 24px rgba(0,200,255,0.4)',display:'flex',alignItems:'center',gap:10}}>
+          <span>⟳ Face:</span>
+          {['up','left','down','right'].map(d=>(
+            <button key={d} onClick={()=>handleRotateConfirm(d)}
+              style={{width:32,height:32,background:player.facing===d?'rgba(0,200,255,0.25)':'transparent',border:'1px solid #00c8ff',borderRadius:4,color:'#00c8ff',cursor:'pointer',fontSize:16,fontWeight:'bold'}}>
+              {facingArrow(d)}
+            </button>
+          ))}
+          <span onClick={()=>setRotateTargeting(false)} style={{color:'#5a7a8a',cursor:'pointer',textDecoration:'underline',marginLeft:4}}>cancel</span>
         </div>
       )}
       {summonPhaseActive&&(
