@@ -13,7 +13,7 @@ const TILE_TYPES = {
   NORMAL:'normal', FIRE_BOOST:'fire_boost', WATER_BOOST:'water_boost',
   EARTH_BOOST:'earth_boost', AIR_BOOST:'air_boost', HEALING:'healing',
 };
-const ELEMENTS = {
+export const ELEMENTS = {
   base: {
     Fire: {
       dice:['d4','d4'],
@@ -108,7 +108,7 @@ const ELEMENTS = {
       tierFormula:(sum,t)=>Math.floor((sum-t)/2)+1, accuracyApplies:true },
   },
 };
-const getXPThreshold = (level) => Math.floor(1000 * Math.pow(level, 1.5));
+export const getXPThreshold = (level) => Math.floor(1000 * Math.pow(level, 1.5));
 // Per-die damage multiplier for Fire / Earth / Air base skills (v4.3: 10 -> 20).
 // Raises skill output so a skill reliably out-damages an equivalent melee stack.
 // Water uses its own fixed tiers in resolveTorrent instead.
@@ -533,7 +533,7 @@ const newGoblin = (level, _playerPos) => {
 
 // Available classes for the post-boss unlock modal. Summoner is the first;
 // the list is structured so more classes can slot in later.
-const UNLOCKABLE_CLASSES = [
+export const UNLOCKABLE_CLASSES = [
   {
     id:'Summoner',
     name:'Summoner',
@@ -1476,7 +1476,7 @@ const RewardModal = ({show,html}) => {
 };
 // ─── MAIN GAME COMPONENT ───────────────────────────────────────────────────────
 
-export default function GridBattlerGame() {
+export default function GridBattlerGame({ onStateSync } = {}) {
   const initPlayer = () => newHero();
   const initEnemy  = (p) => newGoblin(1, p.boardPosition);
 
@@ -2454,6 +2454,13 @@ export default function GridBattlerGame() {
   // Initial healing-tile guarantee on first mount handled by makeTiles.
   const didInitRef = useRef(false);
   useEffect(()=>{ didInitRef.current=true; },[]);
+
+  // Mirror the live Proxy/session state up to a host shell (e.g. a Character
+  // screen elsewhere in the app) that isn't otherwise able to see this
+  // component's internal state. No-op if no callback was passed in.
+  useEffect(()=>{
+    onStateSync?.({ player, playerClass, wave, hexas });
+  },[player, playerClass, wave, hexas, onStateSync]);
 
   // Track viewport orientation so the rotate prompt reacts to resize/rotation.
   useEffect(()=>{
