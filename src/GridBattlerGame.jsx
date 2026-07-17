@@ -169,6 +169,15 @@ const getMoveToward = (fx,fy,tx,ty) => {
 const isAdjacent = (a,b) => { const dx=Math.abs(a.x-b.x),dy=Math.abs(a.y-b.y); return (dx===1&&dy===0)||(dx===0&&dy===1); };
 // 8-directional adjacency (orthogonal + diagonal) — used by Compass Slash.
 const isAdjacent8 = (a,b) => { const dx=Math.abs(a.x-b.x),dy=Math.abs(a.y-b.y); return dx<=1&&dy<=1&&(dx+dy)>0; };
+// Chess-knight offsets (±1,±2)/(±2,±1) — Rogue's Dark Web attack pattern.
+const KNIGHT_OFFSETS = [
+  {dx:1,dy:2},{dx:1,dy:-2},{dx:-1,dy:2},{dx:-1,dy:-2},
+  {dx:2,dy:1},{dx:2,dy:-1},{dx:-2,dy:1},{dx:-2,dy:-1},
+];
+const getKnightTiles = (pos) => KNIGHT_OFFSETS
+  .map(o=>({x:pos.x+o.dx,y:pos.y+o.dy}))
+  .filter(t=>t.x>=0&&t.x<SIZE&&t.y>=0&&t.y<SIZE);
+const isKnightMove = (a,b) => KNIGHT_OFFSETS.some(o=>a.x+o.dx===b.x&&a.y+o.dy===b.y);
 const facingFromMove = (o,n) => { const dx=n.x-o.x,dy=n.y-o.y; if(dx>0)return'right';if(dx<0)return'left';if(dy>0)return'down';if(dy<0)return'up';return'down'; };
 // Facing from one tile toward another (used to rotate a unit to face its melee
 // target). Picks the dominant axis when the target isn't orthogonally aligned.
@@ -375,9 +384,13 @@ const pickApproachTile = (enemyPos, def, defFacing, tier, blockers) => {
   return {x:pool[0].x,y:pool[0].y,quality:pool[0].quality};
 };
 
+// skillUsed gates elemental skills; classSkillUsed gates class abilities
+// (Mastermind, Dark Web, ...) as a separate once-per-round limit — per the
+// Codex: "a player may use their class skill once and one elemental skill
+// per turn, but cannot repeat the same skill."
 const makeCharacter = (name,hp,level,agi,ap,pos,element,elementCategory) => ({
   name,level,agi,health:hp,maxHealth:hp,actionpts:ap,boardPosition:pos,
-  playerXp:0,facing:'down',frozen:0,slowed:false,skillUsed:false,rotateUsed:false,
+  playerXp:0,facing:'down',frozen:0,slowed:false,skillUsed:false,rotateUsed:false,classSkillUsed:false,
   element:element||null,elementCategory:elementCategory||null,energyRollover:0,
 });
 
@@ -531,8 +544,9 @@ const newGoblin = (level, _playerPos) => {
   return {...makeCharacter(tierName,hp,level,agi,0,pos,null,null),energyRollover:0};
 };
 
-// Available classes for the post-boss unlock modal. Summoner is the first;
-// the list is structured so more classes can slot in later.
+// Available classes for the post-boss unlock modal. The list is structured
+// so more classes (Paladin, Gunner, Wizard) can slot in later per the Codex
+// Class Registry — each entry here is one step of that integration.
 export const UNLOCKABLE_CLASSES = [
   {
     id:'Summoner',
@@ -541,6 +555,14 @@ export const UNLOCKABLE_CLASSES = [
     color:'#9b6cff',
     tagline:'Mastermind — strike or deploy entities from the cyberworld.',
     blurb:'Hybrid skill chosen on activation. Direct: Compass Slash (60 dmg, any of 8 surrounding tiles). Deploy: roll a circuit sigil to call a Bug, Virus, or Malware onto your second row. Bandwidth 2.',
+  },
+  {
+    id:'Rogue',
+    name:'Rogue',
+    icon:'⚔',
+    color:'#a0a0a0',
+    tagline:'Dark Web — strike from angles no defender expects.',
+    blurb:'Moves and attacks in an L-pattern, like a chess knight — striking any of 8 offset tiles, bypassing adjacent defenders entirely. 70 base damage, 2 Energy, once per turn. A finishing blow claims the target\'s tile, same as any melee kill.',
   },
 ];
 // ─── UI COMPONENTS ─────────────────────────────────────────────────────────────
@@ -762,7 +784,7 @@ const ElementPickerModal = ({selectedCategory,selectedElement,onSelect,onClose})
   );
 };
 
-const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedElement,onElementSelect,canAttack,canSkill,onMelee,onSkill,onEndTurn,onRollEnergy,energyPhase,onSurrender,enemy,enemyRolledEnergy,isPlayerTurn,playerClass,summons,canMastermind,onMastermind,canRotate,onRotate}) => {
+const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedElement,onElementSelect,canAttack,canSkill,onMelee,onSkill,onEndTurn,onRollEnergy,energyPhase,onSurrender,enemy,enemyRolledEnergy,isPlayerTurn,playerClass,summons,canMastermind,onMastermind,canRotate,onRotate,canDarkWeb,onDarkWeb}) => {
   const [showPicker,setShowPicker]=useState(false);
   const allEl={...ELEMENTS.base,...ELEMENTS.minor,...ELEMENTS.major};
   const elData=allEl[selectedElement];
@@ -772,6 +794,8 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
   const skillCost = getSkillCost(selectedCategory, selectedElement);
   const classMeta = playerClass ? UNLOCKABLE_CLASSES.find(c=>c.id===playerClass) : null;
   const hasSummoner = playerClass==='Summoner';
+  const hasRogue = playerClass==='Rogue';
+  const hasClassAction = hasSummoner || hasRogue;
   return (
     <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden',minHeight:0,height:'100%'}}>
         {/* Scrollable body — stats columns live here so they can never push the
@@ -861,7 +885,7 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
                 MELEE<div style={{fontSize:'8px',opacity:0.7}}>{playerMeleeBase(player.level)} · 1E</div>
               </button>
               <button onClick={onSkill} disabled={!canSkill}
-                style={{flex:hasSummoner?1:1.2,padding:'7px 4px',background:canSkill?'rgba(200,60,0,0.2)':'rgba(20,30,40,0.6)',border:`1px solid ${canSkill?'#cc3300':'#1e3a4a'}`,borderRadius:'4px',color:canSkill?'#ff6644':'#2a4a5e',fontSize:'11px',fontWeight:600,cursor:canSkill?'pointer':'not-allowed',letterSpacing:'.04em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
+                style={{flex:hasClassAction?1:1.2,padding:'7px 4px',background:canSkill?'rgba(200,60,0,0.2)':'rgba(20,30,40,0.6)',border:`1px solid ${canSkill?'#cc3300':'#1e3a4a'}`,borderRadius:'4px',color:canSkill?'#ff6644':'#2a4a5e',fontSize:'11px',fontWeight:600,cursor:canSkill?'pointer':'not-allowed',letterSpacing:'.04em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
                 SKILL<div style={{fontSize:'8px',opacity:0.7}}>{player.skillUsed?'used':`${selectedElement.slice(0,4)}·${skillCost}E`}</div>
               </button>
               <button onClick={onRotate} disabled={!canRotate} title="Rotate facing — 0 Energy, once per turn"
@@ -871,7 +895,13 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
               {hasSummoner&&(
                 <button onClick={onMastermind} disabled={!canMastermind}
                   style={{flex:1.2,padding:'7px 4px',background:canMastermind?'rgba(155,108,255,0.18)':'rgba(20,30,40,0.6)',border:`1px solid ${canMastermind?'#9b6cff':'#1e3a4a'}`,borderRadius:'4px',color:canMastermind?'#b08cff':'#2a4a5e',fontSize:'11px',fontWeight:600,cursor:canMastermind?'pointer':'not-allowed',letterSpacing:'.03em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
-                  MASTERMIND<div style={{fontSize:'8px',opacity:0.7}}>{player.skillUsed?'used':'2E'}</div>
+                  MASTERMIND<div style={{fontSize:'8px',opacity:0.7}}>{player.classSkillUsed?'used':'2E'}</div>
+                </button>
+              )}
+              {hasRogue&&(
+                <button onClick={onDarkWeb} disabled={!canDarkWeb}
+                  style={{flex:1.2,padding:'7px 4px',background:canDarkWeb?'rgba(160,160,160,0.18)':'rgba(20,30,40,0.6)',border:`1px solid ${canDarkWeb?'#a0a0a0':'#1e3a4a'}`,borderRadius:'4px',color:canDarkWeb?'#c8c8c8':'#2a4a5e',fontSize:'11px',fontWeight:600,cursor:canDarkWeb?'pointer':'not-allowed',letterSpacing:'.03em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
+                  DARK WEB<div style={{fontSize:'8px',opacity:0.7}}>{player.classSkillUsed?'used':'2E'}</div>
                 </button>
               )}
               <button onClick={onEndTurn}
@@ -924,7 +954,7 @@ const tileClassName = (t) => {
   }
 };
 
-const Grid = ({playerPos,enemyPos,validSquares,onSquareClick,playerSelected,tiles,playerFacing,enemyFacing,aoeTiles,summons,deployTiles}) => {
+const Grid = ({playerPos,enemyPos,validSquares,onSquareClick,playerSelected,tiles,playerFacing,enemyFacing,aoeTiles,knightTiles,summons,deployTiles}) => {
   const cells=[];
   for(let y=0;y<SIZE;y++) for(let x=0;x<SIZE;x++){
     const isP=playerPos.x===x&&playerPos.y===y;
@@ -932,6 +962,7 @@ const Grid = ({playerPos,enemyPos,validSquares,onSquareClick,playerSelected,tile
     const summon=summons&&summons.find(s=>s.boardPosition.x===x&&s.boardPosition.y===y);
     const isA=validSquares.some(s=>s.x===x&&s.y===y);
     const isAoe=aoeTiles&&aoeTiles.some(s=>s.x===x&&s.y===y);
+    const isKnight=knightTiles&&knightTiles.some(s=>s.x===x&&s.y===y);
     const isDeploy=deployTiles&&deployTiles.some(s=>s.x===x&&s.y===y);
     const tileType=tiles&&tiles[y]&&tiles[y][x]||TILE_TYPES.NORMAL;
     let cls='square';
@@ -941,6 +972,7 @@ const Grid = ({playerPos,enemyPos,validSquares,onSquareClick,playerSelected,tile
     else if(summon){ cls+=' summon'; label=SUMMON_TIER_META[summon.tier].icon; }
     else { if(isA) cls+=' available'; cls+=' '+tileClassName(tileType); }
     if(isAoe) cls+=' aoePreview';
+    if(isKnight) cls+=' knightPreview';
     if(isDeploy) cls+=' deployTile';
     cells.push(
       <div key={`${x}-${y}`} className={cls} onClick={()=>onSquareClick(x,y)}
@@ -1532,6 +1564,9 @@ export default function GridBattlerGame({ onStateSync } = {}) {
   const [awaitingPlacement, setAwaitingPlacement] = useState(false);
   // Direct (Compass Slash) targeting state: when true, grid clicks pick a target.
   const [compassTargeting, setCompassTargeting] = useState(false);
+  // Rogue's Dark Web targeting state: when true, grid clicks pick one of the
+  // 8 knight-move tiles.
+  const [darkWebTargeting, setDarkWebTargeting] = useState(false);
   // Rotate: once-per-turn, 0-cost facing change. True while the direction
   // picker banner is open.
   const [rotateTargeting, setRotateTargeting] = useState(false);
@@ -1560,8 +1595,12 @@ export default function GridBattlerGame({ onStateSync } = {}) {
   const canSkill  = isPlayerTurn && energyPhase==='act' && !player.skillUsed && player.actionpts >= skillCost &&
     (elData?.isEarth||elData?.isAir||elData?.isWater ? true : isAdjacent(player.boardPosition,enemy.boardPosition));
   // Mastermind: available to a Summoner during the act phase, once per turn,
-  // if at least 2 Energy is available (fixed activation cost).
-  const canMastermind = playerClass==='Summoner' && isPlayerTurn && energyPhase==='act' && !player.skillUsed && player.actionpts >= 2;
+  // if at least 2 Energy is available (fixed activation cost). Gated by
+  // classSkillUsed (not skillUsed) — class and elemental skills are separate
+  // once-per-turn limits per the Codex.
+  const canMastermind = playerClass==='Summoner' && isPlayerTurn && energyPhase==='act' && !player.classSkillUsed && player.actionpts >= 2;
+  // Dark Web: Rogue's class ability, same once-per-turn class-skill gate.
+  const canDarkWeb = playerClass==='Rogue' && isPlayerTurn && energyPhase==='act' && !player.classSkillUsed && player.actionpts >= 2;
   // Rotate: 0 Energy, once per turn — a free facing change for tactical
   // repositioning (evade a flank, line up a ranged skill) without spending AP.
   const canRotate = isPlayerTurn && energyPhase==='act' && !player.rotateUsed;
@@ -1692,7 +1731,7 @@ export default function GridBattlerGame({ onStateSync } = {}) {
     setDiceRolls([]); setAbilities([]); setDicePhase('roll');
     setAccuracyRoll(null); setPendingAbility(null); setAirRange(null); setEarthRange(null); setWaterAoe(null);
     addLog(`=== Round ${nextRound} ===`);
-    const rP = { ...latestPlayer, actionpts:0, frozen:latestPlayer.frozen||0, skillUsed:false, rotateUsed:false };
+    const rP = { ...latestPlayer, actionpts:0, frozen:latestPlayer.frozen||0, skillUsed:false, rotateUsed:false, classSkillUsed:false };
     const rE = { ...latestEnemy,  actionpts:0, frozen:latestEnemy.frozen||0, skillUsed:false,
       energyRollover: (latestEnemy.energyRollover||0) + (latestEnemy.actionpts||0) };
     setPlayer(rP);
@@ -1998,7 +2037,7 @@ export default function GridBattlerGame({ onStateSync } = {}) {
     const nextWave = wave + 1;
     const enemyLevel = nextWave;
     const freshEnemy = newGoblin(enemyLevel, curPlayer.boardPosition);
-    const resetPlayer = { ...curPlayer, actionpts:0, frozen:0, skillUsed:false, rotateUsed:false, energyRollover:0,
+    const resetPlayer = { ...curPlayer, actionpts:0, frozen:0, skillUsed:false, rotateUsed:false, classSkillUsed:false, energyRollover:0,
       boardPosition: rollBackRowPosition(8) };
     const newTiles = makeTiles(resetPlayer.boardPosition, freshEnemy.boardPosition);
     setWave(nextWave);
@@ -2303,7 +2342,7 @@ export default function GridBattlerGame({ onStateSync } = {}) {
     setCompassTargeting(false);
     if(!hitsEnemy){
       addLog('// Compass Slash strikes empty tile — 2 Energy spent');
-      const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),skillUsed:true};
+      const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true};
       routeAfterPlayerAction(updatedPlayer, enemy);
       return;
     }
@@ -2311,9 +2350,48 @@ export default function GridBattlerGame({ onStateSync } = {}) {
     const slashFacing=facingToward(player.boardPosition,targetTile);
     const newHP=Math.max(0,enemy.health-dmg);
     addLog(`Compass Slash -> ${dmg} dmg (${newHP}/${enemy.maxHealth})`);
-    const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),skillUsed:true,facing:slashFacing};
+    const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true,facing:slashFacing};
     const updatedEnemy={...enemy,health:newHP};
     if(newHP<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
+    routeAfterPlayerAction(updatedPlayer, updatedEnemy);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[player,enemy,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction]);
+
+  // ── DARK WEB (Rogue skill) ──
+  // Chess-knight strike pattern. Per Codex Protocols §V (Melee & Displacement):
+  // a finishing blow claims the defeated unit's tile; a survived hit leaves
+  // the attacker in place — same rule as ordinary melee.
+  const handleDarkWeb = useCallback(()=>{
+    if(!canDarkWeb) return;
+    setDarkWebTargeting(true);
+    addLog('// Dark Web armed — click a knight-move tile where the enemy stands');
+  },[canDarkWeb,addLog]);
+
+  const resolveDarkWeb = useCallback((targetTile)=>{
+    if(!isKnightMove(player.boardPosition,targetTile)){ addLog('// Target not a knight-move tile'); return; }
+    const hitsEnemy = enemy.boardPosition.x===targetTile.x && enemy.boardPosition.y===targetTile.y;
+    setDarkWebTargeting(false);
+    if(!hitsEnemy){
+      addLog('// Dark Web strikes empty tile — 2 Energy spent');
+      const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true};
+      routeAfterPlayerAction(updatedPlayer, enemy);
+      return;
+    }
+    const acc=rollD100Accuracy();
+    const dmg=applyAccuracy(70,acc);
+    const strikeFacing=facingToward(player.boardPosition,targetTile);
+    const newHP=Math.max(0,enemy.health-dmg);
+    const updatedEnemy={...enemy,health:newHP};
+    if(newHP<=0){
+      // Finishing blow — Rogue claims the target's tile, same as a melee kill.
+      const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true,facing:strikeFacing,boardPosition:targetTile};
+      addLog(`Dark Web -> ${dmg} dmg (${acc}% ${accuracyTierLabel(acc)}) — finishing blow, claims (${targetTile.x},${targetTile.y})`);
+      setPlayer(updatedPlayer); setEnemy(updatedEnemy);
+      handleEnemyDefeated(updatedPlayer,wave);
+      return;
+    }
+    addLog(`Dark Web -> ${dmg} dmg (${acc}% ${accuracyTierLabel(acc)}) (${newHP}/${enemy.maxHealth})`);
+    const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true,facing:strikeFacing};
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[player,enemy,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction]);
@@ -2340,7 +2418,7 @@ export default function GridBattlerGame({ onStateSync } = {}) {
     if(!legal){ addLog('// Illegal deploy tile'); return; }
     const s=makeSummon(deployTier, {x:tile.x,y:tile.y});
     setSummons(prev=>[...prev,s]);
-    const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),skillUsed:true};
+    const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true};
     addLog(`◈ ${s.name} deployed at (${tile.x},${tile.y}). Bandwidth ${summons.length+1}/${BANDWIDTH}.`);
     setShowDeploy(false); setAwaitingPlacement(false); setDeployRoll(null); setDeployTier(null);
     routeAfterPlayerAction(updatedPlayer, enemy);
@@ -2366,6 +2444,8 @@ export default function GridBattlerGame({ onStateSync } = {}) {
     if(showDeploy && awaitingPlacement){ resolveDeployPlacement({x,y}); return; }
     // Compass Slash targeting mode
     if(compassTargeting){ resolveCompassSlash({x,y}); return; }
+    // Dark Web targeting mode
+    if(darkWebTargeting){ resolveDarkWeb({x,y}); return; }
     // Summon command sub-phase
     if(summonPhaseActive && energyPhase==='summon'){
       const clickedSummon=summons.find(s=>s.boardPosition.x===x&&s.boardPosition.y===y);
@@ -2415,7 +2495,7 @@ export default function GridBattlerGame({ onStateSync } = {}) {
     setPlayerSel(false);
     setValidSquares([]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[showDeploy,awaitingPlacement,compassTargeting,summonPhaseActive,energyPhase,summons,actedSummonIds,selectedSummonId,isPlayerTurn,player,enemy,playerSel,validSquares,tiles,addLog,resolveDeployPlacement,resolveCompassSlash,summonForwardTile,resolveSummonAction]);
+  },[showDeploy,awaitingPlacement,compassTargeting,darkWebTargeting,summonPhaseActive,energyPhase,summons,actedSummonIds,selectedSummonId,isPlayerTurn,player,enemy,playerSel,validSquares,tiles,addLog,resolveDeployPlacement,resolveCompassSlash,resolveDarkWeb,summonForwardTile,resolveSummonAction]);
 
   // Auto-end the summon command phase once all summons have acted (or pool is empty)
   useEffect(()=>{
@@ -2443,11 +2523,10 @@ export default function GridBattlerGame({ onStateSync } = {}) {
     {x:player.boardPosition.x+1,y:player.boardPosition.y+1},{x:player.boardPosition.x-1,y:player.boardPosition.y-1},
     {x:player.boardPosition.x+1,y:player.boardPosition.y-1},{x:player.boardPosition.x-1,y:player.boardPosition.y+1},
   ].filter(t=>t.x>=0&&t.x<SIZE&&t.y>=0&&t.y<SIZE) : [];
+  // Dark Web highlight: the 8 knight-move tiles around the player while targeting.
+  const darkWebTiles = darkWebTargeting ? getKnightTiles(player.boardPosition) : [];
   // Deploy highlight: legal row-7 tiles while awaiting placement.
   const activeDeployTiles = (showDeploy && awaitingPlacement) ? deployTiles : [];
-  // AoE preview overlay. v4.1: simplified — only Compass Slash contributes a
-  // preview overlay here; deploy uses its own deployTile highlight, so the old
-  // (always-empty when deploying) branch was redundant.
   const aoeTiles = compassTiles;
   const gridDeployHighlights = activeDeployTiles;
 
@@ -2572,6 +2651,7 @@ export default function GridBattlerGame({ onStateSync } = {}) {
                 playerClass={playerClass} summons={summons}
                 canMastermind={canMastermind} onMastermind={handleMastermind}
                 canRotate={canRotate} onRotate={handleRotateOpen}
+                canDarkWeb={canDarkWeb} onDarkWeb={handleDarkWeb}
               />
             </div>
 
@@ -2589,7 +2669,7 @@ export default function GridBattlerGame({ onStateSync } = {}) {
                     validSquares={validSquares} onSquareClick={handleSquareClick}
                     playerSelected={playerSel} tiles={tiles}
                     playerFacing={player.facing} enemyFacing={enemy.facing}
-                    aoeTiles={aoeTiles} summons={summons} deployTiles={gridDeployHighlights}
+                    aoeTiles={aoeTiles} knightTiles={darkWebTiles} summons={summons} deployTiles={gridDeployHighlights}
                   />
                 </div>
               </div>
@@ -2641,6 +2721,12 @@ export default function GridBattlerGame({ onStateSync } = {}) {
                   <span style={{color:'#5a7a8a'}}>Turn order with summons: Summons → Enemy → You. Summons march forward; reaching the back row promotes to Agent (staged).</span>
                 </div>
               )}
+              {playerClass==='Rogue'&&(
+                <div style={{borderLeft:'2px solid #a0a0a0',paddingLeft:10}}>
+                  <div style={{color:'#c8c8c8',fontWeight:'bold',marginBottom:4}}>⚔ Dark Web <span style={{fontSize:'9px',color:'#5a7a8a'}}>(2E, 1/turn)</span></div>
+                  Strikes any of the 8 knight-move tiles (chess-knight L-pattern) — bypasses adjacent defenders entirely. 70 base dmg, accuracy roll applies. A finishing blow claims the target's tile, same as any melee kill; a survived hit leaves you in place.
+                </div>
+              )}
             </div>
           </PanelBox>
         </div>
@@ -2679,6 +2765,12 @@ export default function GridBattlerGame({ onStateSync } = {}) {
       {compassTargeting&&(
         <div style={{position:'fixed',bottom:20,left:'50%',transform:'translateX(-50%)',background:'#080e14',border:'1px solid #9b6cff',borderRadius:8,padding:'10px 18px',color:'#b08cff',fontSize:13,zIndex:1500,boxShadow:'0 0 24px rgba(155,108,255,0.4)'}}>
           ⚔ Compass Slash — click a highlighted tile · <span onClick={()=>setCompassTargeting(false)} style={{color:'#5a7a8a',cursor:'pointer',textDecoration:'underline'}}>cancel</span>
+        </div>
+      )}
+      {/* Dark Web targeting banner */}
+      {darkWebTargeting&&(
+        <div style={{position:'fixed',bottom:20,left:'50%',transform:'translateX(-50%)',background:'#080e14',border:'1px solid #a0a0a0',borderRadius:8,padding:'10px 18px',color:'#c0c0c0',fontSize:13,zIndex:1500,boxShadow:'0 0 24px rgba(160,160,160,0.35)'}}>
+          ⚔ Dark Web — click a highlighted knight-move tile · <span onClick={()=>setDarkWebTargeting(false)} style={{color:'#5a7a8a',cursor:'pointer',textDecoration:'underline'}}>cancel</span>
         </div>
       )}
       {/* Rotate direction-picker banner */}
@@ -2732,6 +2824,7 @@ export default function GridBattlerGame({ onStateSync } = {}) {
         .square.enemy { background: radial-gradient(circle, #ff4422, #8a1500); border-color: #ff6644; color: #1a0500; font-weight: bold; box-shadow: 0 0 12px rgba(255,68,34,0.55); }
         .square.summon { background: radial-gradient(circle, #9b6cff, #5a2a9a); border-color: #b08cff; color: #fff; font-weight: bold; box-shadow: 0 0 10px rgba(155,108,255,0.55); }
         .square.aoePreview { box-shadow: inset 0 0 10px rgba(155,108,255,0.6); border-color: #9b6cff; }
+        .square.knightPreview { box-shadow: inset 0 0 10px rgba(160,160,160,0.6); border-color: #a0a0a0; }
         .square.deployTile { background: linear-gradient(135deg, #2a1a4a, #1a0a3a); border-color: #9b6cff; box-shadow: inset 0 0 8px rgba(155,108,255,0.4); animation: pulsePurple 1.1s infinite; }
         .square.tile-fire { background: linear-gradient(135deg,#4a0e0e,#1a0505); border-color: #ff6b00; }
         .square.tile-water { background: linear-gradient(135deg,#0d2a3d,#051420); border-color: #4aafee; }
