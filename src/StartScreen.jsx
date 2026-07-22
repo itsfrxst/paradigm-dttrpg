@@ -2,7 +2,9 @@ import React from 'react';
 
 const MODES = [
   { id:'gauntlet', name:'Gauntlet Test Mode', icon:'⚔', color:'#00c8ff', locked:false,
-    desc:'Endless wave survival. Face escalating goblins and elemental Wardens. The only mode currently online.' },
+    desc:'Endless wave survival. Face escalating goblins and elemental Wardens.' },
+  { id:'training', name:'Training Mode', icon:'🧭', color:'#00cc66', locked:false,
+    desc:'A tutorial hub of focused practice scenes — movement, classes, and elements, each teachable in isolation. No grind.' },
   { id:'campaign', name:'Campaign', icon:'📜', color:'#5a7a8a', locked:true,
     desc:'A guided path through the cyberworld.' },
   { id:'arena', name:'Arena', icon:'🛡', color:'#5a7a8a', locked:true,

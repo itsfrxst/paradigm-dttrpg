@@ -449,6 +449,21 @@ const makeTiles = (playerPos,enemyPos) => {
   return grid;
 };
 
+// Terrain-free grid — used by tutorial scenes that aren't teaching terrain yet.
+const makePlainTiles = () => Array.from({length:SIZE},()=>Array(SIZE).fill(TILE_TYPES.NORMAL));
+
+// Training Mode scene registry — shared between GridBattlerGame (which reads
+// `scene` to configure a focused single-battle lesson) and the Tutorial Hub
+// screen (which reads it to render the selection cards).
+export const TUTORIAL_SCENES = [
+  { id:'movement', name:'Movement & Melee',   icon:'🧭', color:'#00c8ff',
+    blurb:'Learn tile movement, positioning, and basic melee combat. No elemental skill or class abilities yet.' },
+  { id:'classes',  name:'Classes',            icon:'⚔',  color:'#9b6cff',
+    blurb:'Both classes unlocked immediately — swap between Summoner and Rogue freely to try their abilities.' },
+  { id:'elements', name:'Elements & Terrain', icon:'🔥', color:'#ff6b00',
+    blurb:'Cast Fire, Water, Earth, or Air freely on a grid with elemental boost and healing tiles.' },
+];
+
 const calcAvailableSquares = (pos,ap) => {
   const sq=[];
   for(let y=0;y<SIZE;y++) for(let x=0;x<SIZE;x++){
@@ -622,15 +637,15 @@ const PanelTitle = ({children,icon}) => (
 
 // Post-boss class unlock modal — first gated-content test. Presents available
 // classes; selection persists on the Proxy.
-const ClassUnlockModal = ({show, onSelect, onClose}) => {
+const ClassUnlockModal = ({show, onSelect, onClose, freeSelect}) => {
   if(!show) return null;
   return (
     <div onClick={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.85)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:4000}}>
       <div onClick={e=>e.stopPropagation()} style={{background:'#080e14',border:'2px solid #9b6cff',borderRadius:12,padding:'1.6rem',maxWidth:460,width:'92%',maxHeight:'85vh',overflowY:'auto',color:'#b0dff4',boxShadow:'0 0 50px rgba(155,108,255,0.4)'}}>
         <div style={{textAlign:'center',marginBottom:18}}>
-          <div style={{fontSize:'11px',letterSpacing:'0.2em',textTransform:'uppercase',color:'#9b6cff'}}>// Boss Defeated — Class Unlocked</div>
+          <div style={{fontSize:'11px',letterSpacing:'0.2em',textTransform:'uppercase',color:'#9b6cff'}}>{freeSelect ? '// Training Scene — Try Any Class' : '// Boss Defeated — Class Unlocked'}</div>
           <h2 style={{fontSize:'1.3rem',letterSpacing:'0.1em',textTransform:'uppercase',color:'#b08cff',marginTop:6}}>Choose Your Path</h2>
-          <div style={{fontSize:'11px',color:'#5a7a8a',marginTop:4}}>Select a class to equip on your Proxy. This persists for the run.</div>
+          <div style={{fontSize:'11px',color:'#5a7a8a',marginTop:4}}>{freeSelect ? 'Select a class to try. Swap anytime with the Change Class button.' : 'Select a class to equip on your Proxy. This persists for the run.'}</div>
         </div>
         {UNLOCKABLE_CLASSES.map(c=>(
           <div key={c.id} onClick={()=>onSelect(c.id)}
@@ -750,9 +765,12 @@ const DeployRollModal = ({show, rolling, roll, tier, awaitingPlacement, onRoll, 
     </div>
   );
 };
-const ElementPickerModal = ({selectedCategory,selectedElement,onSelect,onClose}) => {
+const ElementPickerModal = ({selectedCategory,selectedElement,onSelect,onClose,restrictToBase}) => {
   const allEl={...ELEMENTS.base,...ELEMENTS.minor,...ELEMENTS.major};
   const elData=allEl[selectedElement];
+  const categories = restrictToBase
+    ? [['base','Base']]
+    : [['base','Base'],['minor','Minor Fusion'],['major','Major Fusion']];
   return (
     <div onClick={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.7)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:3000}}>
       <div onClick={e=>e.stopPropagation()} style={{background:'#080e14',border:`2px solid ${elData&&elData.color||'#00c8ff'}`,borderRadius:10,padding:'1.2rem',width:340,maxHeight:'85vh',overflowY:'auto',boxShadow:`0 0 30px ${elData&&elData.color||'#00c8ff'}44`,color:'#b0dff4'}}>
@@ -766,7 +784,7 @@ const ElementPickerModal = ({selectedCategory,selectedElement,onSelect,onClose})
           </div>
           <button onClick={onClose} style={{background:'transparent',border:'none',color:'#3a6a8a',cursor:'pointer',fontSize:'16px'}}>X</button>
         </div>
-        {[['base','Base'],['minor','Minor Fusion'],['major','Major Fusion']].map(([cat,label])=>(
+        {categories.map(([cat,label])=>(
           <div key={cat} style={{marginBottom:'10px'}}>
             <div style={{fontSize:'10px',color:'#3a5a6a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:'6px'}}>{label}</div>
             <div style={{display:'flex',flexWrap:'wrap',gap:'5px'}}>
@@ -784,7 +802,7 @@ const ElementPickerModal = ({selectedCategory,selectedElement,onSelect,onClose})
   );
 };
 
-const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedElement,onElementSelect,canAttack,canSkill,onMelee,onSkill,onEndTurn,onRollEnergy,energyPhase,onSurrender,enemy,enemyRolledEnergy,isPlayerTurn,playerClass,summons,canMastermind,onMastermind,canRotate,onRotate,canDarkWeb,onDarkWeb}) => {
+const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedElement,onElementSelect,canAttack,canSkill,onMelee,onSkill,onEndTurn,onRollEnergy,energyPhase,onSurrender,enemy,enemyRolledEnergy,isPlayerTurn,playerClass,summons,canMastermind,onMastermind,canRotate,onRotate,canDarkWeb,onDarkWeb,hideElementalSkill,restrictElementsToBase}) => {
   const [showPicker,setShowPicker]=useState(false);
   const allEl={...ELEMENTS.base,...ELEMENTS.minor,...ELEMENTS.major};
   const elData=allEl[selectedElement];
@@ -805,14 +823,16 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
           <div style={{flex:1,minWidth:0,display:'flex',flexDirection:'column'}}>
             <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',borderBottom:'1px solid #1e3a4a',paddingBottom:'6px',marginBottom:'10px',gap:6}}>
               <div style={{fontSize:'0.75rem',letterSpacing:'0.15em',textTransform:'uppercase',color:'#00c8ff',display:'flex',alignItems:'center',gap:'5px',whiteSpace:'nowrap'}}><span>o</span>Proxy</div>
-              <button onClick={()=>setShowPicker(true)}
-                style={{display:'flex',alignItems:'center',gap:'4px',background:`${elData&&elData.color||'#00c8ff'}11`,border:`1px solid ${elData&&elData.color||'#00c8ff'}55`,borderRadius:'4px',padding:'2px 7px',cursor:'pointer',transition:'all 0.15s',minWidth:0}}
-                onMouseEnter={e=>e.currentTarget.style.borderColor=elData&&elData.color||'#00c8ff'}
-                onMouseLeave={e=>e.currentTarget.style.borderColor=`${elData&&elData.color||'#00c8ff'}55`}>
-                <span style={{fontSize:'12px'}}>{elData&&elData.icon}</span>
-                <span style={{fontSize:'11px',fontWeight:'bold',color:elData&&elData.color||'#b0dff4',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{selectedElement}</span>
-                <span style={{fontSize:'9px',color:'#3a6a8a'}}>v</span>
-              </button>
+              {!hideElementalSkill&&(
+                <button onClick={()=>setShowPicker(true)}
+                  style={{display:'flex',alignItems:'center',gap:'4px',background:`${elData&&elData.color||'#00c8ff'}11`,border:`1px solid ${elData&&elData.color||'#00c8ff'}55`,borderRadius:'4px',padding:'2px 7px',cursor:'pointer',transition:'all 0.15s',minWidth:0}}
+                  onMouseEnter={e=>e.currentTarget.style.borderColor=elData&&elData.color||'#00c8ff'}
+                  onMouseLeave={e=>e.currentTarget.style.borderColor=`${elData&&elData.color||'#00c8ff'}55`}>
+                  <span style={{fontSize:'12px'}}>{elData&&elData.icon}</span>
+                  <span style={{fontSize:'11px',fontWeight:'bold',color:elData&&elData.color||'#b0dff4',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{selectedElement}</span>
+                  <span style={{fontSize:'9px',color:'#3a6a8a'}}>v</span>
+                </button>
+              )}
             </div>
             {classMeta&&(
               <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',background:`${classMeta.color}11`,border:`1px solid ${classMeta.color}44`,borderRadius:4,padding:'3px 8px',marginBottom:8,gap:6}}>
@@ -884,10 +904,12 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
                 style={{flex:1,padding:'7px 4px',background:canAttack?'rgba(255,180,0,0.12)':'rgba(20,30,40,0.6)',border:`1px solid ${canAttack?'#cc9900':'#1e3a4a'}`,borderRadius:'4px',color:canAttack?'#ffd700':'#2a4a5e',fontSize:'11px',fontWeight:600,cursor:canAttack?'pointer':'not-allowed',letterSpacing:'.04em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
                 MELEE<div style={{fontSize:'8px',opacity:0.7}}>{playerMeleeBase(player.level)} · 1E</div>
               </button>
-              <button onClick={onSkill} disabled={!canSkill}
-                style={{flex:hasClassAction?1:1.2,padding:'7px 4px',background:canSkill?'rgba(200,60,0,0.2)':'rgba(20,30,40,0.6)',border:`1px solid ${canSkill?'#cc3300':'#1e3a4a'}`,borderRadius:'4px',color:canSkill?'#ff6644':'#2a4a5e',fontSize:'11px',fontWeight:600,cursor:canSkill?'pointer':'not-allowed',letterSpacing:'.04em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
-                SKILL<div style={{fontSize:'8px',opacity:0.7}}>{player.skillUsed?'used':`${selectedElement.slice(0,4)}·${skillCost}E`}</div>
-              </button>
+              {!hideElementalSkill&&(
+                <button onClick={onSkill} disabled={!canSkill}
+                  style={{flex:hasClassAction?1:1.2,padding:'7px 4px',background:canSkill?'rgba(200,60,0,0.2)':'rgba(20,30,40,0.6)',border:`1px solid ${canSkill?'#cc3300':'#1e3a4a'}`,borderRadius:'4px',color:canSkill?'#ff6644':'#2a4a5e',fontSize:'11px',fontWeight:600,cursor:canSkill?'pointer':'not-allowed',letterSpacing:'.04em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
+                  SKILL<div style={{fontSize:'8px',opacity:0.7}}>{player.skillUsed?'used':`${selectedElement.slice(0,4)}·${skillCost}E`}</div>
+                </button>
+              )}
               <button onClick={onRotate} disabled={!canRotate} title="Rotate facing — 0 Energy, once per turn"
                 style={{flex:0.6,padding:'7px 2px',background:canRotate?'rgba(0,200,255,0.12)':'rgba(20,30,40,0.6)',border:`1px solid ${canRotate?'#0090b0':'#1e3a4a'}`,borderRadius:'4px',color:canRotate?'#00c8ff':'#2a4a5e',fontSize:'13px',fontWeight:600,cursor:canRotate?'pointer':'not-allowed',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
                 ⟳<div style={{fontSize:'8px',opacity:0.7}}>{player.rotateUsed?'used':'0E'}</div>
@@ -920,7 +942,7 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
             </button>
           )}
         </div>
-        {showPicker&&<ElementPickerModal selectedCategory={selectedCategory} selectedElement={selectedElement} onSelect={onElementSelect} onClose={()=>setShowPicker(false)} />}
+        {showPicker&&<ElementPickerModal selectedCategory={selectedCategory} selectedElement={selectedElement} onSelect={onElementSelect} onClose={()=>setShowPicker(false)} restrictToBase={restrictElementsToBase} />}
     </div>
   );
 };
@@ -1506,15 +1528,52 @@ const RewardModal = ({show,html}) => {
   if(!show) return null;
   return <div style={{position:'fixed',top:'50%',left:'50%',transform:'translate(-50%,-50%)',background:'#080e14',border:'2px solid #00c8ff',boxShadow:'0 0 40px rgba(0,200,255,0.5)',padding:'2rem',borderRadius:10,zIndex:1000,minWidth:300,maxWidth:'90vw',textAlign:'center',color:'#b0dff4'}} dangerouslySetInnerHTML={{__html:html}} />;
 };
+
+// Shown when a Training Mode scene's single enemy is defeated — replaces the
+// normal wave-progression/boss-unlock flow, since a scene is a standalone
+// lesson rather than an endless run.
+const SceneCompleteModal = ({show, sceneMeta, onReturn}) => {
+  if(!show) return null;
+  const color = sceneMeta?.color || '#00cc66';
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.85)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:4000}}>
+      <div style={{background:'#080e14',border:`2px solid ${color}`,borderRadius:12,padding:'2rem',maxWidth:420,width:'92%',textAlign:'center',color:'#b0dff4',boxShadow:`0 0 50px ${color}66`}}>
+        <div style={{fontSize:'11px',letterSpacing:'0.2em',textTransform:'uppercase',color}}>// Scene Cleared</div>
+        <h2 style={{fontSize:'1.4rem',letterSpacing:'0.1em',textTransform:'uppercase',color,marginTop:8}}>{sceneMeta?.name || 'Scene'} Complete</h2>
+        <div style={{fontSize:12,color:'#7a9db5',marginTop:10,marginBottom:20,lineHeight:1.6}}>Nice work. You can replay this scene anytime from the Tutorial Hub.</div>
+        <button onClick={onReturn}
+          style={{width:'100%',padding:12,background:`${color}22`,border:`1px solid ${color}`,borderRadius:6,color,fontSize:14,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.08em'}}>
+          Return to Tutorial Hub
+        </button>
+      </div>
+    </div>
+  );
+};
 // ─── MAIN GAME COMPONENT ───────────────────────────────────────────────────────
 
-export default function GridBattlerGame({ onStateSync } = {}) {
+export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } = {}) {
+  // Training Mode scene config. `scene` is undefined for normal Gauntlet play
+  // (every flag below defaults to current behavior). Each scene isolates one
+  // new mechanic on top of core movement/melee rather than accumulating —
+  // simplest to reason about and keeps Gauntlet's own logic untouched. Class
+  // availability isn't a separate flag here: classUnlocked only starts true
+  // when scene==='classes', and the boss-defeat unlock path never runs in
+  // scene mode (handleEnemyDefeated returns early), so classes stay
+  // naturally locked in every other scene without an extra check.
+  const sceneAllowSkill = !scene || scene==='elements';
+  const sceneIncludeTerrain = !scene || scene==='elements';
+  const sceneRestrictBaseElements = scene==='elements';
+  const sceneMeta = scene ? TUTORIAL_SCENES.find(s=>s.id===scene) : null;
+
   const initPlayer = () => newHero();
   const initEnemy  = (p) => newGoblin(1, p.boardPosition);
 
   const [player,         setPlayer]         = useState(()=>{ const p=initPlayer(); return p; });
   const [enemy,          setEnemy]          = useState(()=>{ const p=initPlayer(); return initEnemy(p); });
-  const [tiles,          setTiles]          = useState(()=>{ const p=initPlayer(); const e=initEnemy(p); return makeTiles(p.boardPosition,e.boardPosition); });
+  const [tiles,          setTiles]          = useState(()=>{
+    const p=initPlayer(); const e=initEnemy(p);
+    return sceneIncludeTerrain ? makeTiles(p.boardPosition,e.boardPosition) : makePlainTiles();
+  });
   const [wave,           setWave]           = useState(1);
   const [round,          setRound]          = useState(1);
   const [playerRolledEnergy, setPlayerRolledEnergy] = useState(0);
@@ -1547,7 +1606,8 @@ export default function GridBattlerGame({ onStateSync } = {}) {
 
   // ── Summoner / class state (v4.0) ──
   const [playerClass,    setPlayerClass]    = useState(null);   // null until unlocked+selected
-  const [classUnlocked,  setClassUnlocked]  = useState(false);  // gate flag (post-boss)
+  const [classUnlocked,  setClassUnlocked]  = useState(scene==='classes');  // gate flag (post-boss, or immediate in the Classes scene)
+  const [sceneComplete,  setSceneComplete]  = useState(false);  // Training Mode: this scene's single enemy is down
   const [showClassModal, setShowClassModal] = useState(false);  // unlock picker
   // Landscape-only game: true when the viewport is taller than it is wide, which
   // triggers a rotate-your-device overlay (the 3-panel row needs the width).
@@ -1592,7 +1652,7 @@ export default function GridBattlerGame({ onStateSync } = {}) {
   const elData = ELEMENTS[selCategory]?.[selElement];
   const canAttack = isPlayerTurn && energyPhase==='act' && player.actionpts>0 && isAdjacent(player.boardPosition,enemy.boardPosition);
   // Earth, Air, and Water bypass adjacency — they're ranged.
-  const canSkill  = isPlayerTurn && energyPhase==='act' && !player.skillUsed && player.actionpts >= skillCost &&
+  const canSkill  = sceneAllowSkill && isPlayerTurn && energyPhase==='act' && !player.skillUsed && player.actionpts >= skillCost &&
     (elData?.isEarth||elData?.isAir||elData?.isWater ? true : isAdjacent(player.boardPosition,enemy.boardPosition));
   // Mastermind: available to a Summoner during the act phase, once per turn,
   // if at least 2 Energy is available (fixed activation cost). Gated by
@@ -2015,6 +2075,13 @@ export default function GridBattlerGame({ onStateSync } = {}) {
 
   // ── ENEMY DEFEAT / REWARDS / WAVES ──
   const handleEnemyDefeated = useCallback((curPlayer, curWave)=>{
+    // Training Mode: a scene is a single standalone lesson, not an endless
+    // run — no XP/wave progression, just mark it cleared.
+    if(scene){
+      addLog(`=== ${enemy.name} defeated! Scene complete. ===`);
+      setSceneComplete(true);
+      return;
+    }
     const xpGain = 200 + curWave*120;
     const hexGain = 50 + curWave*25;
     addLog(`=== ${enemy.name} defeated! +${xpGain} XP, +${hexGain} Hexas ===`);
@@ -2031,7 +2098,7 @@ export default function GridBattlerGame({ onStateSync } = {}) {
     }
     setTimeout(()=>startNextWave(leveled), defeatedBoss && !classUnlocked ? 600 : 1400);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[enemy,addLog,applyLevelUp,classUnlocked]);
+  },[enemy,addLog,applyLevelUp,classUnlocked,scene]);
 
   const startNextWave = useCallback((curPlayer)=>{
     const nextWave = wave + 1;
@@ -2430,12 +2497,20 @@ export default function GridBattlerGame({ onStateSync } = {}) {
   },[]);
 
   const handleSelectClass = useCallback((classId)=>{
+    // Training Mode's Classes scene allows re-opening this picker to swap at
+    // will — clear any class-specific state (active summons, class skill
+    // usage) so a fresh class starts clean. No-op impact on Gauntlet, where
+    // this only ever fires once with playerClass still null.
+    const isSwitch = !!playerClass && playerClass!==classId;
     setPlayerClass(classId);
     setShowClassModal(false);
+    setSummons([]);
+    setSelectedSummonId(null);
+    setPlayer(p=>({...p, classSkillUsed:false}));
     const meta=UNLOCKABLE_CLASSES.find(c=>c.id===classId);
-    addLog(`=== Class equipped: ${meta?meta.name:classId}! ===`);
-    showReward(`<h2 style="color:#9b6cff;letter-spacing:.1em">CLASS UNLOCKED</h2><p style="font-size:1.3rem;margin:10px 0;color:#b08cff">${meta?meta.icon+' '+meta.name:classId}</p><p style="color:#8ab5cc;font-size:.85rem;max-width:320px">${meta?meta.blurb:''}</p>`,3500);
-  },[addLog,showReward]);
+    addLog(`=== Class ${isSwitch?'switched to':'equipped'}: ${meta?meta.name:classId}! ===`);
+    showReward(`<h2 style="color:#9b6cff;letter-spacing:.1em">${isSwitch?'CLASS SWITCHED':'CLASS UNLOCKED'}</h2><p style="font-size:1.3rem;margin:10px 0;color:#b08cff">${meta?meta.icon+' '+meta.name:classId}</p><p style="color:#8ab5cc;font-size:.85rem;max-width:320px">${meta?meta.blurb:''}</p>`,3500);
+  },[addLog,showReward,playerClass]);
 
   // ── GRID CLICK ROUTER ──
   const handleSquareClick = useCallback((x,y)=>{
@@ -2533,6 +2608,14 @@ export default function GridBattlerGame({ onStateSync } = {}) {
   const didInitRef = useRef(false);
   useEffect(()=>{ didInitRef.current=true; },[]);
 
+  // Classes scene: surface the class picker immediately on entry rather than
+  // requiring a boss defeat — the whole point of this scene is trying classes
+  // out with no grind.
+  useEffect(()=>{
+    if(scene==='classes') setShowClassModal(true);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
+
   // Mirror the live Proxy/session state up to a host shell (e.g. a Character
   // screen elsewhere in the app) that isn't otherwise able to see this
   // component's internal state. No-op if no callback was passed in.
@@ -2609,13 +2692,13 @@ export default function GridBattlerGame({ onStateSync } = {}) {
         <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:8,flexWrap:'wrap',gap:6}}>
           <div style={{display:'flex',alignItems:'baseline',gap:10}}>
             <h1 style={{fontFamily:"'Advent Pro',sans-serif",fontSize:'1.25rem',fontWeight:700,letterSpacing:'0.18em',textTransform:'uppercase',color:'#00c8ff',textShadow:'0 0 18px rgba(0,200,255,0.4)',margin:0}}>Paradigm</h1>
-            <span style={{fontSize:'0.7rem',letterSpacing:'0.2em',color:'#3a6a8a',textTransform:'uppercase'}}>Grid Battler</span>
+            <span style={{fontSize:'0.7rem',letterSpacing:'0.2em',color:'#3a6a8a',textTransform:'uppercase'}}>{sceneMeta ? `Training — ${sceneMeta.name}` : 'Grid Battler'}</span>
             <span style={{fontSize:'0.62rem',letterSpacing:'0.15em',color:'#2a4a5e',fontFamily:'monospace'}}>v4.3</span>
           </div>
           <div style={{display:'flex',gap:14,alignItems:'center',fontSize:'0.8rem',fontFamily:'monospace'}}>
-            <span style={{color:'#7a9db5'}}>Wave <span style={{color:'#00c8ff',fontWeight:'bold'}}>{wave}</span></span>
+            {!scene&&<span style={{color:'#7a9db5'}}>Wave <span style={{color:'#00c8ff',fontWeight:'bold'}}>{wave}</span></span>}
             <span style={{color:'#7a9db5'}}>Round <span style={{color:'#00c8ff',fontWeight:'bold'}}>{round}</span></span>
-            <span style={{color:'#7a9db5'}}>Hexas <span style={{color:'#ffd700',fontWeight:'bold'}}>{hexas}</span></span>
+            {!scene&&<span style={{color:'#7a9db5'}}>Hexas <span style={{color:'#ffd700',fontWeight:'bold'}}>{hexas}</span></span>}
             {playerClass&&(()=>{const m=UNLOCKABLE_CLASSES.find(c=>c.id===playerClass);return <span style={{color:m.color,fontWeight:'bold',display:'flex',alignItems:'center',gap:3}}>{m.icon}{m.name}</span>;})()}
           </div>
         </div>
@@ -2651,6 +2734,7 @@ export default function GridBattlerGame({ onStateSync } = {}) {
                 canMastermind={canMastermind} onMastermind={handleMastermind}
                 canRotate={canRotate} onRotate={handleRotateOpen}
                 canDarkWeb={canDarkWeb} onDarkWeb={handleDarkWeb}
+                hideElementalSkill={!sceneAllowSkill} restrictElementsToBase={sceneRestrictBaseElements}
               />
             </div>
 
@@ -2673,7 +2757,7 @@ export default function GridBattlerGame({ onStateSync } = {}) {
                 </div>
               </div>
               <div style={{display:'grid',gridTemplateColumns:'repeat(3, auto)',gap:'3px 12px',justifyContent:'center',alignItems:'center',marginTop:6,paddingTop:6,borderTop:'1px solid #1e3a4a',flexShrink:0}}>
-                {TILE_LEGEND.map(l=>(
+                {sceneIncludeTerrain && TILE_LEGEND.map(l=>(
                   <div key={l.type} style={{display:'flex',alignItems:'center',gap:4,fontSize:'9px',color:'#5a7a8a',whiteSpace:'nowrap'}}>
                     <span style={{width:10,height:10,borderRadius:2,border:`1px solid ${l.border}`,background:l.bg,display:'inline-block',flexShrink:0}} />
                     {l.label}
@@ -2749,7 +2833,7 @@ export default function GridBattlerGame({ onStateSync } = {}) {
         waterAnchorInBounds={waterAnchorInBounds} waterEnemyInFootprint={waterEnemyInFootprint}
         playerFacing={player.facing} enemyDistance={enemyDistanceForAir}
       />
-      <ClassUnlockModal show={showClassModal} onSelect={handleSelectClass} onClose={()=>setShowClassModal(false)} />
+      <ClassUnlockModal show={showClassModal} onSelect={handleSelectClass} onClose={()=>setShowClassModal(false)} freeSelect={scene==='classes'} />
       <MastermindModeModal
         show={showMmModal} canDeploy={canDeploy} deployReason={deployBlockedReason}
         onPickDirect={handlePickDirect} onPickDeploy={handlePickDeploy} onClose={()=>setShowMmModal(false)}
@@ -2759,6 +2843,18 @@ export default function GridBattlerGame({ onStateSync } = {}) {
         awaitingPlacement={awaitingPlacement} onRoll={handleDeployRoll} onClose={handleCloseDeploy}
       />
       <RewardModal show={reward.show} html={reward.html} />
+      <SceneCompleteModal show={sceneComplete} sceneMeta={sceneMeta} onReturn={()=>onSceneComplete?.()} />
+
+      {/* Change Class — Training Mode's Classes scene only, lets the player
+          reopen the picker and swap freely instead of a one-time choice. */}
+      {scene==='classes'&&!showClassModal&&!sceneComplete&&(
+        <div style={{position:'fixed',bottom:20,left:'50%',transform:'translateX(-50%)',zIndex:1500}}>
+          <button onClick={()=>setShowClassModal(true)}
+            style={{padding:'9px 18px',background:'rgba(155,108,255,0.16)',border:'1px solid #9b6cff',borderRadius:8,color:'#b08cff',fontSize:12,fontWeight:700,letterSpacing:'0.08em',textTransform:'uppercase',cursor:'pointer',fontFamily:"'Rajdhani',sans-serif",boxShadow:'0 0 20px rgba(155,108,255,0.3)'}}>
+            ⇄ Change Class
+          </button>
+        </div>
+      )}
 
       {/* Compass targeting banner */}
       {compassTargeting&&(
