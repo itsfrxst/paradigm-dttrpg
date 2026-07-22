@@ -1732,54 +1732,51 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } 
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[addLog,round]);
 
+  // Resolves a single summon's move/attack against the current (closured)
+  // player/enemy/summons state — deliberately NOT nested setState updaters.
+  // The previous version chained setSummons(curSummons => { ... setPlayer(curPlayer
+  // => { ... setEnemy(curEnemy => { didAct=true; ... }) ...; if(!didAct) ... }) ...})
+  // and relied on `didAct` being mutated inside the innermost updater and
+  // read back by the outer ones immediately after — but React doesn't
+  // guarantee an updater function runs synchronously at its call site, so
+  // `didAct` was often still false when checked. That silently skipped both
+  // the summon's position update AND the pool.actionpts-1 decrement, which
+  // is exactly why summons sat idle and the pool never seemed to spend.
   const resolveSummonAction = useCallback((summonId, tile)=>{
-    setSummons(curSummons=>{
-      const idx=curSummons.findIndex(s=>s.id===summonId);
-      if(idx<0) return curSummons;
-      const s=curSummons[idx];
-      let didAct=false;
-      let wasAttack=false;
-      setPlayer(curPlayer=>{
-        if(curPlayer.actionpts<=0){ addLog('// Pool empty — cannot act'); return curPlayer; }
-        setEnemy(curEnemy=>{
-          const kind=summonActionAt(s,tile,curEnemy,curSummons);
-          if(!kind) return curEnemy;
-          didAct=true;
-          if(kind==='attack'){
-            wasAttack=true;
-            const dmg=s.atk;
-            const newHP=Math.max(0,curEnemy.health-dmg);
-            addLog(`${s.name} strikes ${curEnemy.name} → ${dmg} dmg (${newHP}/${curEnemy.maxHealth})`);
-            const ne={...curEnemy,health:newHP};
-            if(newHP<=0){
-              addLog('=== Enemy defeated by summons! ===');
-              setTimeout(()=>handleEnemyDefeated({...curPlayer,actionpts:curPlayer.actionpts-1}, wave),400);
-            }
-            return ne;
-          }
-          return curEnemy;
-        });
-        if(!didAct) return curPlayer;
-        return {...curPlayer, actionpts:curPlayer.actionpts-1};
-      });
-      if(!didAct) return curSummons;
-      const next=curSummons.slice();
-      if(wasAttack){
-        next[idx]={...s};
-      } else if(tile.y===ENEMY_BACK_ROW){
-        next[idx]={...s,boardPosition:tile,promoted:true};
-        addLog(`★ ${s.name} reaches the back row → promotes to Agent (autonomous staged)`);
-      } else {
-        next[idx]={...s,boardPosition:tile};
-        addLog(`${s.name} advances → (${tile.x},${tile.y})`);
+    const s = summons.find(z=>z.id===summonId);
+    if(!s) return;
+    if(player.actionpts<=0){ addLog('// Pool empty — cannot act'); return; }
+    const kind = summonActionAt(s, tile, enemy, summons);
+    if(!kind) return;
+
+    const updatedPlayer = {...player, actionpts:player.actionpts-1};
+    setPlayer(updatedPlayer);
+
+    if(kind==='attack'){
+      const dmg=s.atk;
+      const newHP=Math.max(0,enemy.health-dmg);
+      addLog(`${s.name} strikes ${enemy.name} → ${dmg} dmg (${newHP}/${enemy.maxHealth})`);
+      setEnemy({...enemy,health:newHP});
+      if(newHP<=0){
+        addLog('=== Enemy defeated by summons! ===');
+        setTimeout(()=>handleEnemyDefeated(updatedPlayer, wave),400);
       }
-      return next.filter(z=>!z.promoted);
-    });
+      // Summon holds its tile on an attack — it doesn't move into the enemy.
+    } else if(tile.y===ENEMY_BACK_ROW){
+      setSummons(prev=>prev.filter(z=>z.id!==summonId));
+      addLog(`★ ${s.name} reaches the back row → promotes to Agent (autonomous staged)`);
+    } else {
+      setSummons(prev=>prev.map(z=>z.id===summonId?{...z,boardPosition:tile}:z));
+      addLog(`${s.name} advances → (${tile.x},${tile.y})`);
+    }
+
     setActedSummonIds(prev=>[...prev,summonId]);
     setSelectedSummonId(null);
     setValidSquares([]);
+  // handleEnemyDefeated is defined later in the file (const, TDZ) — referenced
+  // in the closure body only, can't be listed here without a definition-order crash.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[addLog,summonActionAt,wave]);
+  },[summons,player,enemy,addLog,summonActionAt,wave]);
 
   const checkEndOfRound = useCallback((latestPlayer,latestEnemy,currentRound)=>{
     if(latestPlayer.actionpts>0||latestEnemy.actionpts>0) return;
