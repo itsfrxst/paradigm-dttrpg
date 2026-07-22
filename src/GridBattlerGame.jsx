@@ -705,11 +705,17 @@ const MastermindModeModal = ({show, canDeploy, deployReason, onPickDirect, onPic
 // Deploy roll modal — rolls the d100 sigil, reveals the tier, then prompts the
 // player to pick a legal row-7 tile (handled on the grid).
 const DeployRollModal = ({show, rolling, roll, tier, awaitingPlacement, onRoll, onClose}) => {
-  if(!show) return null;
+  // Once placement is awaited, the grid itself needs to be clickable — a
+  // full-screen backdrop here would sit on top of it and eat every click,
+  // making the highlighted row-7 tiles unreachable. Bail out to null and let
+  // the fixed bottom-center banner (rendered alongside the grid) carry the
+  // status + cancel affordance instead, same pattern as Compass Slash/Dark
+  // Web/Summon Command targeting.
+  if(!show || awaitingPlacement) return null;
   const purple='#9b6cff';
   const meta = tier ? SUMMON_TIER_META[tier] : null;
   return (
-    <div onClick={awaitingPlacement?undefined:onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.82)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:2500}}>
+    <div onClick={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.82)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:2500}}>
       <div onClick={e=>e.stopPropagation()} style={{background:'#080e14',border:`2px solid ${meta?meta.color:purple}`,borderRadius:10,padding:'1.4rem',maxWidth:400,width:'92%',maxHeight:'85vh',overflowY:'auto',color:'#b0dff4',boxShadow:`0 0 40px ${(meta?meta.color:purple)}44`}}>
         <div style={{textAlign:'center',marginBottom:16}}>
           <span style={{fontSize:24}}>◈</span>
@@ -730,22 +736,16 @@ const DeployRollModal = ({show, rolling, roll, tier, awaitingPlacement, onRoll, 
             </div>
           </div>
         )}
-        {awaitingPlacement
-          ? <div style={{textAlign:'center',fontSize:'12px',color:meta.color,padding:'8px 0',animation:'pulseGold 1.2s infinite'}}>
-              ▸ Pick a highlighted tile on row 7 to deploy
-            </div>
-          : roll===null
-            ? <button onClick={onRoll} disabled={rolling}
-                style={{width:'100%',padding:14,background:`${purple}22`,color:purple,border:`1px solid ${purple}`,borderRadius:6,fontSize:16,fontWeight:'bold',cursor:rolling?'not-allowed':'pointer',letterSpacing:'0.1em'}}>
-                {rolling?'Rolling...':'Roll Sigil (d100)'}
-              </button>
-            : null}
-        {!awaitingPlacement&&(
-          <button onClick={onClose}
-            style={{width:'100%',marginTop:12,padding:8,background:'transparent',color:'#3a5a6a',border:'1px solid #1e3a4a',borderRadius:5,cursor:'pointer',fontSize:12}}>
-            Cancel
-          </button>
-        )}
+        {roll===null
+          ? <button onClick={onRoll} disabled={rolling}
+              style={{width:'100%',padding:14,background:`${purple}22`,color:purple,border:`1px solid ${purple}`,borderRadius:6,fontSize:16,fontWeight:'bold',cursor:rolling?'not-allowed':'pointer',letterSpacing:'0.1em'}}>
+              {rolling?'Rolling...':'Roll Sigil (d100)'}
+            </button>
+          : null}
+        <button onClick={onClose}
+          style={{width:'100%',marginTop:12,padding:8,background:'transparent',color:'#3a5a6a',border:'1px solid #1e3a4a',borderRadius:5,cursor:'pointer',fontSize:12}}>
+          Cancel
+        </button>
       </div>
     </div>
   );
@@ -2426,9 +2426,8 @@ export default function GridBattlerGame({ onStateSync } = {}) {
   },[deployTiles,deployTier,player,enemy,summons,addLog,routeAfterPlayerAction]);
 
   const handleCloseDeploy = useCallback(()=>{
-    if(awaitingPlacement) return; // must place once rolled
-    setShowDeploy(false); setDeployRoll(null); setDeployTier(null);
-  },[awaitingPlacement]);
+    setShowDeploy(false); setAwaitingPlacement(false); setDeployRoll(null); setDeployTier(null);
+  },[]);
 
   const handleSelectClass = useCallback((classId)=>{
     setPlayerClass(classId);
@@ -2771,6 +2770,13 @@ export default function GridBattlerGame({ onStateSync } = {}) {
       {darkWebTargeting&&(
         <div style={{position:'fixed',bottom:20,left:'50%',transform:'translateX(-50%)',background:'#080e14',border:'1px solid #a0a0a0',borderRadius:8,padding:'10px 18px',color:'#c0c0c0',fontSize:13,zIndex:1500,boxShadow:'0 0 24px rgba(160,160,160,0.35)'}}>
           ⚔ Dark Web — click a highlighted knight-move tile · <span onClick={()=>setDarkWebTargeting(false)} style={{color:'#5a7a8a',cursor:'pointer',textDecoration:'underline'}}>cancel</span>
+        </div>
+      )}
+      {/* Circuit Sigil placement banner — replaces the modal once a tier has
+          rolled, so the grid's row-7 tiles are actually clickable. */}
+      {showDeploy&&awaitingPlacement&&(
+        <div style={{position:'fixed',bottom:20,left:'50%',transform:'translateX(-50%)',background:'#080e14',border:`1px solid ${SUMMON_TIER_META[deployTier]?.color||'#9b6cff'}`,borderRadius:8,padding:'10px 18px',color:SUMMON_TIER_META[deployTier]?.color||'#9b6cff',fontSize:13,zIndex:1500,boxShadow:`0 0 24px ${SUMMON_TIER_META[deployTier]?.color||'#9b6cff'}55`}}>
+          ◈ {deployTier} Novice ready — click a highlighted tile on row 7 · <span onClick={handleCloseDeploy} style={{color:'#5a7a8a',cursor:'pointer',textDecoration:'underline'}}>cancel</span>
         </div>
       )}
       {/* Rotate direction-picker banner */}
