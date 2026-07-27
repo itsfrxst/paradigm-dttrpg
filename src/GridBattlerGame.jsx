@@ -419,7 +419,11 @@ const SUMMON_TIER_META = {
 };
 
 let SUMMON_SEQ = 0;
-const makeSummon = (tier, pos) => ({
+// `side`/`ownerId` let Campaign mode's shared `summons` array hold both
+// player- and enemy-deployed Novices at once. Player summons (side:'player')
+// march toward row 0 as before; enemy summons (side:'enemy') march the
+// opposite direction, toward the player (row 8).
+const makeSummon = (tier, pos, side='player', ownerId=null) => ({
   id: `S${++SUMMON_SEQ}`,
   tier,
   name: `${tier} Novice`,
@@ -427,8 +431,10 @@ const makeSummon = (tier, pos) => ({
   maxHealth: SUMMON_HP,
   atk: SUMMON_ATK,
   boardPosition: pos,
-  facing: 'up',          // summons march toward row 0; fixed, cannot turn
-  promoted: false,       // becomes true on reaching ENEMY_BACK_ROW (Agent — staged)
+  facing: side==='enemy' ? 'down' : 'up', // fixed marching direction, cannot turn
+  promoted: false,       // becomes true on reaching the far row (Agent — staged)
+  side,
+  ownerId,
 });
 
 const TILE_LEGEND = [
@@ -439,9 +445,9 @@ const TILE_LEGEND = [
   {type:'healing',    label:'Heal: +100 HP',  border:'#00ff88',bg:'linear-gradient(135deg,#0d3d0d,#052005)'},
 ];
 
-const makeTiles = (playerPos,enemyPos) => {
+const makeTiles = (playerPos,enemyPos,extraOccupied=[]) => {
   const grid=Array.from({length:SIZE},()=>Array(SIZE).fill(TILE_TYPES.NORMAL));
-  const occupied=[playerPos,enemyPos];
+  const occupied=[playerPos,enemyPos,...extraOccupied];
   ['fire','water','earth','air'].forEach(el=>{
     for(let i=0;i<2;i++){const pos=getRandomFreePosition(occupied);grid[pos.y][pos.x]=`${el}_boost`;occupied.push(pos);}
   });
@@ -475,13 +481,14 @@ const calcAvailableSquares = (pos,ap) => {
 
 // Legal Deploy tiles: row 7, normal tile only (no boost/healing), not occupied
 // by the player, enemy, or an existing summon.
-const getDeployTiles = (tiles, playerPos, enemyPos, summons) => {
+const getDeployTiles = (tiles, playerPos, enemyPositions, summons) => {
+  const enemyList = Array.isArray(enemyPositions) ? enemyPositions : [enemyPositions];
   const out=[];
   for(let x=0;x<SIZE;x++){
     const y=SUMMON_ROW;
     if(tiles?.[y]?.[x]!==TILE_TYPES.NORMAL) continue;
     if(playerPos.x===x&&playerPos.y===y) continue;
-    if(enemyPos.x===x&&enemyPos.y===y) continue;
+    if(enemyList.some(p=>p.x===x&&p.y===y)) continue;
     if(summons.some(s=>s.boardPosition.x===x&&s.boardPosition.y===y)) continue;
     out.push({x,y});
   }
@@ -557,6 +564,223 @@ const newGoblin = (level, _playerPos) => {
                  : tier.canFlank ? 'Skirmisher Goblin'
                  : (level===1 ? 'Goblin' : `Goblin Lv${level}`);
   return {...makeCharacter(tierName,hp,level,agi,0,pos,null,null),energyRollover:0};
+};
+
+// ─── CAMPAIGN MODE (multi-enemy squads) ────────────────────────────────────────
+// Rank determines which of {melee, element, class} an enemy Proxie carries.
+// Rank 1 = Full Proxie (all three). Rank 2 = element+class, no melee. Rank 3 =
+// melee + one of {element,class} (randomized). Rank 4 = exactly one of the
+// three (randomized). Independent of `enemyTier`, which still scales HP/melee
+// base off `level` as it always has.
+const rollEnemyCapabilities = (rank) => {
+  if(rank===1) return { melee:true,  element:true,  class:true };
+  if(rank===2) return { melee:false, element:true,  class:true };
+  if(rank===3){
+    const pick = Math.random()<0.5 ? 'element' : 'class';
+    return { melee:true, element:pick==='element', class:pick==='class' };
+  }
+  // rank 4 — exactly one skill
+  const pick = ['melee','element','class'][Math.floor(Math.random()*3)];
+  return { melee:pick==='melee', element:pick==='element', class:pick==='class' };
+};
+
+const ENEMY_CLASS_POOL = ['Summoner','Rogue'];
+
+let ENEMY_SEQ = 0;
+const makeEnemyProxie = (rank, level, pos) => {
+  const caps = rollEnemyCapabilities(rank);
+  const element = caps.element ? BOSS_ELEMENTS[Math.floor(Math.random()*BOSS_ELEMENTS.length)] : null;
+  const enemyClass = caps.class ? ENEMY_CLASS_POOL[Math.floor(Math.random()*ENEMY_CLASS_POOL.length)] : null;
+  const hp = ENEMY_HP_W1+(level-1)*ENEMY_HP_SCALE;
+  const agi = Math.min(1+Math.floor(level/3),3);
+  const name = element && enemyClass ? `${element} ${enemyClass} Proxie`
+    : enemyClass ? `${enemyClass} Adept`
+    : element ? `${element} Warden`
+    : 'Grunt Proxie';
+  return {
+    ...makeCharacter(name, hp, level, agi, 0, pos, element, element?'base':null),
+    energyRollover:0,
+    id: `E${++ENEMY_SEQ}`,
+    rank,
+    enemyClass,
+    canMelee: caps.melee,
+    canElement: caps.element,
+    canClass: caps.class,
+  };
+};
+
+// The 3-battle Campaign arc: escalating from a pair of single-skill Rank 4
+// grunts to a lone Rank 1 "Full Proxie" finale. `level` drives HP/melee-base
+// scaling via the existing enemyTier system, independent of rank.
+export const CAMPAIGN_BATTLES = [
+  { stage:1, name:'Skirmish Line',  roster:[{rank:4},{rank:4}], level:2 },
+  { stage:2, name:'Strike Squad',   roster:[{rank:3},{rank:3}], level:8 },
+  { stage:3, name:'Command Proxie', roster:[{rank:1}],          level:10, isFinale:true },
+];
+
+// Places each roster slot on the enemy back row (row 0), retrying on
+// collision with player/previously-placed enemies.
+const spawnCampaignRoster = (stage, playerPos) => {
+  const battle = CAMPAIGN_BATTLES[stage-1];
+  const placed = [];
+  battle.roster.forEach(({rank})=>{
+    let pos, guard=0;
+    do {
+      pos = rollBackRowPosition(0);
+      guard++;
+    } while((pos.x===playerPos.x&&pos.y===playerPos.y || placed.some(p=>p.boardPosition.x===pos.x&&p.boardPosition.y===pos.y)) && guard<50);
+    placed.push(makeEnemyProxie(rank, battle.level, {x:pos.x,y:pos.y}));
+  });
+  return placed;
+};
+
+// Resolves an elemental skill cast by `attacker` (any enemy-shaped unit)
+// against `target`, given the current `tiles` grid. Pure — no state writes.
+// Mirrors the Fire/Earth/Air/Water math already used by Gauntlet's
+// single-enemy `runEnemyTurn` (dice, accuracy, tile boosts, ranged min-damage
+// floors, Water AoE, Air knockback), extracted here so every Campaign enemy
+// with `canElement` gets the identical mechanics rather than a stand-in.
+// Returns null if the attacker has no element.
+const computeElementalStrike = (attacker, target, tiles) => {
+  const elData = attacker.element ? ELEMENTS[attacker.elementCategory]?.[attacker.element] : null;
+  if(!elData) return null;
+  const rolls = elData.dice.map(d=>({type:d,value:rollDie(parseInt(d.slice(1)))}));
+  const ranged = elData.isEarth||elData.isAir||elData.isWater;
+  const castFacing = ranged ? facingToward(attacker.boardPosition,target.boardPosition) : attacker.facing;
+  let dmg=0, eCost=getSkillCost(attacker.elementCategory, attacker.element), knockbackPos=null, log='';
+
+  if(elData.isFire){
+    const pulses=rolls[0].value, dmgEach=rolls[1].value;
+    const base=pulses*dmgEach*SKILL_DICE_MULT;
+    const acc=rollD100Accuracy();
+    dmg=applyAccuracy(base,acc);
+    const flank=getFlankBonus(attacker.boardPosition,target.boardPosition,target.facing);
+    if(flank.bonus>0) dmg+=flank.bonus;
+    const tileBoost=getTileBoost(tiles,attacker.boardPosition,'Fire');
+    if(tileBoost>0) dmg+=tileBoost;
+    log=`${attacker.name} Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${tileBoost>0?' [Fire tile +20]':''}`;
+  } else if(elData.isEarth){
+    const dieRoll=rolls[0].value;
+    const maxRange=Math.max(1,Math.floor(dieRoll/2));
+    const chosenRange=Math.max(1,Math.min(maxRange, attacker.actionpts-1));
+    const line=getForwardTiles(attacker.boardPosition,castFacing,chosenRange);
+    const hit=line.some(t=>t.x===target.boardPosition.x&&t.y===target.boardPosition.y);
+    const base=dieRoll*SKILL_DICE_MULT;
+    const acc=rollD100Accuracy();
+    const tileBoost=getTileBoost(tiles,attacker.boardPosition,'Earth');
+    dmg=hit?Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost:0;
+    eCost=1+chosenRange;
+    log=`${attacker.name} Tremor [d6=${dieRoll}, ${chosenRange} tile${chosenRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg':'MISS'}`;
+  } else if(elData.isAir){
+    const dieRoll=rolls[0].value;
+    const maxLine=getForwardTiles(attacker.boardPosition,castFacing,SIZE);
+    const targetStep=maxLine.findIndex(t=>t.x===target.boardPosition.x&&t.y===target.boardPosition.y);
+    const targetDist=targetStep>=0?targetStep+1:-1;
+    const canReach=targetDist>0&&targetDist<dieRoll;
+    const chosenRange=canReach?targetDist:Math.max(1,dieRoll-1);
+    const base=Math.max(0,(dieRoll-chosenRange)*SKILL_DICE_MULT);
+    const line=getForwardTiles(attacker.boardPosition,castFacing,chosenRange);
+    const hit=line.some(t=>t.x===target.boardPosition.x&&t.y===target.boardPosition.y);
+    const acc=rollD100Accuracy();
+    const tileBoost=getTileBoost(tiles,attacker.boardPosition,'Air');
+    dmg=hit?Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost:0;
+    eCost=2;
+    if(hit){
+      const kbPos=getKnockbackPos(target.boardPosition,castFacing);
+      const kbBlocked=!kbPos||(kbPos.x===attacker.boardPosition.x&&kbPos.y===attacker.boardPosition.y);
+      if(kbPos&&!kbBlocked) knockbackPos=kbPos;
+    }
+    log=`${attacker.name} Gale Force [d8=${dieRoll}, range ${chosenRange}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg':'MISS'}`;
+  } else if(elData.isWater){
+    const dieRoll=rolls[0].value;
+    const res=resolveTorrent(dieRoll);
+    const anchor=getTorrentAnchor(attacker.boardPosition,castFacing);
+    const opts=getTorrentOptions(dieRoll,attacker.actionpts).filter(o=>o.affordable);
+    if(opts.length===0){
+      dmg=0; eCost=Math.min(TORRENT_AOE_COST.single,attacker.actionpts);
+      log=`${attacker.name} Torrent [d20=${dieRoll}] -> insufficient Energy, disperses`;
+    } else {
+      let chosen=null;
+      for(const o of opts){
+        const fp=getTorrentFootprint(anchor,o.aoe);
+        if(fp.some(t=>t.x===target.boardPosition.x&&t.y===target.boardPosition.y)){ chosen=o; break; }
+      }
+      if(!chosen) chosen=opts[opts.length-1];
+      eCost=chosen.cost;
+      const footprint=getTorrentFootprint(anchor,chosen.aoe);
+      const hit=footprint.some(t=>t.x===target.boardPosition.x&&t.y===target.boardPosition.y);
+      const acc=rollD100Accuracy();
+      const tileBoost=getTileBoost(tiles,attacker.boardPosition,'Water');
+      dmg=hit?applyAccuracy(res.damage,acc)+tileBoost:0;
+      log=`${attacker.name} Torrent [d20=${dieRoll}, ${AOE_LABEL[chosen.aoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg':'MISS'}`;
+    }
+  }
+  return { dmg, eCost, castFacing, knockbackPos, log };
+};
+
+// Auto-resolves every un-acted summon owned by `thisEnemy` in one batch, 1 AP
+// each: march one tile toward the player (row+1, opposite of a player
+// summon's row-1 march) or, if already lined up ahead, strike the player
+// directly. Mirrors the player's own summon move/attack rule for the
+// opposite marching direction. Pure — returns results, writes no state.
+const commandEnemySummons = (thisEnemy, allSummons, otherEnemies, player) => {
+  let nextSummons = allSummons;
+  let apLeft = thisEnemy.actionpts;
+  let playerHP = player.health;
+  const logs = [];
+  const owned = allSummons.filter(s=>s.side==='enemy' && s.ownerId===thisEnemy.id);
+  for(const s of owned){
+    if(apLeft<=0) break;
+    const cur = nextSummons.find(z=>z.id===s.id);
+    if(!cur) continue;
+    const fwd = {x:cur.boardPosition.x, y:cur.boardPosition.y+1};
+    if(fwd.x===player.boardPosition.x && fwd.y===player.boardPosition.y){
+      const dmg=cur.atk;
+      playerHP=Math.max(0,playerHP-dmg);
+      logs.push(`${cur.name} (enemy) strikes you -> ${dmg} dmg`);
+      apLeft--;
+      continue;
+    }
+    if(fwd.y>=SIZE){
+      nextSummons = nextSummons.filter(z=>z.id!==cur.id);
+      logs.push(`* ${cur.name} reaches your line — promotes to Agent (autonomous staged)`);
+      apLeft--;
+      continue;
+    }
+    const blocked = nextSummons.some(z=>z.id!==cur.id&&z.boardPosition.x===fwd.x&&z.boardPosition.y===fwd.y)
+      || otherEnemies.some(e=>e.boardPosition.x===fwd.x&&e.boardPosition.y===fwd.y);
+    if(blocked) continue;
+    nextSummons = nextSummons.map(z=>z.id===cur.id?{...z,boardPosition:fwd}:z);
+    logs.push(`${cur.name} (enemy) advances -> (${fwd.x},${fwd.y})`);
+    apLeft--;
+  }
+  return { nextSummons, apSpent: thisEnemy.actionpts-apLeft, playerHP, logs };
+};
+
+// Decides whether `thisEnemy` uses its class skill this pass, and how.
+// Summoner: Compass-Slash-equivalent (60 dmg) if the player is in the 8
+// surrounding tiles, else Deploy a Novice on the tile directly ahead if
+// bandwidth allows. Rogue: Dark Web if the player is a knight-move away.
+// Pure decision — no state writes, no dice rolled here (that happens where
+// the result is applied, same separation `computeElementalStrike` uses).
+const resolveEnemyClassSkill = (thisEnemy, currentPlayer, currentSummons) => {
+  if(thisEnemy.enemyClass==='Rogue'){
+    if(isKnightMove(thisEnemy.boardPosition, currentPlayer.boardPosition)) return { kind:'darkweb' };
+    return null;
+  }
+  if(thisEnemy.enemyClass==='Summoner'){
+    if(isAdjacent8(thisEnemy.boardPosition, currentPlayer.boardPosition)) return { kind:'direct' };
+    const ownCount = currentSummons.filter(s=>s.side==='enemy'&&s.ownerId===thisEnemy.id).length;
+    if(ownCount<BANDWIDTH){
+      const fwd = {x:thisEnemy.boardPosition.x,y:thisEnemy.boardPosition.y+1};
+      const blocked = fwd.y>=SIZE
+        || currentSummons.some(s=>s.boardPosition.x===fwd.x&&s.boardPosition.y===fwd.y)
+        || (currentPlayer.boardPosition.x===fwd.x&&currentPlayer.boardPosition.y===fwd.y);
+      if(!blocked) return { kind:'deploy', tile:fwd };
+    }
+    return null;
+  }
+  return null;
 };
 
 // Available classes for the post-boss unlock modal. The list is structured
@@ -802,11 +1026,12 @@ const ElementPickerModal = ({selectedCategory,selectedElement,onSelect,onClose,r
   );
 };
 
-const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedElement,onElementSelect,canAttack,canSkill,onMelee,onSkill,onEndTurn,onRollEnergy,energyPhase,onSurrender,enemy,enemyRolledEnergy,isPlayerTurn,playerClass,summons,canMastermind,onMastermind,canRotate,onRotate,canDarkWeb,onDarkWeb,hideElementalSkill,restrictElementsToBase}) => {
+const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedElement,onElementSelect,canAttack,canSkill,onMelee,onSkill,onEndTurn,onRollEnergy,energyPhase,onSurrender,enemy,enemyRolledEnergy,enemies,enemyRolledEnergyById,selectedEnemyId,onSelectEnemy,isPlayerTurn,playerClass,summons,canMastermind,onMastermind,canRotate,onRotate,canDarkWeb,onDarkWeb,hideElementalSkill,restrictElementsToBase}) => {
   const [showPicker,setShowPicker]=useState(false);
   const allEl={...ELEMENTS.base,...ELEMENTS.minor,...ELEMENTS.major};
   const elData=allEl[selectedElement];
-  const enemyElData=enemy.element?ELEMENTS[enemy.elementCategory]&&ELEMENTS[enemy.elementCategory][enemy.element]:null;
+  // Campaign passes `enemies` (roster array) instead of a single `enemy`.
+  const enemyElData=(!enemies&&enemy.element)?ELEMENTS[enemy.elementCategory]&&ELEMENTS[enemy.elementCategory][enemy.element]:null;
   const showRollBtn = isPlayerTurn && energyPhase==='roll';
   const showActions = isPlayerTurn && energyPhase==='act';
   const skillCost = getSkillCost(selectedCategory, selectedElement);
@@ -839,7 +1064,7 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
                 <span style={{display:'flex',alignItems:'center',gap:5,fontSize:'11px',color:classMeta.color,fontWeight:'bold',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>
                   <span>{classMeta.icon}</span>{classMeta.name}
                 </span>
-                {hasSummoner&&<span style={{fontSize:'10px',color:'#8ab5cc',fontFamily:'monospace',whiteSpace:'nowrap'}}>Bandwidth {summons.length}/{BANDWIDTH}</span>}
+                {hasSummoner&&<span style={{fontSize:'10px',color:'#8ab5cc',fontFamily:'monospace',whiteSpace:'nowrap'}}>Bandwidth {summons.filter(s=>!s.side||s.side==='player').length}/{BANDWIDTH}</span>}
               </div>
             )}
             <StatLine
@@ -849,10 +1074,10 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
             />
             <EnergyBar current={player.actionpts} rolled={playerRolledEnergy} rollover={player.energyRollover} />
             {player.frozen>0&&<StatLine label="Freeze" value={`-${player.frozen} Energy next round`} accent="#a0e4ff" />}
-            {hasSummoner&&summons.length>0&&(
+            {hasSummoner&&summons.some(s=>!s.side||s.side==='player')&&(
               <div style={{marginTop:6,borderTop:'1px solid #1e3a4a',paddingTop:6}}>
                 <div style={{fontSize:'9px',color:'#3a6a8a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:4}}>Active Summons</div>
-                {summons.map(s=>{
+                {summons.filter(s=>!s.side||s.side==='player').map(s=>{
                   const m=SUMMON_TIER_META[s.tier];
                   return (
                     <div key={s.id} style={{display:'flex',alignItems:'center',justifyContent:'space-between',fontSize:'10px',marginBottom:2,gap:6}}>
@@ -867,21 +1092,43 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
           <div style={{width:1,background:'#1e3a4a',flexShrink:0,alignSelf:'stretch'}} />
           <div style={{flex:1,minWidth:0,display:'flex',flexDirection:'column'}}>
             <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',borderBottom:'1px solid #3a1a1a',paddingBottom:'6px',marginBottom:'10px',gap:6,flexWrap:'wrap'}}>
-              <div style={{fontSize:'0.75rem',letterSpacing:'0.15em',textTransform:'uppercase',color:'#cc4422',display:'flex',alignItems:'center',gap:'5px',whiteSpace:'nowrap'}}><span>*</span>Enemy</div>
-              {enemyElData&&<span style={{display:'flex',alignItems:'center',gap:'3px',background:`${enemyElData.color}18`,border:`1px solid ${enemyElData.color}55`,borderRadius:'4px',padding:'1px 6px',fontSize:'11px',color:enemyElData.color,fontWeight:'bold',whiteSpace:'nowrap'}}><span>{enemyElData.icon}</span>{enemy.element}</span>}
-              <span style={{fontSize:'11px',color:'#b0dff4',fontWeight:'bold',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',minWidth:0}}>{enemy.name}</span>
-              <span style={{fontSize:'11px',color:'#7a9db5',whiteSpace:'nowrap'}}>Lv<span style={{color:'#b0dff4',fontWeight:'bold',marginLeft:2}}>{enemy.level}</span></span>
+              <div style={{fontSize:'0.75rem',letterSpacing:'0.15em',textTransform:'uppercase',color:'#cc4422',display:'flex',alignItems:'center',gap:'5px',whiteSpace:'nowrap'}}><span>*</span>{enemies?`Enemies (${enemies.length})`:'Enemy'}</div>
+              {!enemies&&enemyElData&&<span style={{display:'flex',alignItems:'center',gap:'3px',background:`${enemyElData.color}18`,border:`1px solid ${enemyElData.color}55`,borderRadius:'4px',padding:'1px 6px',fontSize:'11px',color:enemyElData.color,fontWeight:'bold',whiteSpace:'nowrap'}}><span>{enemyElData.icon}</span>{enemy.element}</span>}
+              {!enemies&&<span style={{fontSize:'11px',color:'#b0dff4',fontWeight:'bold',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',minWidth:0}}>{enemy.name}</span>}
+              {!enemies&&<span style={{fontSize:'11px',color:'#7a9db5',whiteSpace:'nowrap'}}>Lv<span style={{color:'#b0dff4',fontWeight:'bold',marginLeft:2}}>{enemy.level}</span></span>}
             </div>
-            <StatLine label="HP" value={`${enemy.health} / ${enemy.maxHealth}`} />
-            <HealthBar current={enemy.health} max={enemy.maxHealth} />
-            <StatLine
-              label="Energy"
-              value={enemyRolledEnergy===0 ? '-' : `${enemy.actionpts} / ${enemyRolledEnergy}${enemy.energyRollover>0?` (+${enemy.energyRollover})`:''}`}
-              accent={enemy.actionpts>0?'#ff6644':'#555'}
-            />
-            <EnergyBar current={enemy.actionpts} rolled={enemyRolledEnergy} rollover={enemy.energyRollover} />
-            {enemy.frozen>0&&<StatLine label="Freeze" value={`-${enemy.frozen} Energy next round`} accent="#a0e4ff" />}
-            {enemy.element&&<StatLine label="Skill" value={enemy.skillUsed?'used':'ready'} accent={enemy.skillUsed?'#3a6a8a':'#00cc66'} />}
+            {enemies ? (
+              enemies.map(e=>{
+                const eEl = e.element?ELEMENTS[e.elementCategory]&&ELEMENTS[e.elementCategory][e.element]:null;
+                const rolled = enemyRolledEnergyById?.[e.id]||0;
+                const selected = e.id===selectedEnemyId;
+                return (
+                  <div key={e.id} onClick={()=>onSelectEnemy&&onSelectEnemy(e.id)}
+                    style={{border:`1px solid ${selected?'#ffd700':'#3a1a1a'}`,borderRadius:5,padding:'6px 7px',marginBottom:6,cursor:'pointer',background:selected?'rgba(255,215,0,0.08)':'transparent'}}>
+                    <div style={{display:'flex',alignItems:'center',gap:5,marginBottom:3,flexWrap:'wrap'}}>
+                      <span style={{fontSize:9,color:'#cc4422',border:'1px solid #cc442266',borderRadius:3,padding:'0 4px',fontWeight:'bold'}}>R{e.rank}</span>
+                      {eEl&&<span style={{fontSize:11}}>{eEl.icon}</span>}
+                      <span style={{fontSize:11,color:'#b0dff4',fontWeight:'bold',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap',flex:1,minWidth:0}}>{e.name}</span>
+                    </div>
+                    <HealthBar current={e.health} max={e.maxHealth} />
+                    <StatLine label="Energy" value={rolled===0?'-':`${e.actionpts} / ${rolled}`} accent={e.actionpts>0?'#ff6644':'#555'} />
+                  </div>
+                );
+              })
+            ) : (
+              <>
+                <StatLine label="HP" value={`${enemy.health} / ${enemy.maxHealth}`} />
+                <HealthBar current={enemy.health} max={enemy.maxHealth} />
+                <StatLine
+                  label="Energy"
+                  value={enemyRolledEnergy===0 ? '-' : `${enemy.actionpts} / ${enemyRolledEnergy}${enemy.energyRollover>0?` (+${enemy.energyRollover})`:''}`}
+                  accent={enemy.actionpts>0?'#ff6644':'#555'}
+                />
+                <EnergyBar current={enemy.actionpts} rolled={enemyRolledEnergy} rollover={enemy.energyRollover} />
+                {enemy.frozen>0&&<StatLine label="Freeze" value={`-${enemy.frozen} Energy next round`} accent="#a0e4ff" />}
+                {enemy.element&&<StatLine label="Skill" value={enemy.skillUsed?'used':'ready'} accent={enemy.skillUsed?'#3a6a8a':'#00cc66'} />}
+              </>
+            )}
           </div>
         </div>
         <div style={{height:1,background:'#1e3a4a',margin:'10px 0',flexShrink:0}} />
@@ -976,11 +1223,14 @@ const tileClassName = (t) => {
   }
 };
 
-const Grid = ({playerPos,enemyPos,validSquares,onSquareClick,playerSelected,tiles,playerFacing,enemyFacing,aoeTiles,knightTiles,summons,deployTiles}) => {
+const Grid = ({playerPos,enemyPos,enemies,selectedEnemyId,validSquares,onSquareClick,playerSelected,tiles,playerFacing,enemyFacing,aoeTiles,knightTiles,summons,deployTiles}) => {
   const cells=[];
   for(let y=0;y<SIZE;y++) for(let x=0;x<SIZE;x++){
     const isP=playerPos.x===x&&playerPos.y===y;
-    const isE=enemyPos.x===x&&enemyPos.y===y;
+    // Campaign passes `enemies` (array, multi-target) instead of the single
+    // `enemyPos`/`enemyFacing` pair Gauntlet/Training use.
+    const enemyHere = enemies && enemies.find(e=>e.boardPosition.x===x&&e.boardPosition.y===y);
+    const isE = enemies ? !!enemyHere : (enemyPos.x===x&&enemyPos.y===y);
     const summon=summons&&summons.find(s=>s.boardPosition.x===x&&s.boardPosition.y===y);
     const isA=validSquares.some(s=>s.x===x&&s.y===y);
     const isAoe=aoeTiles&&aoeTiles.some(s=>s.x===x&&s.y===y);
@@ -990,8 +1240,11 @@ const Grid = ({playerPos,enemyPos,validSquares,onSquareClick,playerSelected,tile
     let cls='square';
     let label='';
     if(isP){ cls+=' player'+(playerSelected?' playerSelected':''); label=facingArrow(playerFacing); }
-    else if(isE){ cls+=' enemy'; label=facingArrow(enemyFacing); }
-    else if(summon){ cls+=' summon'; label=SUMMON_TIER_META[summon.tier].icon; }
+    else if(isE){
+      cls+=' enemy'+(enemyHere&&enemyHere.id===selectedEnemyId?' enemySelected':'');
+      label=facingArrow(enemyHere?enemyHere.facing:enemyFacing);
+    }
+    else if(summon){ cls+=' summon'+(summon.side==='enemy'?' enemySide':''); label=SUMMON_TIER_META[summon.tier].icon; }
     else { if(isA) cls+=' available'; cls+=' '+tileClassName(tileType); }
     if(isAoe) cls+=' aoePreview';
     if(isKnight) cls+=' knightPreview';
@@ -1549,9 +1802,32 @@ const SceneCompleteModal = ({show, sceneMeta, onReturn}) => {
     </div>
   );
 };
+
+// Shown between Campaign battles ("Continue" to the next roster) and on the
+// finale ("Return to Menu"). Player HP/level/XP/hexas carry forward — only
+// position/tiles/enemies reset, handled by startNextCampaignBattle.
+const CampaignBattleCompleteModal = ({show, isFinale, battle, onContinue, onFinish}) => {
+  if(!show) return null;
+  const color = isFinale ? '#ffd700' : '#00c8ff';
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.85)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:4000}}>
+      <div style={{background:'#080e14',border:`2px solid ${color}`,borderRadius:12,padding:'2rem',maxWidth:420,width:'92%',textAlign:'center',color:'#b0dff4',boxShadow:`0 0 50px ${color}66`}}>
+        <div style={{fontSize:'11px',letterSpacing:'0.2em',textTransform:'uppercase',color}}>{isFinale ? '// Campaign Complete' : `// Battle ${battle?.stage}/3 Cleared`}</div>
+        <h2 style={{fontSize:'1.4rem',letterSpacing:'0.1em',textTransform:'uppercase',color,marginTop:8}}>{isFinale ? 'The Army Falls' : `${battle?.name} Down`}</h2>
+        <div style={{fontSize:12,color:'#7a9db5',marginTop:10,marginBottom:20,lineHeight:1.6}}>
+          {isFinale ? 'You defeated the Command Proxie. The Campaign is complete.' : `Onward to Battle ${(battle?.stage||1)+1}/3. Your HP and progress carry forward — no full heal between fights.`}
+        </div>
+        <button onClick={isFinale?onFinish:onContinue}
+          style={{width:'100%',padding:12,background:`${color}22`,border:`1px solid ${color}`,borderRadius:6,color,fontSize:14,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.08em'}}>
+          {isFinale ? 'Return to Menu' : 'Continue'}
+        </button>
+      </div>
+    </div>
+  );
+};
 // ─── MAIN GAME COMPONENT ───────────────────────────────────────────────────────
 
-export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } = {}) {
+export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, campaign, onCampaignComplete } = {}) {
   // Training Mode scene config. `scene` is undefined for normal Gauntlet play
   // (every flag below defaults to current behavior). Each scene isolates one
   // new mechanic on top of core movement/melee rather than accumulating —
@@ -1565,13 +1841,27 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } 
   const sceneRestrictBaseElements = scene==='elements';
   const sceneMeta = scene ? TUTORIAL_SCENES.find(s=>s.id===scene) : null;
 
+  // Campaign Mode: a squad-battle mode entirely separate from Gauntlet's
+  // single-`enemy` code path (see `enemies` state below). `isCampaign` gates
+  // every piece of the multi-enemy engine so Gauntlet/Training stay untouched.
+  const isCampaign = !!campaign;
+
   const initPlayer = () => newHero();
   const initEnemy  = (p) => newGoblin(1, p.boardPosition);
 
   const [player,         setPlayer]         = useState(()=>{ const p=initPlayer(); return p; });
   const [enemy,          setEnemy]          = useState(()=>{ const p=initPlayer(); return initEnemy(p); });
+  // ── Campaign Mode: multi-enemy roster (only meaningful when isCampaign) ──
+  const [enemies,          setEnemies]          = useState(()=> isCampaign ? spawnCampaignRoster(1, initPlayer().boardPosition) : []);
+  const [campaignBattle,   setCampaignBattle]   = useState(1);
+  const [campaignComplete, setCampaignComplete] = useState(false);
+  const [showBattleComplete, setShowBattleComplete] = useState(false);
+  const [selectedEnemyId,  setSelectedEnemyId]  = useState(null);
+  const [enemyRolledEnergyById, setEnemyRolledEnergyById] = useState({});
   const [tiles,          setTiles]          = useState(()=>{
-    const p=initPlayer(); const e=initEnemy(p);
+    const p=initPlayer();
+    if(isCampaign) return makeTiles(p.boardPosition, {x:-1,y:-1}, enemies.map(e=>e.boardPosition));
+    const e=initEnemy(p);
     return sceneIncludeTerrain ? makeTiles(p.boardPosition,e.boardPosition) : makePlainTiles();
   });
   const [wave,           setWave]           = useState(1);
@@ -1654,6 +1944,11 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } 
   // Earth, Air, and Water bypass adjacency — they're ranged.
   const canSkill  = sceneAllowSkill && isPlayerTurn && energyPhase==='act' && !player.skillUsed && player.actionpts >= skillCost &&
     (elData?.isEarth||elData?.isAir||elData?.isWater ? true : isAdjacent(player.boardPosition,enemy.boardPosition));
+  // Campaign Mode equivalents — same gates, checked against any living enemy
+  // in the roster instead of the single `enemy`.
+  const canAttackMulti = isPlayerTurn && energyPhase==='act' && player.actionpts>0 && enemies.some(e=>isAdjacent(player.boardPosition,e.boardPosition));
+  const canSkillMulti  = sceneAllowSkill && isPlayerTurn && energyPhase==='act' && !player.skillUsed && player.actionpts >= skillCost &&
+    (elData?.isEarth||elData?.isAir||elData?.isWater ? true : enemies.some(e=>isAdjacent(player.boardPosition,e.boardPosition)));
   // Mastermind: available to a Summoner during the act phase, once per turn,
   // if at least 2 Energy is available (fixed activation cost). Gated by
   // classSkillUsed (not skillUsed) — class and elemental skills are separate
@@ -2208,7 +2503,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } 
   },[]);
 
   const handleSkill = useCallback(()=>{
-    if(!canSkill) return;
+    if(!(isCampaign?canSkillMulti:canSkill)) return;
     // Resume a locked roll if one exists this round; else fresh.
     if(lockedRoll && lockedRoll.element===selElement){
       setDiceRolls(lockedRoll.rolls);
@@ -2223,7 +2518,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } 
     }
     setAccuracyRoll(null); setPendingAbility(null);
     setShowDice(true);
-  },[canSkill,lockedRoll,selElement]);
+  },[isCampaign,canSkill,canSkillMulti,lockedRoll,selElement]);
 
   const handleRoll = useCallback(()=>{
     setRolling(true);
@@ -2509,17 +2804,650 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } 
     showReward(`<h2 style="color:#9b6cff;letter-spacing:.1em">${isSwitch?'CLASS SWITCHED':'CLASS UNLOCKED'}</h2><p style="font-size:1.3rem;margin:10px 0;color:#b08cff">${meta?meta.icon+' '+meta.name:classId}</p><p style="color:#8ab5cc;font-size:.85rem;max-width:320px">${meta?meta.blurb:''}</p>`,3500);
   },[addLog,showReward,playerClass]);
 
+  // ══════════════════════════════════════════════════════════════════════════
+  // ── CAMPAIGN MODE ENGINE (multi-enemy) ──
+  // Entirely parallel to the single-`enemy` engine above — none of it runs
+  // unless isCampaign is true, and nothing above this banner was changed to
+  // support it. See computeElementalStrike / commandEnemySummons /
+  // resolveEnemyClassSkill (module scope, above the component) for the pure
+  // per-enemy decision logic this section applies.
+  // ══════════════════════════════════════════════════════════════════════════
+
+  const checkEndOfRoundMulti = useCallback((latestPlayer, latestEnemies, currentRound)=>{
+    if(latestPlayer.actionpts>0 || latestEnemies.some(e=>e.actionpts>0)) return;
+    const nextRound = currentRound+1;
+    setRound(nextRound);
+    setPlayerRolledEnergy(0);
+    setEnemyRolledEnergyById({});
+    setLockedRoll(null);
+    setDiceRolls([]); setAbilities([]); setDicePhase('roll');
+    setAccuracyRoll(null); setPendingAbility(null); setAirRange(null); setEarthRange(null); setWaterAoe(null);
+    addLog(`=== Round ${nextRound} ===`);
+    const rP = { ...latestPlayer, actionpts:0, frozen:latestPlayer.frozen||0, skillUsed:false, rotateUsed:false, classSkillUsed:false };
+    const rEnemies = latestEnemies.map(e=>({ ...e, actionpts:0, frozen:e.frozen||0, skillUsed:false, classSkillUsed:false,
+      energyRollover:(e.energyRollover||0)+(e.actionpts||0) }));
+    setPlayer(rP);
+    setEnemies(rEnemies);
+    setTimeout(()=>beginRoundMulti(rP, rEnemies, nextRound), 300);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[addLog]);
+
+  const beginRoundMulti = useCallback((rP, rEnemies, currentRound)=>{
+    summonPhaseRanRef.current = false;
+    setIsPlayerTurn(true);
+    setEnergyPhase('roll');
+    setSelectedSummonId(null);
+    setSelectedEnemyId(null);
+    setSummonPhaseActive(false);
+    setValidSquares([]);
+    setHealingConsumed(consumed=>{
+      if(consumed){
+        setTiles(prevTiles=>relocateHealingTile(prevTiles, rP.boardPosition, {x:-1,y:-1}, [...rEnemies.map(e=>e.boardPosition), ...summons.map(s=>s.boardPosition)]));
+        addLog('// A new healing node materializes on the grid');
+      }
+      return false;
+    });
+    addLog('=== Your Turn — Roll Energy ===');
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[addLog,summons]);
+
+  const finishEnemiesToPlayerMulti = useCallback((latestPlayer, latestEnemies, currentRound)=>{
+    if(latestPlayer.actionpts<=0 && latestEnemies.every(e=>e.actionpts<=0)){
+      checkEndOfRoundMulti(latestPlayer, latestEnemies, currentRound);
+      return;
+    }
+    setPlayer(latestPlayer);
+    setEnemies(latestEnemies);
+    startPlayerTurn(latestPlayer);
+  },[checkEndOfRoundMulti,startPlayerTurn]);
+
+  // Per-enemy AI turn: rolls its own independent d12, then spends the
+  // resulting pool one decision at a time (own-summons, class skill,
+  // elemental skill, melee, approach-move, hold), recursing via setTimeout
+  // exactly the way the single-enemy engine's runEnemyTurn already does.
+  const runSingleEnemyAITurn = useCallback((thisEnemy, allEnemies, currentPlayer, currentRound, onDone)=>{
+    const needsRoll = thisEnemy.actionpts===0;
+    if(needsRoll){
+      const eRoll=rollD12Energy();
+      const rollover=thisEnemy.energyRollover||0;
+      const frozenPenalty=thisEnemy.frozen||0;
+      const total=eRoll+rollover;
+      const newAP=Math.max(0,total-frozenPenalty);
+      setEnemyRolledEnergyById(prev=>({...prev,[thisEnemy.id]:total}));
+      addLog(`// ${thisEnemy.name} (R${thisEnemy.rank}) rolls d12=${eRoll}${rollover>0?` +${rollover} rollover`:''} = ${total} Energy${frozenPenalty>0?` (freeze -${frozenPenalty})`:''}  ->  ${newAP} AP`);
+      const rolledEnemy={...thisEnemy,actionpts:newAP,frozen:0,energyRollover:0};
+      const rolledEnemies=allEnemies.map(e=>e.id===rolledEnemy.id?rolledEnemy:e);
+      setEnemies(rolledEnemies);
+      if(newAP<=0){
+        addLog(`// ${thisEnemy.name} has 0 Energy — passing`);
+        onDone(currentPlayer,rolledEnemies);
+        return;
+      }
+      setTimeout(()=>runSingleEnemyAITurn(rolledEnemy,rolledEnemies,currentPlayer,currentRound,onDone),500);
+      return;
+    }
+
+    setTimeout(()=>{
+      const others = allEnemies.filter(e=>e.id!==thisEnemy.id && e.health>0);
+      let updatedPlayer=currentPlayer, updatedEnemy=thisEnemy, updatedSummons=summons;
+
+      // Own-summon command (Summoner enemies only) — batched once at the top
+      // of this enemy's AP-spend pass.
+      if(thisEnemy.canClass && thisEnemy.enemyClass==='Summoner' && summons.some(s=>s.side==='enemy'&&s.ownerId===thisEnemy.id) && updatedEnemy.actionpts>0){
+        const res = commandEnemySummons(updatedEnemy, updatedSummons, others, updatedPlayer);
+        if(res.apSpent>0){
+          res.logs.forEach(addLog);
+          updatedSummons = res.nextSummons;
+          updatedEnemy = {...updatedEnemy, actionpts:updatedEnemy.actionpts-res.apSpent};
+          if(res.playerHP!==updatedPlayer.health) updatedPlayer = {...updatedPlayer, health:res.playerHP};
+          setSummons(updatedSummons);
+          if(updatedPlayer!==currentPlayer) setPlayer(updatedPlayer);
+          setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
+          if(updatedPlayer.health<=0){ addLog('=== DEFEAT ==='); return; }
+        }
+      }
+
+      const adjacent=isAdjacent(updatedEnemy.boardPosition,updatedPlayer.boardPosition);
+      const eElData=updatedEnemy.element?ELEMENTS[updatedEnemy.elementCategory]?.[updatedEnemy.element]:null;
+      const eMinCost=eElData?getSkillCost(updatedEnemy.elementCategory,updatedEnemy.element):1;
+      const eRanged=eElData?.isEarth||eElData?.isAir||eElData?.isWater;
+      const canUseElement = updatedEnemy.canElement && (eRanged?true:adjacent) && updatedEnemy.element && !updatedEnemy.skillUsed && updatedEnemy.actionpts>=eMinCost && Math.random()<0.6;
+      const canUseClass = updatedEnemy.canClass && updatedEnemy.enemyClass && !updatedEnemy.classSkillUsed && updatedEnemy.actionpts>=2 && Math.random()<0.6;
+
+      const lowHP = updatedEnemy.health <= updatedEnemy.maxHealth*0.3;
+      const healTile = findHealingTile(tiles);
+      const onHealTile = healTile && updatedEnemy.boardPosition.x===healTile.x && updatedEnemy.boardPosition.y===healTile.y;
+      const willFlee = lowHP && healTile && (updatedEnemy.element ? Math.random()<0.6 : true);
+      const moveBlockers = [...others.map(e=>e.boardPosition), ...updatedSummons.map(s=>s.boardPosition)];
+
+      const finishStep = ()=>{
+        setTimeout(()=>{
+          if(updatedEnemy.actionpts>0) runSingleEnemyAITurn(updatedEnemy,allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e),updatedPlayer,currentRound,onDone);
+          else onDone(updatedPlayer,allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
+        },600);
+      };
+
+      if(willFlee && !onHealTile){
+        const moves=getMoveToward(updatedEnemy.boardPosition.x,updatedEnemy.boardPosition.y,healTile.x,healTile.y);
+        let moved=false;
+        for(const m of moves){
+          const blocked=moveBlockers.some(b=>b.x===m.x&&b.y===m.y);
+          if(m.x>=0&&m.x<SIZE&&m.y>=0&&m.y<SIZE&&!(m.x===updatedPlayer.boardPosition.x&&m.y===updatedPlayer.boardPosition.y)&&!blocked){
+            const nf=facingFromMove(updatedEnemy.boardPosition,m);
+            let healed=false, newHP=updatedEnemy.health;
+            if(m.x===healTile.x&&m.y===healTile.y){ newHP=Math.min(updatedEnemy.maxHealth,updatedEnemy.health+100); healed=true; }
+            updatedEnemy={...updatedEnemy,boardPosition:m,facing:nf,actionpts:updatedEnemy.actionpts-1,health:newHP};
+            if(healed){
+              setHealingConsumed(true);
+              setTiles(prev=>{const g=prev.map(r=>r.slice()); if(g[healTile.y][healTile.x]===TILE_TYPES.HEALING) g[healTile.y][healTile.x]=TILE_TYPES.NORMAL; return g;});
+              addLog(`${updatedEnemy.name} reaches healing tile → +100 HP (${newHP}/${updatedEnemy.maxHealth})`);
+            } else {
+              addLog(`${updatedEnemy.name} flees to heal → (${m.x},${m.y})`);
+            }
+            moved=true; break;
+          }
+        }
+        if(!moved){ updatedEnemy={...updatedEnemy,actionpts:updatedEnemy.actionpts-1}; addLog(`${updatedEnemy.name} blocked from healing path`); }
+        setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
+        finishStep();
+        return;
+      }
+      if(willFlee && onHealTile){
+        const newHP=Math.min(updatedEnemy.maxHealth,updatedEnemy.health+100);
+        updatedEnemy={...updatedEnemy,health:newHP,actionpts:updatedEnemy.actionpts-1};
+        setHealingConsumed(true);
+        setTiles(prev=>{const g=prev.map(r=>r.slice()); if(g[healTile.y][healTile.x]===TILE_TYPES.HEALING) g[healTile.y][healTile.x]=TILE_TYPES.NORMAL; return g;});
+        addLog(`${updatedEnemy.name} heals on tile → +100 HP (${newHP}/${updatedEnemy.maxHealth})`);
+        setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
+        finishStep();
+        return;
+      }
+
+      if(canUseClass){
+        const decision = resolveEnemyClassSkill(updatedEnemy, updatedPlayer, updatedSummons);
+        if(decision?.kind==='direct'){
+          const dmg=60;
+          const newHP=Math.max(0,updatedPlayer.health-dmg);
+          const facing=facingToward(updatedEnemy.boardPosition,updatedPlayer.boardPosition);
+          addLog(`${updatedEnemy.name} Compass Slash -> ${dmg} dmg`);
+          updatedPlayer={...updatedPlayer,health:newHP};
+          updatedEnemy={...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-2),classSkillUsed:true,facing};
+          setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
+          if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
+          finishStep();
+          return;
+        }
+        if(decision?.kind==='deploy'){
+          const roll=rollD100(); const tier=summonTierFromRoll(roll);
+          const s=makeSummon(tier,decision.tile,'enemy',updatedEnemy.id);
+          updatedSummons=[...updatedSummons,s];
+          setSummons(updatedSummons);
+          addLog(`◈ ${updatedEnemy.name} deploys ${s.name} at (${decision.tile.x},${decision.tile.y})`);
+          updatedEnemy={...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-2),classSkillUsed:true};
+          setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
+          finishStep();
+          return;
+        }
+        if(decision?.kind==='darkweb'){
+          const acc=rollD100Accuracy();
+          const dmg=applyAccuracy(70,acc);
+          const facing=facingToward(updatedEnemy.boardPosition,updatedPlayer.boardPosition);
+          const newHP=Math.max(0,updatedPlayer.health-dmg);
+          addLog(`${updatedEnemy.name} Dark Web -> ${dmg} dmg (${acc}% ${accuracyTierLabel(acc)})`);
+          updatedPlayer={...updatedPlayer,health:newHP};
+          updatedEnemy={...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-2),classSkillUsed:true,facing,
+            boardPosition: newHP<=0 ? updatedPlayer.boardPosition : updatedEnemy.boardPosition};
+          setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
+          if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
+          finishStep();
+          return;
+        }
+      }
+
+      if(canUseElement){
+        const strike = computeElementalStrike(updatedEnemy, updatedPlayer, tiles);
+        if(strike){
+          addLog(strike.log);
+          updatedEnemy={...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-strike.eCost),skillUsed:true,facing:strike.castFacing};
+          if(strike.dmg>0){
+            const newHP=Math.max(0,updatedPlayer.health-strike.dmg);
+            updatedPlayer={...updatedPlayer,health:newHP,boardPosition:strike.knockbackPos||updatedPlayer.boardPosition};
+            setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
+            if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
+          } else {
+            setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
+          }
+        }
+        finishStep();
+        return;
+      }
+
+      if(updatedEnemy.canMelee && adjacent){
+        const tier=enemyTier(updatedEnemy.level);
+        const flank=getFlankBonus(updatedEnemy.boardPosition,updatedPlayer.boardPosition,updatedPlayer.facing);
+        const dmg=tier.meleeBase+flank.bonus;
+        const newHP=Math.max(0,updatedPlayer.health-dmg);
+        addLog(`${updatedEnemy.name} melee ${dmg} dmg${flank.label?' ['+flank.label+']':''}`);
+        updatedPlayer={...updatedPlayer,health:newHP};
+        const eMeleeFacing=facingToward(updatedEnemy.boardPosition,updatedPlayer.boardPosition);
+        updatedEnemy={...updatedEnemy,actionpts:updatedEnemy.actionpts-1,facing:eMeleeFacing};
+        setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
+        if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
+        finishStep();
+        return;
+      }
+
+      // Approach/reposition (also the path for no-melee ranks that are out
+      // of skill range — they still reposition, they just never land here
+      // with an attack attached).
+      const tier=enemyTier(updatedEnemy.level);
+      const target=pickApproachTile(updatedEnemy.boardPosition,updatedPlayer.boardPosition,updatedPlayer.facing,tier,[updatedPlayer.boardPosition,...moveBlockers]);
+      const goal=target||updatedPlayer.boardPosition;
+      const curDist=manhattan(updatedEnemy.boardPosition,goal);
+      const moves=getMoveToward(updatedEnemy.boardPosition.x,updatedEnemy.boardPosition.y,goal.x,goal.y);
+      let moved=false;
+      for(const m of moves){
+        const blocked=moveBlockers.some(b=>b.x===m.x&&b.y===m.y);
+        if(m.x>=0&&m.x<SIZE&&m.y>=0&&m.y<SIZE&&!(m.x===updatedPlayer.boardPosition.x&&m.y===updatedPlayer.boardPosition.y)&&!blocked){
+          if(manhattan(m,goal)<curDist){
+            const nf=facingFromMove(updatedEnemy.boardPosition,m);
+            updatedEnemy={...updatedEnemy,boardPosition:m,facing:nf,actionpts:updatedEnemy.actionpts-1};
+            addLog(`${updatedEnemy.name} -> (${m.x},${m.y})`); moved=true; break;
+          }
+        }
+      }
+      if(!moved){
+        const saved=updatedEnemy.actionpts;
+        addLog(`${updatedEnemy.name} holds position — saving ${saved} Energy`);
+        updatedEnemy={...updatedEnemy,actionpts:0,energyRollover:(updatedEnemy.energyRollover||0)+saved};
+        setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
+        onDone(updatedPlayer,allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
+        return;
+      }
+      setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
+      finishStep();
+    },700);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[addLog,tiles,summons]);
+
+  // Sequences the roster: each living enemy takes its full independent turn
+  // (own roll, own AP pool) before control returns to the player. Mirrors
+  // finishEnemyToPlayer's role in the single-enemy engine.
+  const runEnemiesSequence = useCallback((idx, currentEnemies, currentPlayer, currentRound)=>{
+    if(currentPlayer.health<=0) return; // mirrors the single-enemy engine's own lack of a game-over flow
+    if(idx>=currentEnemies.length){
+      finishEnemiesToPlayerMulti(currentPlayer,currentEnemies,currentRound);
+      return;
+    }
+    const thisEnemy=currentEnemies[idx];
+    if(!thisEnemy||thisEnemy.health<=0){
+      runEnemiesSequence(idx+1,currentEnemies,currentPlayer,currentRound);
+      return;
+    }
+    runSingleEnemyAITurn(thisEnemy,currentEnemies,currentPlayer,currentRound,(updatedPlayer,updatedEnemies)=>{
+      if(updatedPlayer.health<=0) return;
+      runEnemiesSequence(idx+1,updatedEnemies,updatedPlayer,currentRound);
+    });
+  },[finishEnemiesToPlayerMulti,runSingleEnemyAITurn]);
+
+  const endSummonCommandPhaseMulti = useCallback(()=>{
+    setSummonPhaseActive(false);
+    setSelectedSummonId(null);
+    setValidSquares([]);
+    const ctx = summonCtxRef.current || { round };
+    addLog('=== Summons done — enemies act ===');
+    setIsPlayerTurn(false);
+    setEnemyRolledEnergyById({});
+    setPlayer(curP=>{
+      setEnemies(curE=>{
+        setTimeout(()=>runEnemiesSequence(0, curE.map(e=>({...e,actionpts:0})), curP, ctx.round), 400);
+        return curE;
+      });
+      return curP;
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[addLog,round]);
+
+  const routeAfterPlayerActionMulti = useCallback((updatedPlayer, updatedEnemies)=>{
+    if(updatedPlayer.actionpts>0){
+      setPlayer(updatedPlayer);
+      setEnemies(updatedEnemies);
+      return;
+    }
+    if(roundHadSummonPhase()){
+      checkEndOfRoundMulti(updatedPlayer, updatedEnemies, round);
+    } else {
+      addLog("=== Enemies' Turn ===");
+      setIsPlayerTurn(false);
+      setEnemyRolledEnergyById({});
+      setTimeout(()=>runEnemiesSequence(0, updatedEnemies.map(e=>({...e,actionpts:0})), updatedPlayer, round), 400);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[round,addLog,checkEndOfRoundMulti,roundHadSummonPhase,runEnemiesSequence]);
+
+  const handleEnemyDefeatedMulti = useCallback((defeatedId, curPlayer, curEnemies)=>{
+    const dead = curEnemies.find(e=>e.id===defeatedId);
+    if(!dead) return;
+    const remaining = curEnemies.filter(e=>e.id!==defeatedId);
+    setEnemies(remaining);
+    setSummons(prev=>prev.filter(s=>s.ownerId!==defeatedId));
+    setSelectedEnemyId(null);
+    const xpGain = 150 + campaignBattle*150;
+    const hexGain = 40 + campaignBattle*30;
+    addLog(`=== ${dead.name} (R${dead.rank}) defeated! +${xpGain} XP, +${hexGain} Hexas ===`);
+    setHexas(h=>h+hexGain);
+    let leveled = { ...curPlayer, playerXp:(curPlayer.playerXp||0)+xpGain };
+    leveled = applyLevelUp(leveled);
+    setPlayer(leveled);
+    if(remaining.length>0) return; // battle continues with the survivors
+    const battle = CAMPAIGN_BATTLES[campaignBattle-1];
+    addLog(battle.isFinale ? '=== CAMPAIGN COMPLETE — the army falls. ===' : `=== Battle ${campaignBattle}/3 cleared! ===`);
+    if(battle.isFinale) setCampaignComplete(true);
+    setShowBattleComplete(true);
+  },[campaignBattle,addLog,applyLevelUp]);
+
+  const startNextCampaignBattle = useCallback((curPlayer, nextStage)=>{
+    const battle = CAMPAIGN_BATTLES[nextStage-1];
+    const resetPlayer = { ...curPlayer, actionpts:0, frozen:0, skillUsed:false, rotateUsed:false, classSkillUsed:false, energyRollover:0,
+      boardPosition: rollBackRowPosition(8) };
+    const freshEnemies = spawnCampaignRoster(nextStage, resetPlayer.boardPosition);
+    const newTiles = makeTiles(resetPlayer.boardPosition, {x:-1,y:-1}, freshEnemies.map(e=>e.boardPosition));
+    setCampaignBattle(nextStage);
+    setEnemies(freshEnemies);
+    setPlayer(resetPlayer);
+    setTiles(newTiles);
+    setSummons([]);
+    setSelectedSummonId(null);
+    setSelectedEnemyId(null);
+    setSummonPhaseActive(false);
+    setPlayerRolledEnergy(0);
+    setEnemyRolledEnergyById({});
+    setEnergyPhase('roll');
+    setRound(1);
+    setLockedRoll(null);
+    setHealingConsumed(false);
+    setIsPlayerTurn(true);
+    addLog(`=== Battle ${nextStage}/3 — ${battle.name} ===`);
+  },[addLog]);
+
+  const handleRollEnergyMulti = useCallback(()=>{
+    const roll=rollD12Energy();
+    const rollover=player.energyRollover||0;
+    const frozenPenalty=player.frozen||0;
+    const total=roll+rollover;
+    const newAP=Math.max(0,total-frozenPenalty);
+    setPlayerRolledEnergy(total);
+    addLog(`You roll d12=${roll}${rollover>0?` +${rollover} rollover`:''} = ${total} Energy${frozenPenalty>0?` (freeze -${frozenPenalty})`:''}  ->  ${newAP} AP`);
+    const rolledPlayer={...player,actionpts:newAP,frozen:0,energyRollover:0};
+    setPlayer(rolledPlayer);
+    if(summons.some(s=>s.side==='player')){
+      beginSummonCommandPhase(rolledPlayer, null, round);
+    } else {
+      setEnergyPhase('act');
+      addLog('=== Spend your Energy ===');
+    }
+  },[player,summons,round,addLog,beginSummonCommandPhase]);
+
+  const handleEndTurnMulti = useCallback(()=>{
+    const saved=player.actionpts;
+    if(saved>0) addLog(`You end your turn — saving ${saved} Energy as rollover`);
+    else addLog('You end your turn');
+    const updatedPlayer={...player,actionpts:0,energyRollover:(player.energyRollover||0)+saved};
+    if(roundHadSummonPhase()){
+      checkEndOfRoundMulti(updatedPlayer, enemies, round);
+    } else {
+      setPlayer(updatedPlayer);
+      setIsPlayerTurn(false);
+      setEnemyRolledEnergyById({});
+      addLog("=== Enemies' Turn ===");
+      setTimeout(()=>runEnemiesSequence(0, enemies.map(e=>({...e,actionpts:0})), updatedPlayer, round), 400);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[player,enemies,round,addLog,checkEndOfRoundMulti,roundHadSummonPhase,runEnemiesSequence]);
+
+  const handleSurrenderMulti = useCallback(()=>{
+    addLog('=== You retreat from the Campaign. ===');
+    onCampaignComplete?.();
+  },[addLog,onCampaignComplete]);
+
+  // ── Melee ──
+  const handleMeleeMulti = useCallback(()=>{
+    if(!canAttackMulti) return;
+    const adjacentEnemies = enemies.filter(e=>isAdjacent(player.boardPosition,e.boardPosition));
+    const target = adjacentEnemies.find(e=>e.id===selectedEnemyId) || adjacentEnemies[0];
+    if(!target) return;
+    const flank=getFlankBonus(player.boardPosition,target.boardPosition,target.facing);
+    const dmg=playerMeleeBase(player.level)+flank.bonus;
+    const newHP=Math.max(0,target.health-dmg);
+    const meleeFacing=facingToward(player.boardPosition,target.boardPosition);
+    addLog(`You melee ${target.name} -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}`);
+    const updatedPlayer={...player,actionpts:player.actionpts-1,facing:meleeFacing};
+    if(newHP<=0){
+      const remaining=enemies.map(e=>e.id===target.id?{...e,health:0}:e);
+      setPlayer(updatedPlayer); setEnemies(remaining);
+      handleEnemyDefeatedMulti(target.id, updatedPlayer, remaining);
+      return;
+    }
+    routeAfterPlayerActionMulti(updatedPlayer, enemies.map(e=>e.id===target.id?{...e,health:newHP}:e));
+  },[canAttackMulti,player,enemies,selectedEnemyId,addLog,handleEnemyDefeatedMulti,routeAfterPlayerActionMulti]);
+
+  // ── Elemental skill (generic + Fire/Earth/Air/Water apply) ──
+  // All five share one shape: resolve `target` from selectedEnemyId (falling
+  // back to the sole enemy in range), compute damage with the exact same
+  // math as the single-enemy handlers, then route through the Multi helpers.
+  const resolveTargetForSkill = useCallback((rangeCheckFn)=>{
+    const inRange = enemies.filter(e=>rangeCheckFn(e));
+    return inRange.find(e=>e.id===selectedEnemyId) || inRange[0] || null;
+  },[enemies,selectedEnemyId]);
+
+  const applySkillResultMulti = useCallback((target, dmg, updatedPlayer, extra={})=>{
+    if(!target || dmg<=0){
+      routeAfterPlayerActionMulti(updatedPlayer, enemies);
+      return;
+    }
+    const newHP=Math.max(0,target.health-dmg);
+    if(newHP<=0){
+      const remaining=enemies.map(e=>e.id===target.id?{...e,health:0,...extra}:e);
+      setPlayer(updatedPlayer); setEnemies(remaining);
+      handleEnemyDefeatedMulti(target.id, updatedPlayer, remaining);
+      return;
+    }
+    routeAfterPlayerActionMulti(updatedPlayer, enemies.map(e=>e.id===target.id?{...e,health:newHP,...extra}:e));
+  },[enemies,handleEnemyDefeatedMulti,routeAfterPlayerActionMulti]);
+
+  const handleModalAbilityMulti = useCallback((ability,accuracy)=>{
+    if(dicePhase==='roll'){ setPendingAbility(ability); setDicePhase('accuracy'); setAccuracyRoll(null); return; }
+    const acc=accuracy??accuracyRoll??100;
+    const el=ELEMENTS[selCategory][selElement];
+    const cost=el.COST??1;
+    let dmg=0, heal=0;
+    if(ability.heal){ heal=ability.heal; } else { dmg=applyAccuracy(ability.damage,acc); }
+    const target = resolveTargetForSkill(e=>isAdjacent(player.boardPosition,e.boardPosition));
+    const flank = target ? getFlankBonus(player.boardPosition,target.boardPosition,target.facing) : {bonus:0,label:''};
+    if(dmg>0&&flank.bonus>0) dmg+=flank.bonus;
+    let updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
+    if(heal>0){ updatedPlayer.health=Math.min(updatedPlayer.maxHealth,updatedPlayer.health+heal); addLog(`${selElement} ${ability.name} — heal +${heal} HP`); }
+    if(dmg>0 && target) addLog(`${selElement} ${ability.name} -> ${dmg} dmg${flank.label?' ['+flank.label+']':''} (${acc}% (${accuracyTierLabel(acc)}))`);
+    resetDiceModal();
+    applySkillResultMulti(target, dmg, updatedPlayer);
+  },[dicePhase,accuracyRoll,selCategory,selElement,player,addLog,resetDiceModal,resolveTargetForSkill,applySkillResultMulti]);
+
+  const handleFireApplyWithAccuracyMulti = useCallback((acc)=>{
+    const pulses=diceRolls[0].value, dmgEach=diceRolls[1].value;
+    const base=pulses*dmgEach*SKILL_DICE_MULT;
+    let dmg=applyAccuracy(base,acc);
+    const target = resolveTargetForSkill(e=>isAdjacent(player.boardPosition,e.boardPosition));
+    const flank = target ? getFlankBonus(player.boardPosition,target.boardPosition,target.facing) : {bonus:0,label:''};
+    if(flank.bonus>0) dmg+=flank.bonus;
+    const tileBoost=getTileBoost(tiles,player.boardPosition,'Fire');
+    if(tileBoost>0) dmg+=tileBoost;
+    const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-3),skillUsed:true};
+    if(target) addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tileBoost>0?' [Fire tile +20]':''}`);
+    resetDiceModal();
+    applySkillResultMulti(target, dmg, updatedPlayer);
+  },[diceRolls,player,tiles,addLog,resetDiceModal,resolveTargetForSkill,applySkillResultMulti]);
+
+  const handleEarthApplyWithAccuracyMulti = useCallback((acc)=>{
+    const dieRoll=diceRolls[0].value;
+    const base=dieRoll*SKILL_DICE_MULT;
+    const line=getForwardTiles(player.boardPosition,player.facing,earthRange);
+    const target = enemies.find(e=>line.some(t=>t.x===e.boardPosition.x&&t.y===e.boardPosition.y));
+    const tileBoost=getTileBoost(tiles,player.boardPosition,'Earth');
+    const dmg=target?Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost:0;
+    const cost=1+earthRange;
+    const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
+    addLog(`Tremor [d6=${dieRoll}, ${earthRange} tile${earthRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${target?dmg+' dmg'+(tileBoost>0?' [Earth tile +20]':''):'MISS (no enemy in line)'}`);
+    resetDiceModal();
+    applySkillResultMulti(target, dmg, updatedPlayer);
+  },[diceRolls,player,tiles,earthRange,enemies,addLog,resetDiceModal,applySkillResultMulti]);
+
+  const handleAirApplyWithAccuracyMulti = useCallback((acc)=>{
+    const dieRoll=diceRolls[0].value;
+    const base=Math.max(0,(dieRoll-airRange)*SKILL_DICE_MULT);
+    const line=getForwardTiles(player.boardPosition,player.facing,airRange);
+    const target = enemies.find(e=>line.some(t=>t.x===e.boardPosition.x&&t.y===e.boardPosition.y));
+    const tileBoost=getTileBoost(tiles,player.boardPosition,'Air');
+    const dmg=target?Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost:0;
+    const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),skillUsed:true};
+    let extra={};
+    if(target){
+      const kbPos=getKnockbackPos(target.boardPosition,player.facing);
+      const kbBlocked=!kbPos||(kbPos.x===player.boardPosition.x&&kbPos.y===player.boardPosition.y)||enemies.some(e=>e.id!==target.id&&kbPos&&e.boardPosition.x===kbPos.x&&e.boardPosition.y===kbPos.y);
+      if(kbPos&&!kbBlocked){ extra.boardPosition=kbPos; addLog(`Gale Force [d8=${dieRoll}, range ${airRange}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} + knockback`); }
+      else addLog(`Gale Force [d8=${dieRoll}, range ${airRange}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} (knockback blocked)`);
+    } else {
+      addLog(`Gale Force [d8=${dieRoll}, range ${airRange}] -> MISS`);
+    }
+    resetDiceModal();
+    applySkillResultMulti(target, dmg, updatedPlayer, extra);
+  },[diceRolls,player,tiles,airRange,enemies,addLog,resetDiceModal,applySkillResultMulti]);
+
+  const handleWaterApplyWithAccuracyMulti = useCallback((acc)=>{
+    const dieRoll=diceRolls[0].value;
+    const res=resolveTorrent(dieRoll);
+    const anchor=getTorrentAnchor(player.boardPosition,player.facing);
+    const footprint=getTorrentFootprint(anchor,waterAoe);
+    const target = enemies.find(e=>footprint.some(t=>t.x===e.boardPosition.x&&t.y===e.boardPosition.y));
+    const tileBoost=getTileBoost(tiles,player.boardPosition,'Water');
+    const dmg=target?applyAccuracy(res.damage,acc)+tileBoost:0;
+    const cost=TORRENT_AOE_COST[waterAoe];
+    const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
+    addLog(`Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[waterAoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${target?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS (no enemy in blast)'}`);
+    resetDiceModal();
+    applySkillResultMulti(target, dmg, updatedPlayer);
+  },[diceRolls,player,tiles,waterAoe,enemies,addLog,resetDiceModal,applySkillResultMulti]);
+
+  // ── Mastermind / Dark Web targeting resolution ──
+  const deployTilesMulti = getDeployTiles(tiles, player.boardPosition, enemies.map(e=>e.boardPosition), summons);
+  const canDeployMulti = summons.filter(s=>s.side==='player').length < BANDWIDTH && deployTilesMulti.length > 0 && player.actionpts >= 2;
+  const deployBlockedReasonMulti = summons.filter(s=>s.side==='player').length>=BANDWIDTH ? `bandwidth full (${BANDWIDTH}/${BANDWIDTH})`
+                            : deployTilesMulti.length===0 ? 'no legal tiles on row 7'
+                            : player.actionpts<2 ? 'need 2 Energy'
+                            : '';
+
+  const resolveCompassSlashMulti = useCallback((targetTile)=>{
+    if(!isAdjacent8(player.boardPosition,targetTile)){ addLog('// Target not in the 8 surrounding tiles'); return; }
+    const target = enemies.find(e=>e.boardPosition.x===targetTile.x&&e.boardPosition.y===targetTile.y);
+    setCompassTargeting(false);
+    if(!target){
+      addLog('// Compass Slash strikes empty tile — 2 Energy spent');
+      routeAfterPlayerActionMulti({...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true}, enemies);
+      return;
+    }
+    const dmg=60;
+    const slashFacing=facingToward(player.boardPosition,targetTile);
+    addLog(`Compass Slash -> ${dmg} dmg`);
+    const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true,facing:slashFacing};
+    applySkillResultMulti(target, dmg, updatedPlayer);
+  },[player,enemies,addLog,applySkillResultMulti,routeAfterPlayerActionMulti]);
+
+  const resolveDarkWebMulti = useCallback((targetTile)=>{
+    if(!isKnightMove(player.boardPosition,targetTile)){ addLog('// Target not a knight-move tile'); return; }
+    const target = enemies.find(e=>e.boardPosition.x===targetTile.x&&e.boardPosition.y===targetTile.y);
+    setDarkWebTargeting(false);
+    if(!target){
+      addLog('// Dark Web strikes empty tile — 2 Energy spent');
+      routeAfterPlayerActionMulti({...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true}, enemies);
+      return;
+    }
+    const acc=rollD100Accuracy();
+    const dmg=applyAccuracy(70,acc);
+    const strikeFacing=facingToward(player.boardPosition,targetTile);
+    const newHP=Math.max(0,target.health-dmg);
+    let updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true,facing:strikeFacing};
+    if(newHP<=0) updatedPlayer={...updatedPlayer,boardPosition:targetTile};
+    addLog(`Dark Web -> ${dmg} dmg (${acc}% ${accuracyTierLabel(acc)})${newHP<=0?' — finishing blow, claims tile':''}`);
+    applySkillResultMulti(target, dmg, updatedPlayer);
+  },[player,enemies,addLog,applySkillResultMulti,routeAfterPlayerActionMulti]);
+
+  const resolveDeployPlacementMulti = useCallback((tile)=>{
+    const legal=deployTilesMulti.some(t=>t.x===tile.x&&t.y===tile.y);
+    if(!legal){ addLog('// Illegal deploy tile'); return; }
+    const s=makeSummon(deployTier,{x:tile.x,y:tile.y},'player',null);
+    setSummons(prev=>[...prev,s]);
+    const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true};
+    addLog(`◈ ${s.name} deployed at (${tile.x},${tile.y}).`);
+    setShowDeploy(false); setAwaitingPlacement(false); setDeployRoll(null); setDeployTier(null);
+    routeAfterPlayerActionMulti(updatedPlayer, enemies);
+  },[deployTilesMulti,deployTier,player,enemies,addLog,routeAfterPlayerActionMulti]);
+
+  // ── Player's own summons (side:'player') attacking one of several enemies ──
+  const summonActionAtMulti = useCallback((s, tile, curEnemies, curSummons)=>{
+    const ahead=summonForwardTile(s);
+    if(!ahead||ahead.x!==tile.x||ahead.y!==tile.y) return null;
+    if(player.boardPosition.x===tile.x&&player.boardPosition.y===tile.y) return null;
+    if(curSummons.some(o=>o.id!==s.id&&o.boardPosition.x===tile.x&&o.boardPosition.y===tile.y)) return null;
+    if(curEnemies.some(e=>e.health>0&&e.boardPosition.x===tile.x&&e.boardPosition.y===tile.y)) return 'attack';
+    return 'move';
+  },[player,summonForwardTile]);
+
+  const resolveSummonActionMulti = useCallback((summonId, tile)=>{
+    const s=summons.find(z=>z.id===summonId);
+    if(!s) return;
+    if(player.actionpts<=0){ addLog('// Pool empty — cannot act'); return; }
+    const kind=summonActionAtMulti(s,tile,enemies,summons);
+    if(!kind) return;
+    const updatedPlayer={...player,actionpts:player.actionpts-1};
+    setPlayer(updatedPlayer);
+    if(kind==='attack'){
+      const target=enemies.find(e=>e.boardPosition.x===tile.x&&e.boardPosition.y===tile.y);
+      const dmg=s.atk;
+      const newHP=Math.max(0,target.health-dmg);
+      addLog(`${s.name} strikes ${target.name} -> ${dmg} dmg (${newHP}/${target.maxHealth})`);
+      if(newHP<=0){
+        const remaining=enemies.filter(e=>e.id!==target.id);
+        setEnemies(remaining);
+        setTimeout(()=>handleEnemyDefeatedMulti(target.id,updatedPlayer,enemies),400);
+      } else {
+        setEnemies(enemies.map(e=>e.id===target.id?{...e,health:newHP}:e));
+      }
+    } else if(tile.y===ENEMY_BACK_ROW){
+      setSummons(prev=>prev.filter(z=>z.id!==summonId));
+      addLog(`★ ${s.name} reaches the back row → promotes to Agent (autonomous staged)`);
+    } else {
+      setSummons(prev=>prev.map(z=>z.id===summonId?{...z,boardPosition:tile}:z));
+      addLog(`${s.name} advances → (${tile.x},${tile.y})`);
+    }
+    setActedSummonIds(prev=>[...prev,summonId]);
+    setSelectedSummonId(null);
+    setValidSquares([]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[summons,player,enemies,addLog,summonActionAtMulti]);
+
   // ── GRID CLICK ROUTER ──
   const handleSquareClick = useCallback((x,y)=>{
     // Deploy placement mode
-    if(showDeploy && awaitingPlacement){ resolveDeployPlacement({x,y}); return; }
+    if(showDeploy && awaitingPlacement){ (isCampaign?resolveDeployPlacementMulti:resolveDeployPlacement)({x,y}); return; }
     // Compass Slash targeting mode
-    if(compassTargeting){ resolveCompassSlash({x,y}); return; }
+    if(compassTargeting){ (isCampaign?resolveCompassSlashMulti:resolveCompassSlash)({x,y}); return; }
     // Dark Web targeting mode
-    if(darkWebTargeting){ resolveDarkWeb({x,y}); return; }
-    // Summon command sub-phase
+    if(darkWebTargeting){ (isCampaign?resolveDarkWebMulti:resolveDarkWeb)({x,y}); return; }
+    // Summon command sub-phase — only the player's own summons are
+    // selectable here; any enemy-deployed summons on the board (Campaign)
+    // are commanded automatically by their owner's own AI turn.
     if(summonPhaseActive && energyPhase==='summon'){
-      const clickedSummon=summons.find(s=>s.boardPosition.x===x&&s.boardPosition.y===y);
+      const ownSummons = summons.filter(s=>s.side==='player');
+      const clickedSummon=ownSummons.find(s=>s.boardPosition.x===x&&s.boardPosition.y===y);
       if(clickedSummon){
         if(actedSummonIds.includes(clickedSummon.id)){ addLog('// That summon already acted'); return; }
         setSelectedSummonId(clickedSummon.id);
@@ -2528,10 +3456,10 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } 
         return;
       }
       if(selectedSummonId){
-        const s=summons.find(z=>z.id===selectedSummonId);
+        const s=ownSummons.find(z=>z.id===selectedSummonId);
         if(s){
           const fwd=summonForwardTile(s);
-          if(fwd&&fwd.x===x&&fwd.y===y){ resolveSummonAction(selectedSummonId,{x,y}); return; }
+          if(fwd&&fwd.x===x&&fwd.y===y){ (isCampaign?resolveSummonActionMulti:resolveSummonAction)(selectedSummonId,{x,y}); return; }
         }
         addLog('// Click the highlighted forward tile, or another summon');
       }
@@ -2541,11 +3469,18 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } 
     if(!isPlayerTurn||energyPhase!=='act') return;
     const clickedSelf=player.boardPosition.x===x&&player.boardPosition.y===y;
     if(clickedSelf){ setPlayerSel(s=>!s); return; }
+    // Campaign: clicking a live enemy tile selects it as the current target
+    // for Melee/elemental skills (disambiguates when several are in range)
+    // rather than being interpreted as a movement destination.
+    if(isCampaign){
+      const clickedEnemy = enemies.find(e=>e.boardPosition.x===x&&e.boardPosition.y===y);
+      if(clickedEnemy){ setSelectedEnemyId(clickedEnemy.id); return; }
+    }
     if(!playerSel) return;
     const target=validSquares.find(s=>s.x===x&&s.y===y);
     if(!target) return;
     if(player.actionpts<target.distance){ addLog(`Not enough Energy (need ${target.distance})`); return; }
-    const occupiedByEnemy=enemy.boardPosition.x===x&&enemy.boardPosition.y===y;
+    const occupiedByEnemy=isCampaign ? enemies.some(e=>e.boardPosition.x===x&&e.boardPosition.y===y) : (enemy.boardPosition.x===x&&enemy.boardPosition.y===y);
     const occupiedBySummon=summons.some(s=>s.boardPosition.x===x&&s.boardPosition.y===y);
     if(occupiedByEnemy||occupiedBySummon){ addLog('// Tile occupied'); return; }
     const oldPos=player.boardPosition;
@@ -2566,15 +3501,18 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } 
     setPlayerSel(false);
     setValidSquares([]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[showDeploy,awaitingPlacement,compassTargeting,darkWebTargeting,summonPhaseActive,energyPhase,summons,actedSummonIds,selectedSummonId,isPlayerTurn,player,enemy,playerSel,validSquares,tiles,addLog,resolveDeployPlacement,resolveCompassSlash,resolveDarkWeb,summonForwardTile,resolveSummonAction]);
+  },[isCampaign,showDeploy,awaitingPlacement,compassTargeting,darkWebTargeting,summonPhaseActive,energyPhase,summons,actedSummonIds,selectedSummonId,isPlayerTurn,player,enemy,enemies,playerSel,validSquares,tiles,addLog,resolveDeployPlacement,resolveDeployPlacementMulti,resolveCompassSlash,resolveCompassSlashMulti,resolveDarkWeb,resolveDarkWebMulti,summonForwardTile,resolveSummonAction,resolveSummonActionMulti]);
 
-  // Auto-end the summon command phase once all summons have acted (or pool is empty)
+  // Auto-end the summon command phase once all of the PLAYER's own summons
+  // have acted (or pool is empty) — enemy-deployed summons in Campaign act
+  // automatically during their owner's own turn, not here.
   useEffect(()=>{
     if(!summonPhaseActive||energyPhase!=='summon') return;
-    const allActed = summons.length>0 && summons.every(s=>actedSummonIds.includes(s.id));
-    if(allActed){ const t=setTimeout(()=>endSummonCommandPhase(),300); return ()=>clearTimeout(t); }
+    const ownSummons = summons.filter(s=>s.side==='player');
+    const allActed = ownSummons.length>0 && ownSummons.every(s=>actedSummonIds.includes(s.id));
+    if(allActed){ const t=setTimeout(()=>(isCampaign?endSummonCommandPhaseMulti:endSummonCommandPhase)(),300); return ()=>clearTimeout(t); }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[summonPhaseActive,energyPhase,actedSummonIds,summons]);
+  },[summonPhaseActive,energyPhase,actedSummonIds,summons,isCampaign]);
 
   // Movement-range highlight while selected in the act phase
   useEffect(()=>{
@@ -2597,7 +3535,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } 
   // Dark Web highlight: the 8 knight-move tiles around the player while targeting.
   const darkWebTiles = darkWebTargeting ? getKnightTiles(player.boardPosition) : [];
   // Deploy highlight: legal row-7 tiles while awaiting placement.
-  const activeDeployTiles = (showDeploy && awaitingPlacement) ? deployTiles : [];
+  const activeDeployTiles = (showDeploy && awaitingPlacement) ? (isCampaign?deployTilesMulti:deployTiles) : [];
   const aoeTiles = compassTiles;
   const gridDeployHighlights = activeDeployTiles;
 
@@ -2658,6 +3596,10 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } 
 
   const enemyDistanceForAir = (()=>{
     const line=getForwardTiles(player.boardPosition,player.facing,SIZE);
+    if(isCampaign){
+      const idx=line.findIndex(t=>enemies.some(en=>en.boardPosition.x===t.x&&en.boardPosition.y===t.y));
+      return idx>=0?idx+1:0;
+    }
     const idx=line.findIndex(t=>t.x===enemy.boardPosition.x&&t.y===enemy.boardPosition.y);
     return idx>=0?idx+1:0;
   })();
@@ -2667,7 +3609,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } 
     const tx=player.boardPosition.x+dir.dx*TORRENT_RANGE, ty=player.boardPosition.y+dir.dy*TORRENT_RANGE;
     return tx>=0&&tx<SIZE&&ty>=0&&ty<SIZE;
   })();
-  const waterEnemyInFootprint = waterAoe ? getTorrentFootprint(waterAnchor,waterAoe).some(t=>t.x===enemy.boardPosition.x&&t.y===enemy.boardPosition.y) : false;
+  const waterEnemyInFootprint = waterAoe ? getTorrentFootprint(waterAnchor,waterAoe).some(t=>isCampaign ? enemies.some(en=>en.boardPosition.x===t.x&&en.boardPosition.y===t.y) : (t.x===enemy.boardPosition.x&&t.y===enemy.boardPosition.y)) : false;
   return (
     <div style={{minHeight:'100vh',background:'#0a0a0a',backgroundImage:'radial-gradient(circle at 50% 0%, rgba(0,200,255,0.06), transparent 60%)',color:'#b0dff4',fontFamily:"'Rajdhani','Share Tech Mono',sans-serif",padding:'10px 12px 24px'}}>
 
@@ -2689,11 +3631,11 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } 
         <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:8,flexWrap:'wrap',gap:6}}>
           <div style={{display:'flex',alignItems:'baseline',gap:10}}>
             <h1 style={{fontFamily:"'Advent Pro',sans-serif",fontSize:'1.25rem',fontWeight:700,letterSpacing:'0.18em',textTransform:'uppercase',color:'#00c8ff',textShadow:'0 0 18px rgba(0,200,255,0.4)',margin:0}}>Paradigm</h1>
-            <span style={{fontSize:'0.7rem',letterSpacing:'0.2em',color:'#3a6a8a',textTransform:'uppercase'}}>{sceneMeta ? `Training — ${sceneMeta.name}` : 'Grid Battler'}</span>
+            <span style={{fontSize:'0.7rem',letterSpacing:'0.2em',color:'#3a6a8a',textTransform:'uppercase'}}>{sceneMeta ? `Training — ${sceneMeta.name}` : isCampaign ? `Campaign — Battle ${campaignBattle}/3: ${CAMPAIGN_BATTLES[campaignBattle-1].name}` : 'Grid Battler'}</span>
             <span style={{fontSize:'0.62rem',letterSpacing:'0.15em',color:'#2a4a5e',fontFamily:'monospace'}}>v4.3</span>
           </div>
           <div style={{display:'flex',gap:14,alignItems:'center',fontSize:'0.8rem',fontFamily:'monospace'}}>
-            {!scene&&<span style={{color:'#7a9db5'}}>Wave <span style={{color:'#00c8ff',fontWeight:'bold'}}>{wave}</span></span>}
+            {!scene&&!isCampaign&&<span style={{color:'#7a9db5'}}>Wave <span style={{color:'#00c8ff',fontWeight:'bold'}}>{wave}</span></span>}
             <span style={{color:'#7a9db5'}}>Round <span style={{color:'#00c8ff',fontWeight:'bold'}}>{round}</span></span>
             {!scene&&<span style={{color:'#7a9db5'}}>Hexas <span style={{color:'#ffd700',fontWeight:'bold'}}>{hexas}</span></span>}
             {playerClass&&(()=>{const m=UNLOCKABLE_CLASSES.find(c=>c.id===playerClass);return <span style={{color:m.color,fontWeight:'bold',display:'flex',alignItems:'center',gap:3}}>{m.icon}{m.name}</span>;})()}
@@ -2722,10 +3664,12 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } 
                 player={player} playerRolledEnergy={playerRolledEnergy}
                 selectedCategory={selCategory} selectedElement={selElement}
                 onElementSelect={(c,e)=>{setSelCategory(c);setSelElement(e);}}
-                canAttack={canAttack} canSkill={canSkill}
-                onMelee={handleMelee} onSkill={handleSkill} onEndTurn={handleEndTurn}
-                onRollEnergy={handleRollEnergy} energyPhase={energyPhase}
-                onSurrender={handleSurrender} enemy={enemy} enemyRolledEnergy={enemyRolledEnergy}
+                canAttack={isCampaign?canAttackMulti:canAttack} canSkill={isCampaign?canSkillMulti:canSkill}
+                onMelee={isCampaign?handleMeleeMulti:handleMelee} onSkill={handleSkill} onEndTurn={isCampaign?handleEndTurnMulti:handleEndTurn}
+                onRollEnergy={isCampaign?handleRollEnergyMulti:handleRollEnergy} energyPhase={energyPhase}
+                onSurrender={isCampaign?handleSurrenderMulti:handleSurrender} enemy={enemy} enemyRolledEnergy={enemyRolledEnergy}
+                enemies={isCampaign?enemies:undefined} enemyRolledEnergyById={enemyRolledEnergyById}
+                selectedEnemyId={selectedEnemyId} onSelectEnemy={setSelectedEnemyId}
                 isPlayerTurn={isPlayerTurn}
                 playerClass={playerClass} summons={summons}
                 canMastermind={canMastermind} onMastermind={handleMastermind}
@@ -2746,6 +3690,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } 
                 <div style={{width:gridSize,height:gridSize,flexShrink:0,display:'flex'}}>
                   <Grid
                     playerPos={player.boardPosition} enemyPos={enemy.boardPosition}
+                    enemies={isCampaign?enemies:undefined} selectedEnemyId={selectedEnemyId}
                     validSquares={validSquares} onSquareClick={handleSquareClick}
                     playerSelected={playerSel} tiles={tiles}
                     playerFacing={player.facing} enemyFacing={enemy.facing}
@@ -2816,15 +3761,15 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } 
       <DiceModal
         show={showDice} category={selCategory} elementName={selElement}
         rolls={diceRolls} abilities={abilities} rolling={rolling}
-        onRoll={handleRoll} onUseAbility={handleModalAbility} onClose={resetDiceModal}
+        onRoll={handleRoll} onUseAbility={isCampaign?handleModalAbilityMulti:handleModalAbility} onClose={resetDiceModal}
         phase={dicePhase} accuracyRoll={accuracyRoll} onRollAccuracy={handleRollAccuracy}
         selectedAbilityForAccuracy={pendingAbility}
         airRange={airRange} onSetAirRange={handleSetAirRange} onConfirmAirRange={handleConfirmAirRange}
-        onFireProceedToAccuracy={handleFireProceedToAccuracy} onFireApplyWithAccuracy={handleFireApplyWithAccuracy}
+        onFireProceedToAccuracy={handleFireProceedToAccuracy} onFireApplyWithAccuracy={isCampaign?handleFireApplyWithAccuracyMulti:handleFireApplyWithAccuracy}
         earthRange={earthRange} onSetEarthRange={handleSetEarthRange} onConfirmEarthRange={handleConfirmEarthRange}
-        onEarthApplyWithAccuracy={handleEarthApplyWithAccuracy}
-        onAirApplyWithAccuracy={handleAirApplyWithAccuracy}
-        onWaterConfirm={handleWaterConfirm} onWaterApplyWithAccuracy={handleWaterApplyWithAccuracy}
+        onEarthApplyWithAccuracy={isCampaign?handleEarthApplyWithAccuracyMulti:handleEarthApplyWithAccuracy}
+        onAirApplyWithAccuracy={isCampaign?handleAirApplyWithAccuracyMulti:handleAirApplyWithAccuracy}
+        onWaterConfirm={handleWaterConfirm} onWaterApplyWithAccuracy={isCampaign?handleWaterApplyWithAccuracyMulti:handleWaterApplyWithAccuracy}
         waterAoe={waterAoe} onSetWaterAoe={handleSetWaterAoe}
         waterAvailableAP={player.actionpts}
         waterAnchorInBounds={waterAnchorInBounds} waterEnemyInFootprint={waterEnemyInFootprint}
@@ -2832,7 +3777,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } 
       />
       <ClassUnlockModal show={showClassModal} onSelect={handleSelectClass} onClose={()=>setShowClassModal(false)} freeSelect={scene==='classes'} />
       <MastermindModeModal
-        show={showMmModal} canDeploy={canDeploy} deployReason={deployBlockedReason}
+        show={showMmModal} canDeploy={isCampaign?canDeployMulti:canDeploy} deployReason={isCampaign?deployBlockedReasonMulti:deployBlockedReason}
         onPickDirect={handlePickDirect} onPickDeploy={handlePickDeploy} onClose={()=>setShowMmModal(false)}
       />
       <DeployRollModal
@@ -2841,6 +3786,13 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } 
       />
       <RewardModal show={reward.show} html={reward.html} />
       <SceneCompleteModal show={sceneComplete} sceneMeta={sceneMeta} onReturn={()=>onSceneComplete?.()} />
+      <CampaignBattleCompleteModal
+        show={isCampaign&&showBattleComplete}
+        isFinale={campaignComplete}
+        battle={CAMPAIGN_BATTLES[campaignBattle-1]}
+        onContinue={()=>{ setShowBattleComplete(false); startNextCampaignBattle(player, campaignBattle+1); }}
+        onFinish={()=>{ setShowBattleComplete(false); onCampaignComplete?.(); }}
+      />
 
       {/* Change Class — Training Mode's Classes scene only, lets the player
           reopen the picker and swap freely instead of a one-time choice. */}
@@ -2921,7 +3873,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete } 
         .square.player { background: radial-gradient(circle, #00c8ff, #006a8a); border-color: #00e0ff; color: #001018; font-weight: bold; box-shadow: 0 0 12px rgba(0,200,255,0.55); }
         .square.playerSelected { animation: pulseCyan 1s infinite; }
         .square.enemy { background: radial-gradient(circle, #ff4422, #8a1500); border-color: #ff6644; color: #1a0500; font-weight: bold; box-shadow: 0 0 12px rgba(255,68,34,0.55); }
+        .square.enemy.enemySelected { border-color: #ffd700; box-shadow: 0 0 14px rgba(255,215,0,0.75), inset 0 0 8px rgba(255,215,0,0.5); }
         .square.summon { background: radial-gradient(circle, #9b6cff, #5a2a9a); border-color: #b08cff; color: #fff; font-weight: bold; box-shadow: 0 0 10px rgba(155,108,255,0.55); }
+        .square.summon.enemySide { background: radial-gradient(circle, #ff6644, #8a2a10); border-color: #ff9966; box-shadow: 0 0 10px rgba(255,102,68,0.55); }
         .square.aoePreview { box-shadow: inset 0 0 10px rgba(155,108,255,0.6); border-color: #9b6cff; }
         .square.knightPreview { box-shadow: inset 0 0 10px rgba(160,160,160,0.6); border-color: #a0a0a0; }
         .square.deployTile { background: linear-gradient(135deg, #2a1a4a, #1a0a3a); border-color: #9b6cff; box-shadow: inset 0 0 8px rgba(155,108,255,0.4); animation: pulsePurple 1.1s infinite; }

@@ -41,6 +41,7 @@ const PLACEHOLDER_CONTENT = {
 function App() {
   const [screen, setScreen] = useState('start')
   const [gauntletStarted, setGauntletStarted] = useState(false)
+  const [campaignStarted, setCampaignStarted] = useState(false)
   const [liveState, setLiveState] = useState(null)
   // Training Mode: which scene is active, a nonce to force a fresh mount
   // each time a scene is (re)selected (scenes are a practice sandbox, not a
@@ -52,7 +53,13 @@ function App() {
 
   const goTo = useCallback((s)=>{
     if(s==='gauntlet') setGauntletStarted(true)
+    if(s==='campaign') setCampaignStarted(true)
     setScreen(s)
+  },[])
+
+  const handleCampaignComplete = useCallback(()=>{
+    setCampaignStarted(false)
+    setScreen('start')
   },[])
 
   const startScene = useCallback((sceneId)=>{
@@ -67,7 +74,7 @@ function App() {
   },[activeScene])
 
   if(screen==='start'){
-    return <StartScreen onSelectMode={goTo} onNavigate={goTo} hasActiveSession={gauntletStarted} />
+    return <StartScreen onSelectMode={goTo} onNavigate={goTo} hasActiveSession={gauntletStarted} hasActiveCampaignSession={campaignStarted} />
   }
 
   if(screen==='training'){
@@ -86,6 +93,16 @@ function App() {
         </div>
       )}
 
+      {/* Campaign stays mounted (just hidden) once started too — same
+          resume-in-progress pattern as Gauntlet, since it's a real
+          multi-battle run whose player HP/level carries across battles. */}
+      {campaignStarted && (
+        <div style={{display: screen==='campaign' ? 'block' : 'none'}}>
+          <GridBattlerGame campaign onCampaignComplete={handleCampaignComplete} onStateSync={setLiveState} />
+          <FloatingMenuButton onNavigate={goTo} />
+        </div>
+      )}
+
       {/* Training scenes are NOT kept mounted — each selection from the hub
           is a fresh instance (key forces remount even on replaying the same
           scene), since these are repeatable lessons, not sessions to resume. */}
@@ -93,7 +110,7 @@ function App() {
         <GridBattlerGame key={`${activeScene}-${sceneNonce}`} scene={activeScene} onSceneComplete={handleSceneComplete} />
       )}
 
-      {screen!=='gauntlet' && screen!=='trainingScene' && (
+      {screen!=='gauntlet' && screen!=='campaign' && screen!=='trainingScene' && (
         <div style={{minHeight:'100vh',background:'#0a0a0a',backgroundImage:'radial-gradient(circle at 50% 0%, rgba(0,200,255,0.06), transparent 60%)',color:'#b0dff4',fontFamily:"'Rajdhani','Share Tech Mono',sans-serif",display:'flex',flexDirection:'column'}}>
           <NavBar current={screen} onNavigate={goTo} onMenu={()=>setScreen('start')} />
           {screen==='character'

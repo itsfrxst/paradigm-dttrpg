@@ -5,8 +5,8 @@ const MODES = [
     desc:'Endless wave survival. Face escalating goblins and elemental Wardens.' },
   { id:'training', name:'Training Mode', icon:'🧭', color:'#00cc66', locked:false,
     desc:'A tutorial hub of focused practice scenes — movement, classes, and elements, each teachable in isolation. No grind.' },
-  { id:'campaign', name:'Campaign', icon:'📜', color:'#5a7a8a', locked:true,
-    desc:'A guided path through the cyberworld.' },
+  { id:'campaign', name:'Campaign', icon:'📜', color:'#cc4422', locked:false,
+    desc:'Fight through an army. Three escalating squad battles — from a pair of single-skill grunts to a lone Full Proxie finale.' },
   { id:'arena', name:'Arena', icon:'🛡', color:'#5a7a8a', locked:true,
     desc:'Head-to-head Proxy combat.' },
 ];
@@ -19,7 +19,7 @@ const NAV_ITEMS = [
   { id:'social',    label:'Social',    icon:'💬', color:'#d966b3' },
 ];
 
-const StartScreen = ({ onSelectMode, onNavigate, hasActiveSession }) => (
+const StartScreen = ({ onSelectMode, onNavigate, hasActiveSession, hasActiveCampaignSession }) => (
   <div style={{minHeight:'100vh',background:'#0a0a0a',backgroundImage:'radial-gradient(circle at 50% 0%, rgba(0,200,255,0.08), transparent 60%)',color:'#b0dff4',fontFamily:"'Rajdhani','Share Tech Mono',sans-serif",display:'flex',flexDirection:'column',alignItems:'center',padding:'48px 20px 60px'}}>
     <div style={{fontSize:11,letterSpacing:'0.3em',color:'#3a6a8a',textTransform:'uppercase',marginBottom:10,fontFamily:'monospace'}}>// cyberworld access terminal //</div>
     <h1 style={{fontFamily:"'Advent Pro',sans-serif",fontSize:'3.2rem',fontWeight:700,letterSpacing:'0.16em',textTransform:'uppercase',color:'#00c8ff',textShadow:'0 0 30px rgba(0,200,255,0.5)',margin:0}}>Paradigm</h1>
@@ -40,6 +40,9 @@ const StartScreen = ({ onSelectMode, onNavigate, hasActiveSession }) => (
             <div style={{fontSize:14,fontWeight:'bold',color:m.locked?'#5a7a8a':m.color,marginBottom:6}}>{m.name}</div>
             <div style={{fontSize:11,color:'#7a9db5',lineHeight:1.5}}>{m.desc}</div>
             {!m.locked && m.id==='gauntlet' && hasActiveSession && (
+              <div style={{marginTop:10,fontSize:10,color:'#00cc66',fontWeight:'bold',letterSpacing:'0.05em'}}>▸ SESSION IN PROGRESS — RESUME</div>
+            )}
+            {!m.locked && m.id==='campaign' && hasActiveCampaignSession && (
               <div style={{marginTop:10,fontSize:10,color:'#00cc66',fontWeight:'bold',letterSpacing:'0.05em'}}>▸ SESSION IN PROGRESS — RESUME</div>
             )}
           </div>
