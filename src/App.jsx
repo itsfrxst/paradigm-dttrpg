@@ -26,7 +26,7 @@ const PLACEHOLDER_CONTENT = {
     icon:'🔧', title:'Crafting', color:'#ff8844',
     lines:[
       'Synthesis protocol not yet compiled.',
-      'Recipes and item fabrication come online in a future build.',
+      'Complete the Campaign to bring it online.',
     ],
   },
   social: {
@@ -73,6 +73,24 @@ function App() {
     setScreen('training')
   },[activeScene])
 
+  // Crafting stays a placeholder until the real system exists, but reflects
+  // the Campaign-completion unlock: current Hexas balance and whatever
+  // equipment the run granted, so the reward from finishing Campaign is
+  // visible somewhere even before spending is actually wired up.
+  const craftingContent = liveState?.craftingUnlocked
+    ? {
+        icon:'🔧', title:'Crafting', color:'#ff8844',
+        lines:[
+          'Synthesis protocol online — Campaign reward unlocked.',
+          `Hexas on hand: ${liveState.hexas ?? 0}.`,
+          liveState.player?.equipment?.length
+            ? `Equipped: ${liveState.player.equipment.map(e=>e.name).join(', ')}.`
+            : 'No equipment yet.',
+          'Spending Hexas on recipes comes online in a future build.',
+        ],
+      }
+    : PLACEHOLDER_CONTENT.crafting
+
   if(screen==='start'){
     return <StartScreen onSelectMode={goTo} onNavigate={goTo} hasActiveSession={gauntletStarted} hasActiveCampaignSession={campaignStarted} />
   }
@@ -115,7 +133,7 @@ function App() {
           <NavBar current={screen} onNavigate={goTo} onMenu={()=>setScreen('start')} />
           {screen==='character'
             ? <CharacterScreen liveState={liveState} hasActiveSession={gauntletStarted} onLaunch={()=>goTo('gauntlet')} />
-            : <PlaceholderScreen {...PLACEHOLDER_CONTENT[screen]} />}
+            : <PlaceholderScreen {...(screen==='crafting' ? craftingContent : PLACEHOLDER_CONTENT[screen])} />}
         </div>
       )}
     </>

@@ -612,11 +612,25 @@ const makeEnemyProxie = (rank, level, pos) => {
 // The 3-battle Campaign arc: escalating from a pair of single-skill Rank 4
 // grunts to a lone Rank 1 "Full Proxie" finale. `level` drives HP/melee-base
 // scaling via the existing enemyTier system, independent of rank.
+// `narrative` is the lead-in shown before that battle starts (intro modal
+// for stage 1, battle-complete "Continue" modal for 2/3). `victoryNarrative`
+// is finale-only, shown on Campaign completion alongside the reward grant.
+// Placeholder prose — first pass, meant to be rewritten once the wider story
+// is nailed down.
 export const CAMPAIGN_BATTLES = [
-  { stage:1, name:'Skirmish Line',  roster:[{rank:4},{rank:4}], level:2 },
-  { stage:2, name:'Strike Squad',   roster:[{rank:3},{rank:3}], level:8 },
-  { stage:3, name:'Command Proxie', roster:[{rank:1}],          level:10, isFinale:true },
+  { stage:1, name:'Skirmish Line',  roster:[{rank:4},{rank:4}], level:2,
+    narrative:'Grid intercepts flag a fractured patrol at the outer perimeter — two rogue processes running on minimal instruction sets. Clear them before they regroup.' },
+  { stage:2, name:'Strike Squad',   roster:[{rank:3},{rank:3}], level:8,
+    narrative:'The breach widens. A coordinated strike squad has moved in to reinforce the perimeter — better instantiated than the scouts that came before.' },
+  { stage:3, name:'Command Proxie', roster:[{rank:1}],          level:10, isFinale:true,
+    narrative:'At the heart of the breach: a Command Proxie, fully instantiated, every subsystem online. This is what has been holding the line.',
+    victoryNarrative:'The Command Proxie\'s core destabilizes and goes dark. The breach is yours. Synthesis protocols detected in the wreckage — Crafting is online, and your Hexas are finally spendable.' },
 ];
+
+// Campaign's completion reward — the player's first piece of equipment.
+// Placeholder until the real gear/stat system exists; for now it's a flat
+// stat bump applied directly to the player, same spirit as a level-up.
+export const FIRST_EQUIPMENT = { name:'Salvaged Core Chip', statBonus:'+100 Max HP', maxHealthBonus:100 };
 
 // Places each roster slot on the enemy back row (row 0), retrying on
 // collision with player/previously-placed enemies.
@@ -916,6 +930,10 @@ const CampaignIntroModal = ({show, onSubmit}) => {
           <div style={{fontSize:'11px',letterSpacing:'0.2em',textTransform:'uppercase',color:'#cc4422'}}>// Campaign — New Proxie</div>
           <h2 style={{fontSize:'1.3rem',letterSpacing:'0.1em',textTransform:'uppercase',color:'#ff8866',marginTop:6}}>Load Into the Grid</h2>
           <div style={{fontSize:'11px',color:'#5a7a8a',marginTop:4}}>Name your Proxie, choose its class and element. These lock in for the run.</div>
+        </div>
+
+        <div style={{background:'#0a1218',border:'1px solid #cc442244',borderRadius:8,padding:'12px 14px',marginBottom:18,fontSize:12,color:'#7a9db5',lineHeight:1.6,fontStyle:'italic'}}>
+          {CAMPAIGN_BATTLES[0].narrative}
         </div>
 
         <div style={{marginBottom:16}}>
@@ -1873,17 +1891,25 @@ const SceneCompleteModal = ({show, sceneMeta, onReturn}) => {
 // Shown between Campaign battles ("Continue" to the next roster) and on the
 // finale ("Return to Menu"). Player HP/level/XP/hexas carry forward — only
 // position/tiles/enemies reset, handled by startNextCampaignBattle.
-const CampaignBattleCompleteModal = ({show, isFinale, battle, onContinue, onFinish}) => {
+const CampaignBattleCompleteModal = ({show, isFinale, battle, nextBattle, equipmentReward, onContinue, onFinish}) => {
   if(!show) return null;
   const color = isFinale ? '#ffd700' : '#00c8ff';
   return (
     <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.85)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:4000}}>
-      <div style={{background:'#080e14',border:`2px solid ${color}`,borderRadius:12,padding:'2rem',maxWidth:420,width:'92%',textAlign:'center',color:'#b0dff4',boxShadow:`0 0 50px ${color}66`}}>
+      <div style={{background:'#080e14',border:`2px solid ${color}`,borderRadius:12,padding:'2rem',maxWidth:440,width:'92%',textAlign:'center',color:'#b0dff4',boxShadow:`0 0 50px ${color}66`}}>
         <div style={{fontSize:'11px',letterSpacing:'0.2em',textTransform:'uppercase',color}}>{isFinale ? '// Campaign Complete' : `// Battle ${battle?.stage}/3 Cleared`}</div>
         <h2 style={{fontSize:'1.4rem',letterSpacing:'0.1em',textTransform:'uppercase',color,marginTop:8}}>{isFinale ? 'The Army Falls' : `${battle?.name} Down`}</h2>
-        <div style={{fontSize:12,color:'#7a9db5',marginTop:10,marginBottom:20,lineHeight:1.6}}>
-          {isFinale ? 'You defeated the Command Proxie. The Campaign is complete.' : `Onward to Battle ${(battle?.stage||1)+1}/3. Your HP and progress carry forward — no full heal between fights.`}
+        <div style={{background:'#0a1218',border:`1px solid ${color}33`,borderRadius:8,padding:'12px 14px',margin:'14px 0',fontSize:12,color:'#7a9db5',lineHeight:1.6,fontStyle:'italic',textAlign:'left'}}>
+          {isFinale ? battle?.victoryNarrative : nextBattle?.narrative}
         </div>
+        {isFinale && equipmentReward && (
+          <div style={{background:'rgba(255,215,0,0.08)',border:'1px solid #ffd70055',borderRadius:8,padding:'10px 14px',marginBottom:18,fontSize:12,color:'#ffd700',textAlign:'left'}}>
+            <strong>◈ {equipmentReward.name}</strong> — {equipmentReward.statBonus}
+          </div>
+        )}
+        {!isFinale && (
+          <div style={{fontSize:11,color:'#5a7a8a',marginBottom:18}}>Your HP and progress carry forward — no full heal between fights.</div>
+        )}
         <button onClick={isFinale?onFinish:onContinue}
           style={{width:'100%',padding:12,background:`${color}22`,border:`1px solid ${color}`,borderRadius:6,color,fontSize:14,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.08em'}}>
           {isFinale ? 'Return to Menu' : 'Continue'}
@@ -1922,6 +1948,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const [enemies,          setEnemies]          = useState(()=> isCampaign ? spawnCampaignRoster(1, initPlayer().boardPosition) : []);
   const [campaignBattle,   setCampaignBattle]   = useState(1);
   const [campaignComplete, setCampaignComplete] = useState(false);
+  const [craftingUnlocked, setCraftingUnlocked] = useState(false);
   const [showBattleComplete, setShowBattleComplete] = useState(false);
   // Shown once, before Battle 1 — Campaign locks name/class/element up front
   // instead of Gauntlet's post-boss unlock or Training's free swapping.
@@ -3299,7 +3326,13 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(remaining.length>0) return; // battle continues with the survivors
     const battle = CAMPAIGN_BATTLES[campaignBattle-1];
     addLog(battle.isFinale ? '=== CAMPAIGN COMPLETE — the army falls. ===' : `=== Battle ${campaignBattle}/3 cleared! ===`);
-    if(battle.isFinale) setCampaignComplete(true);
+    if(battle.isFinale){
+      setCampaignComplete(true);
+      setCraftingUnlocked(true);
+      setPlayer(p=>({...p, equipment:[...(p.equipment||[]), FIRST_EQUIPMENT],
+        maxHealth:p.maxHealth+FIRST_EQUIPMENT.maxHealthBonus, health:p.health+FIRST_EQUIPMENT.maxHealthBonus}));
+      addLog(`◈ ${FIRST_EQUIPMENT.name} acquired — ${FIRST_EQUIPMENT.statBonus}. Crafting unlocked.`);
+    }
     setShowBattleComplete(true);
   },[campaignBattle,addLog,applyLevelUp]);
 
@@ -3746,8 +3779,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // screen elsewhere in the app) that isn't otherwise able to see this
   // component's internal state. No-op if no callback was passed in.
   useEffect(()=>{
-    onStateSync?.({ player, playerClass, wave, hexas });
-  },[player, playerClass, wave, hexas, onStateSync]);
+    onStateSync?.({ player, playerClass, wave, hexas, craftingUnlocked });
+  },[player, playerClass, wave, hexas, craftingUnlocked, onStateSync]);
 
   // Track viewport orientation so the rotate prompt reacts to resize/rotation.
   useEffect(()=>{
@@ -3983,6 +4016,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         show={isCampaign&&showBattleComplete}
         isFinale={campaignComplete}
         battle={CAMPAIGN_BATTLES[campaignBattle-1]}
+        nextBattle={CAMPAIGN_BATTLES[campaignBattle]}
+        equipmentReward={FIRST_EQUIPMENT}
         onContinue={()=>{ setShowBattleComplete(false); startNextCampaignBattle(player, campaignBattle+1); }}
         onFinish={()=>{ setShowBattleComplete(false); onCampaignComplete?.(); }}
       />
