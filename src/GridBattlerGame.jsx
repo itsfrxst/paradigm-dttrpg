@@ -745,7 +745,7 @@ const commandEnemySummons = (thisEnemy, allSummons, otherEnemies, player) => {
   let apLeft = thisEnemy.actionpts;
   let playerHP = player.health;
   const logs = [];
-  const owned = allSummons.filter(s=>s.side==='enemy' && s.ownerId===thisEnemy.id);
+  const owned = allSummons.filter(s=>s.side==='enemy' && s.ownerId===thisEnemy.id && !s.promoted);
   for(const s of owned){
     if(apLeft<=0) break;
     const cur = nextSummons.find(z=>z.id===s.id);
@@ -759,7 +759,9 @@ const commandEnemySummons = (thisEnemy, allSummons, otherEnemies, player) => {
       continue;
     }
     if(fwd.y>=SIZE){
-      nextSummons = nextSummons.filter(z=>z.id!==cur.id);
+      // Stays on the board, marked as promoted — no more marching (that IS
+      // the last row), just a visible Agent instead of vanishing from play.
+      nextSummons = nextSummons.map(z=>z.id===cur.id?{...z,boardPosition:{x:cur.boardPosition.x,y:SIZE-1},promoted:true}:z);
       logs.push(`* ${cur.name} reaches your line — promotes to Agent (autonomous staged)`);
       apLeft--;
       continue;
@@ -1147,7 +1149,7 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
                 <span style={{display:'flex',alignItems:'center',gap:5,fontSize:'11px',color:classMeta.color,fontWeight:'bold',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>
                   <span>{classMeta.icon}</span>{classMeta.name}
                 </span>
-                {hasSummoner&&<span style={{fontSize:'10px',color:'#8ab5cc',fontFamily:'monospace',whiteSpace:'nowrap'}}>Bandwidth {summons.filter(s=>!s.side||s.side==='player').length}/{BANDWIDTH}</span>}
+                {hasSummoner&&<span style={{fontSize:'10px',color:'#8ab5cc',fontFamily:'monospace',whiteSpace:'nowrap'}}>Bandwidth {summons.filter(s=>(!s.side||s.side==='player')&&!s.promoted).length}/{BANDWIDTH}</span>}
               </div>
             )}
             <StatLine
@@ -1164,7 +1166,7 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
                   const m=SUMMON_TIER_META[s.tier];
                   return (
                     <div key={s.id} style={{display:'flex',alignItems:'center',justifyContent:'space-between',fontSize:'10px',marginBottom:2,gap:6}}>
-                      <span style={{display:'flex',alignItems:'center',gap:4,color:m.color,whiteSpace:'nowrap'}}><span>{m.icon}</span>{s.tier}</span>
+                      <span style={{display:'flex',alignItems:'center',gap:4,color:s.promoted?'#ffd700':m.color,whiteSpace:'nowrap'}}><span>{m.icon}{s.promoted?'★':''}</span>{s.tier}{s.promoted?' (Agent)':''}</span>
                       <span style={{color:'#7a9db5',fontFamily:'monospace',whiteSpace:'nowrap'}}>{s.health}/{s.maxHealth} · ({s.boardPosition.x},{s.boardPosition.y})</span>
                     </div>
                   );
@@ -1327,7 +1329,10 @@ const Grid = ({playerPos,enemyPos,enemies,selectedEnemyId,validSquares,onSquareC
       cls+=' enemy'+(enemyHere&&enemyHere.id===selectedEnemyId?' enemySelected':'');
       label=facingArrow(enemyHere?enemyHere.facing:enemyFacing);
     }
-    else if(summon){ cls+=' summon'+(summon.side==='enemy'?' enemySide':''); label=SUMMON_TIER_META[summon.tier].icon; }
+    else if(summon){
+      cls+=' summon'+(summon.side==='enemy'?' enemySide':'')+(summon.promoted?' promoted':'');
+      label=SUMMON_TIER_META[summon.tier].icon+(summon.promoted?'★':'');
+    }
     else { if(isA) cls+=' available'; cls+=' '+tileClassName(tileType); }
     if(isAoe) cls+=' aoePreview';
     if(isKnight) cls+=' knightPreview';
@@ -2028,10 +2033,6 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const [selectedSummonId,  setSelectedSummonId]  = useState(null);
   const [actedSummonIds,    setActedSummonIds]    = useState([]);
   const summonCtxRef = useRef(null);
-  // True only when a summon COMMAND phase ran this round (summons existed at the
-  // energy roll). Distinguishes "summons → enemy already happened" from a legacy
-  // round where the player deploys a summon mid-turn (enemy still owed a turn).
-  const summonPhaseRanRef = useRef(false);
 
   const addLog = useCallback((msg)=>setLogs(prev=>[...prev,msg]),[]);
 
@@ -2109,7 +2110,6 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
 
   const beginSummonCommandPhase = useCallback((rP, rE, currentRound)=>{
     summonCtxRef.current = { round: currentRound };
-    summonPhaseRanRef.current = true;
     setActedSummonIds([]);
     setSelectedSummonId(null);
     setSummonPhaseActive(true);
@@ -2119,20 +2119,34 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     addLog(`=== Summon Command — ${summons.length} active (pool ${rP.actionpts}E). Click a summon, then its tile. ===`);
   },[addLog,summons]);
 
+  // Summons act first each round, then whatever's left of the shared pool
+  // goes to the player, and only once the player is also spent does the
+  // enemy get its turn — mirroring pawns clearing the way before the
+  // stronger pieces move, and letting the player finish acting on their
+  // own leftover Energy instead of eating a full enemy turn immediately
+  // after committing to summon commands. If the summons used the whole
+  // pool, there's nothing for the player to spend, so skip straight to
+  // the enemy instead of showing an empty act phase.
   const endSummonCommandPhase = useCallback(()=>{
     setSummonPhaseActive(false);
     setSelectedSummonId(null);
     setValidSquares([]);
     const ctx = summonCtxRef.current || { round };
-    addLog('=== Summons done — enemy turn ===');
-    setIsPlayerTurn(false);
-    setEnemyRolledEnergy(0);
-    setEnemy(curE=>{
-      setPlayer(curP=>{
-        setTimeout(()=>runEnemyTurn({...curE,actionpts:0}, curP, ctx.round), 400);
-        return curP;
+    setPlayer(curP=>{
+      setEnemy(curE=>{
+        if(curP.actionpts>0){
+          addLog('=== Summons done — spend remaining Energy ===');
+          setIsPlayerTurn(true);
+          setEnergyPhase('act');
+        } else {
+          addLog('=== Summons done — enemy turn ===');
+          setIsPlayerTurn(false);
+          setEnemyRolledEnergy(0);
+          setTimeout(()=>runEnemyTurn({...curE,actionpts:0}, curP, ctx.round), 400);
+        }
+        return curE;
       });
-      return curE;
+      return curP;
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[addLog,round]);
@@ -2169,7 +2183,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       }
       // Summon holds its tile on an attack — it doesn't move into the enemy.
     } else if(tile.y===ENEMY_BACK_ROW){
-      setSummons(prev=>prev.filter(z=>z.id!==summonId));
+      // Stays on the board, marked promoted — reads as an evolved Agent
+      // instead of vanishing from play. No further movement (staged).
+      setSummons(prev=>prev.map(z=>z.id===summonId?{...z,boardPosition:tile,promoted:true}:z));
       addLog(`★ ${s.name} reaches the back row → promotes to Agent (autonomous staged)`);
     } else {
       setSummons(prev=>prev.map(z=>z.id===summonId?{...z,boardPosition:tile}:z));
@@ -2458,7 +2474,6 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   },[addLog,tiles,summons,wave,triggerCastFx]);
   // ── ROUND ORCHESTRATION ──
   const beginRound = useCallback((rP, rE, currentRound)=>{
-    summonPhaseRanRef.current = false; // reset; set true only if command phase runs
     setIsPlayerTurn(true);
     setEnergyPhase('roll');
     setSelectedSummonId(null);
@@ -2497,7 +2512,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     addLog(`You roll d12=${roll}${rollover>0?` +${rollover} rollover`:''} = ${total} Energy${frozenPenalty>0?` (freeze -${frozenPenalty})`:''}  ->  ${newAP} AP`);
     const rolledPlayer = { ...player, actionpts:newAP, frozen:0, energyRollover:0 };
     setPlayer(rolledPlayer);
-    if(summons.length>0){
+    if(summons.some(s=>!s.promoted)){
       setEnemy(curE=>{ beginSummonCommandPhase(rolledPlayer, curE, round); return curE; });
     } else {
       setEnergyPhase('act');
@@ -2559,11 +2574,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   },[wave,addLog]);
 
   // ── ROUTING AFTER A PLAYER ACTION ──
-  // Whether the current round had a summon command phase (summons → enemy already
-  // resolved). If so, after the player spends their remainder the round simply
-  // ends. If not (legacy/no-summon or mid-turn deploy), the enemy is still owed a turn.
-  const roundHadSummonPhase = useCallback(()=>summonPhaseRanRef.current===true,[]);
-
+  // The enemy always gets exactly one turn per round, right after the
+  // player (and any summons before them) are fully spent — summons no
+  // longer skip straight to the enemy on their own.
   const routeAfterPlayerAction = useCallback((updatedPlayer, updatedEnemy)=>{
     if(updatedEnemy.health<=0) return;
     if(updatedPlayer.actionpts>0){
@@ -2571,17 +2584,12 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       setEnemy(updatedEnemy);
       return; // player keeps acting
     }
-    // Player exhausted pool.
-    if(roundHadSummonPhase()){
-      checkEndOfRound(updatedPlayer, updatedEnemy, round);
-    } else {
-      addLog('=== Enemy Turn ===');
-      setIsPlayerTurn(false);
-      setEnemyRolledEnergy(0);
-      setTimeout(()=>runEnemyTurn({...updatedEnemy,actionpts:0}, updatedPlayer, round), 400);
-    }
+    addLog('=== Enemy Turn ===');
+    setIsPlayerTurn(false);
+    setEnemyRolledEnergy(0);
+    setTimeout(()=>runEnemyTurn({...updatedEnemy,actionpts:0}, updatedPlayer, round), 400);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[round,addLog,checkEndOfRound,roundHadSummonPhase,runEnemyTurn]);
+  },[round,addLog,runEnemyTurn]);
 
   // ── MELEE ──
   const handleMelee = useCallback(()=>{
@@ -2610,17 +2618,13 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(saved>0) addLog(`You end your turn — saving ${saved} Energy as rollover`);
     else addLog('You end your turn');
     const updatedPlayer={...player,actionpts:0,energyRollover:(player.energyRollover||0)+saved};
-    if(roundHadSummonPhase()){
-      checkEndOfRound(updatedPlayer, enemy, round);
-    } else {
-      setPlayer(updatedPlayer);
-      setIsPlayerTurn(false);
-      setEnemyRolledEnergy(0);
-      addLog('=== Enemy Turn ===');
-      setTimeout(()=>runEnemyTurn({...enemy,actionpts:0}, updatedPlayer, round), 400);
-    }
+    setPlayer(updatedPlayer);
+    setIsPlayerTurn(false);
+    setEnemyRolledEnergy(0);
+    addLog('=== Enemy Turn ===');
+    setTimeout(()=>runEnemyTurn({...enemy,actionpts:0}, updatedPlayer, round), 400);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[player,enemy,round,addLog,checkEndOfRound,roundHadSummonPhase,runEnemyTurn]);
+  },[player,enemy,round,addLog,runEnemyTurn]);
 
   const handleSurrender = useCallback(()=>{
     addLog('=== You surrendered. Restarting... ===');
@@ -2825,8 +2829,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
 
   // ── MASTERMIND (Summoner skill) ──
   const deployTiles = getDeployTiles(tiles, player.boardPosition, enemy.boardPosition, summons);
-  const canDeploy = summons.length < BANDWIDTH && deployTiles.length > 0 && player.actionpts >= 2;
-  const deployBlockedReason = summons.length>=BANDWIDTH ? `bandwidth full (${BANDWIDTH}/${BANDWIDTH})`
+  const activeSummonCount = summons.filter(s=>!s.promoted).length;
+  const canDeploy = activeSummonCount < BANDWIDTH && deployTiles.length > 0 && player.actionpts >= 2;
+  const deployBlockedReason = activeSummonCount>=BANDWIDTH ? `bandwidth full (${BANDWIDTH}/${BANDWIDTH})`
                             : deployTiles.length===0 ? 'no legal tiles on row 7'
                             : player.actionpts<2 ? 'need 2 Energy'
                             : '';
@@ -2982,7 +2987,6 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   },[addLog]);
 
   const beginRoundMulti = useCallback((rP, rEnemies, currentRound)=>{
-    summonPhaseRanRef.current = false;
     setIsPlayerTurn(true);
     setEnergyPhase('roll');
     setSelectedSummonId(null);
@@ -3256,35 +3260,50 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
 
   // Sequences the roster: each living enemy takes its full independent turn
   // (own roll, own AP pool) before control returns to the player. Mirrors
-  // finishEnemyToPlayer's role in the single-enemy engine.
+  // finishEnemyToPlayer's role in the single-enemy engine. Weakest rank acts
+  // first, strongest last — pawns clear the way before the stronger pieces
+  // move, per the Codex's chess framing. Only re-sorted at the start of a
+  // fresh sequence (idx===0); the resulting order is then threaded through
+  // the recursive chain like everything else here.
   const runEnemiesSequence = useCallback((idx, currentEnemies, currentPlayer, currentRound)=>{
     if(currentPlayer.health<=0) return; // mirrors the single-enemy engine's own lack of a game-over flow
-    if(idx>=currentEnemies.length){
-      finishEnemiesToPlayerMulti(currentPlayer,currentEnemies,currentRound);
+    const ordered = idx===0 ? [...currentEnemies].sort((a,b)=>b.rank-a.rank) : currentEnemies;
+    if(idx>=ordered.length){
+      finishEnemiesToPlayerMulti(currentPlayer,ordered,currentRound);
       return;
     }
-    const thisEnemy=currentEnemies[idx];
+    const thisEnemy=ordered[idx];
     if(!thisEnemy||thisEnemy.health<=0){
-      runEnemiesSequence(idx+1,currentEnemies,currentPlayer,currentRound);
+      runEnemiesSequence(idx+1,ordered,currentPlayer,currentRound);
       return;
     }
-    runSingleEnemyAITurn(thisEnemy,currentEnemies,currentPlayer,currentRound,(updatedPlayer,updatedEnemies)=>{
+    runSingleEnemyAITurn(thisEnemy,ordered,currentPlayer,currentRound,(updatedPlayer,updatedEnemies)=>{
       if(updatedPlayer.health<=0) return;
       runEnemiesSequence(idx+1,updatedEnemies,updatedPlayer,currentRound);
     });
   },[finishEnemiesToPlayerMulti,runSingleEnemyAITurn]);
 
+  // Same pawns-clear-the-way sequencing as the single-enemy engine: summons
+  // go first, then the player spends whatever's left of the shared pool,
+  // and only once both are spent do the enemies take their (rank-ordered)
+  // turns. Skips straight to the enemies if the summons used the whole pool.
   const endSummonCommandPhaseMulti = useCallback(()=>{
     setSummonPhaseActive(false);
     setSelectedSummonId(null);
     setValidSquares([]);
     const ctx = summonCtxRef.current || { round };
-    addLog('=== Summons done — enemies act ===');
-    setIsPlayerTurn(false);
-    setEnemyRolledEnergyById({});
     setPlayer(curP=>{
       setEnemies(curE=>{
-        setTimeout(()=>runEnemiesSequence(0, curE.map(e=>({...e,actionpts:0})), curP, ctx.round), 400);
+        if(curP.actionpts>0){
+          addLog('=== Summons done — spend remaining Energy ===');
+          setIsPlayerTurn(true);
+          setEnergyPhase('act');
+        } else {
+          addLog('=== Summons done — enemies act ===');
+          setIsPlayerTurn(false);
+          setEnemyRolledEnergyById({});
+          setTimeout(()=>runEnemiesSequence(0, curE.map(e=>({...e,actionpts:0})), curP, ctx.round), 400);
+        }
         return curE;
       });
       return curP;
@@ -3298,16 +3317,11 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       setEnemies(updatedEnemies);
       return;
     }
-    if(roundHadSummonPhase()){
-      checkEndOfRoundMulti(updatedPlayer, updatedEnemies, round);
-    } else {
-      addLog("=== Enemies' Turn ===");
-      setIsPlayerTurn(false);
-      setEnemyRolledEnergyById({});
-      setTimeout(()=>runEnemiesSequence(0, updatedEnemies.map(e=>({...e,actionpts:0})), updatedPlayer, round), 400);
-    }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[round,addLog,checkEndOfRoundMulti,roundHadSummonPhase,runEnemiesSequence]);
+    addLog("=== Enemies' Turn ===");
+    setIsPlayerTurn(false);
+    setEnemyRolledEnergyById({});
+    setTimeout(()=>runEnemiesSequence(0, updatedEnemies.map(e=>({...e,actionpts:0})), updatedPlayer, round), 400);
+  },[round,addLog,runEnemiesSequence]);
 
   const handleEnemyDefeatedMulti = useCallback((defeatedId, curPlayer, curEnemies)=>{
     const dead = curEnemies.find(e=>e.id===defeatedId);
@@ -3380,7 +3394,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     addLog(`You roll d12=${roll}${rollover>0?` +${rollover} rollover`:''} = ${total} Energy${frozenPenalty>0?` (freeze -${frozenPenalty})`:''}  ->  ${newAP} AP`);
     const rolledPlayer={...player,actionpts:newAP,frozen:0,energyRollover:0};
     setPlayer(rolledPlayer);
-    if(summons.some(s=>s.side==='player')){
+    if(summons.some(s=>s.side==='player'&&!s.promoted)){
       beginSummonCommandPhase(rolledPlayer, null, round);
     } else {
       setEnergyPhase('act');
@@ -3393,17 +3407,13 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(saved>0) addLog(`You end your turn — saving ${saved} Energy as rollover`);
     else addLog('You end your turn');
     const updatedPlayer={...player,actionpts:0,energyRollover:(player.energyRollover||0)+saved};
-    if(roundHadSummonPhase()){
-      checkEndOfRoundMulti(updatedPlayer, enemies, round);
-    } else {
-      setPlayer(updatedPlayer);
-      setIsPlayerTurn(false);
-      setEnemyRolledEnergyById({});
-      addLog("=== Enemies' Turn ===");
-      setTimeout(()=>runEnemiesSequence(0, enemies.map(e=>({...e,actionpts:0})), updatedPlayer, round), 400);
-    }
+    setPlayer(updatedPlayer);
+    setIsPlayerTurn(false);
+    setEnemyRolledEnergyById({});
+    addLog("=== Enemies' Turn ===");
+    setTimeout(()=>runEnemiesSequence(0, enemies.map(e=>({...e,actionpts:0})), updatedPlayer, round), 400);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[player,enemies,round,addLog,checkEndOfRoundMulti,roundHadSummonPhase,runEnemiesSequence]);
+  },[player,enemies,round,addLog,runEnemiesSequence]);
 
   const handleSurrenderMulti = useCallback(()=>{
     addLog('=== You retreat from the Campaign. ===');
@@ -3562,8 +3572,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
 
   // ── Mastermind / Dark Web targeting resolution ──
   const deployTilesMulti = getDeployTiles(tiles, player.boardPosition, enemies.map(e=>e.boardPosition), summons);
-  const canDeployMulti = summons.filter(s=>s.side==='player').length < BANDWIDTH && deployTilesMulti.length > 0 && player.actionpts >= 2;
-  const deployBlockedReasonMulti = summons.filter(s=>s.side==='player').length>=BANDWIDTH ? `bandwidth full (${BANDWIDTH}/${BANDWIDTH})`
+  const canDeployMulti = summons.filter(s=>s.side==='player'&&!s.promoted).length < BANDWIDTH && deployTilesMulti.length > 0 && player.actionpts >= 2;
+  const deployBlockedReasonMulti = summons.filter(s=>s.side==='player'&&!s.promoted).length>=BANDWIDTH ? `bandwidth full (${BANDWIDTH}/${BANDWIDTH})`
                             : deployTilesMulti.length===0 ? 'no legal tiles on row 7'
                             : player.actionpts<2 ? 'need 2 Energy'
                             : '';
@@ -3646,7 +3656,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         setEnemies(enemies.map(e=>e.id===target.id?{...e,health:newHP}:e));
       }
     } else if(tile.y===ENEMY_BACK_ROW){
-      setSummons(prev=>prev.filter(z=>z.id!==summonId));
+      // Stays on the board, marked promoted — reads as an evolved Agent
+      // instead of vanishing from play. No further movement (staged).
+      setSummons(prev=>prev.map(z=>z.id===summonId?{...z,boardPosition:tile,promoted:true}:z));
       addLog(`★ ${s.name} reaches the back row → promotes to Agent (autonomous staged)`);
     } else {
       setSummons(prev=>prev.map(z=>z.id===summonId?{...z,boardPosition:tile}:z));
@@ -3670,7 +3682,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     // selectable here; any enemy-deployed summons on the board (Campaign)
     // are commanded automatically by their owner's own AI turn.
     if(summonPhaseActive && energyPhase==='summon'){
-      const ownSummons = summons.filter(s=>s.side==='player');
+      const ownSummons = summons.filter(s=>s.side==='player'&&!s.promoted);
       const clickedSummon=ownSummons.find(s=>s.boardPosition.x===x&&s.boardPosition.y===y);
       if(clickedSummon){
         if(actedSummonIds.includes(clickedSummon.id)){ addLog('// That summon already acted'); return; }
@@ -3732,8 +3744,11 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // automatically during their owner's own turn, not here.
   useEffect(()=>{
     if(!summonPhaseActive||energyPhase!=='summon') return;
-    const ownSummons = summons.filter(s=>s.side==='player');
-    const allActed = ownSummons.length>0 && ownSummons.every(s=>actedSummonIds.includes(s.id));
+    // Promoted summons are inert (staged Agent behavior) — they don't need
+    // commanding, and requiring an empty list to "act" before continuing
+    // would softlock the phase if every summon happened to be promoted.
+    const ownSummons = summons.filter(s=>s.side==='player'&&!s.promoted);
+    const allActed = ownSummons.every(s=>actedSummonIds.includes(s.id));
     if(allActed){ const t=setTimeout(()=>(isCampaign?endSummonCommandPhaseMulti:endSummonCommandPhase)(),300); return ()=>clearTimeout(t); }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[summonPhaseActive,energyPhase,actedSummonIds,summons,isCampaign]);
@@ -4117,6 +4132,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         .square.enemy.enemySelected { border-color: #ffd700; box-shadow: 0 0 14px rgba(255,215,0,0.75), inset 0 0 8px rgba(255,215,0,0.5); }
         .square.summon { background: radial-gradient(circle, #9b6cff, #5a2a9a); border-color: #b08cff; color: #fff; font-weight: bold; box-shadow: 0 0 10px rgba(155,108,255,0.55); }
         .square.summon.enemySide { background: radial-gradient(circle, #ff6644, #8a2a10); border-color: #ff9966; box-shadow: 0 0 10px rgba(255,102,68,0.55); }
+        .square.summon.promoted { border-color: #ffd700; box-shadow: 0 0 14px rgba(255,215,0,0.75), inset 0 0 8px rgba(255,215,0,0.5); font-size: 12px; }
         .square.aoePreview { box-shadow: inset 0 0 10px rgba(155,108,255,0.6); border-color: #9b6cff; }
         .square.knightPreview { box-shadow: inset 0 0 10px rgba(160,160,160,0.6); border-color: #a0a0a0; }
         .square.deployTile { background: linear-gradient(135deg, #2a1a4a, #1a0a3a); border-color: #9b6cff; box-shadow: inset 0 0 8px rgba(155,108,255,0.4); animation: pulsePurple 1.1s infinite; }
