@@ -745,6 +745,7 @@ const commandEnemySummons = (thisEnemy, allSummons, otherEnemies, player) => {
   let apLeft = thisEnemy.actionpts;
   let playerHP = player.health;
   const logs = [];
+  const promoted = [];
   const owned = allSummons.filter(s=>s.side==='enemy' && s.ownerId===thisEnemy.id && !s.promoted);
   for(const s of owned){
     if(apLeft<=0) break;
@@ -759,10 +760,13 @@ const commandEnemySummons = (thisEnemy, allSummons, otherEnemies, player) => {
       continue;
     }
     if(fwd.y>=SIZE){
-      // Stays on the board, marked as promoted — no more marching (that IS
-      // the last row), just a visible Agent instead of vanishing from play.
-      nextSummons = nextSummons.map(z=>z.id===cur.id?{...z,boardPosition:{x:cur.boardPosition.x,y:SIZE-1},promoted:true}:z);
-      logs.push(`* ${cur.name} reaches your line — promotes to Agent (autonomous staged)`);
+      // Reaching the line promotes it into a full independent enemy roster
+      // entry (see promoteSummonToEnemy) — removed from summons entirely,
+      // not just flagged, since it's no longer a summon at all.
+      nextSummons = nextSummons.filter(z=>z.id!==cur.id);
+      const newEnemy = promoteSummonToEnemy(cur, thisEnemy.level);
+      promoted.push(newEnemy);
+      logs.push(`* ${cur.name} reaches your line — promotes into ${newEnemy.name}!`);
       apLeft--;
       continue;
     }
@@ -773,7 +777,7 @@ const commandEnemySummons = (thisEnemy, allSummons, otherEnemies, player) => {
     logs.push(`${cur.name} (enemy) advances -> (${fwd.x},${fwd.y})`);
     apLeft--;
   }
-  return { nextSummons, apSpent: thisEnemy.actionpts-apLeft, playerHP, logs };
+  return { nextSummons, apSpent: thisEnemy.actionpts-apLeft, playerHP, logs, promoted };
 };
 
 // Decides whether `thisEnemy` uses its class skill this pass, and how.
@@ -800,6 +804,55 @@ const resolveEnemyClassSkill = (thisEnemy, currentPlayer, currentSummons) => {
     return null;
   }
   return null;
+};
+
+// Converts a promoted enemy-side summon into a full roster entry — from
+// here on it's just another enemy with its own roll and AI turn, rank-
+// sorted and player-attackable like any other, rather than a special case
+// that needs its own parallel machinery. Rank 4 (melee + class only, no
+// element) — a converted grunt, not a rebalanced boss.
+const promoteSummonToEnemy = (summon, level) => {
+  const agentClass = ENEMY_CLASS_POOL[Math.floor(Math.random()*ENEMY_CLASS_POOL.length)];
+  return {
+    ...makeCharacter(`${agentClass} Agent`, summon.maxHealth, level, 1, 0, summon.boardPosition, null, null),
+    id: `E${++ENEMY_SEQ}`,
+    rank: 4,
+    enemyClass: agentClass,
+    canMelee: true, canElement: false, canClass: true,
+    health: summon.health,
+  };
+};
+
+// One action-point's worth of an autonomous Agent's turn (a promoted
+// player-side summon acting independently, "similar logic to the
+// enemies") against `target` — an enemy character or, symmetrically, the
+// player. Pure — no state writes, no target-array indexing; the caller
+// resolves which target object this refers to. `blockers` excludes the
+// agent's own tile and the target's tile — movement collision only.
+const computeAgentStep = (agent, target, blockers) => {
+  const adjacent = isAdjacent(agent.boardPosition, target.boardPosition);
+  const canClass = agent.agentClass && !agent.classSkillUsed && agent.actionpts>=2 && Math.random()<0.7;
+  if(canClass){
+    if(agent.agentClass==='Rogue' && isKnightMove(agent.boardPosition, target.boardPosition)){
+      const acc=rollD100Accuracy();
+      const dmg=applyAccuracy(70,acc);
+      return { kind:'darkweb', dmg, cost:2, log:`${agent.name} Dark Web -> ${dmg} dmg (${acc}% ${accuracyTierLabel(acc)})`, color:'#a0a0a0' };
+    }
+    if(agent.agentClass==='Summoner' && isAdjacent8(agent.boardPosition, target.boardPosition)){
+      return { kind:'direct', dmg:60, cost:2, log:`${agent.name} Compass Slash -> 60 dmg`, color:'#9b6cff' };
+    }
+  }
+  if(adjacent){
+    return { kind:'melee', dmg:agent.atk, cost:1, log:`${agent.name} strikes ${target.name} -> ${agent.atk} dmg`, color:'#66dd88' };
+  }
+  const moves=getMoveToward(agent.boardPosition.x,agent.boardPosition.y,target.boardPosition.x,target.boardPosition.y);
+  for(const m of moves){
+    const blocked=blockers.some(b=>b.x===m.x&&b.y===m.y);
+    if(m.x>=0&&m.x<SIZE&&m.y>=0&&m.y<SIZE&&!blocked){
+      return { kind:'move', to:m, cost:1, log:`${agent.name} -> (${m.x},${m.y})` };
+    }
+  }
+  return { kind:'hold' };
 };
 
 // Available classes for the post-boss unlock modal. The list is structured
@@ -1945,7 +1998,13 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const isCampaign = !!campaign;
 
   const initPlayer = () => newHero();
-  const initEnemy  = (p) => newGoblin(1, p.boardPosition);
+  // Classes scene: a random Rank 1 Full Proxie (melee+element+class) instead
+  // of a plain goblin — "an even match" now that a promoted Agent can fight
+  // alongside the player, and the only scene where class play (and thus
+  // Agents) is actually reachable.
+  const initEnemy  = (p) => scene==='classes'
+    ? makeEnemyProxie(1, 1, rollBackRowPosition(0))
+    : newGoblin(1, p.boardPosition);
 
   const [player,         setPlayer]         = useState(()=>{ const p=initPlayer(); return p; });
   const [enemy,          setEnemy]          = useState(()=>{ const p=initPlayer(); return initEnemy(p); });
@@ -2184,8 +2243,13 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       // Summon holds its tile on an attack — it doesn't move into the enemy.
     } else if(tile.y===ENEMY_BACK_ROW){
       // Stays on the board, marked promoted — reads as an evolved Agent
-      // instead of vanishing from play. No further movement (staged).
-      setSummons(prev=>prev.map(z=>z.id===summonId?{...z,boardPosition:tile,promoted:true}:z));
+      // instead of vanishing from play, and becomes an autonomous unit:
+      // no more manual commanding, it rolls and acts for itself each round
+      // (see runAgentTurn/runAgentTurnMulti), fighting under one of the
+      // currently-implemented classes.
+      const agentClass = ENEMY_CLASS_POOL[Math.floor(Math.random()*ENEMY_CLASS_POOL.length)];
+      setSummons(prev=>prev.map(z=>z.id===summonId?{...z,boardPosition:tile,promoted:true,agentClass,
+        actionpts:0,energyRollover:0,frozen:0,classSkillUsed:false}:z));
       addLog(`★ ${s.name} reaches the back row → promotes to Agent (autonomous staged)`);
     } else {
       setSummons(prev=>prev.map(z=>z.id===summonId?{...z,boardPosition:tile}:z));
@@ -2199,6 +2263,85 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // in the closure body only, can't be listed here without a definition-order crash.
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[summons,player,enemy,addLog,summonActionAt,wave,triggerCastFx]);
+
+  // ── PROMOTED AGENTS (autonomous, player-side) ──
+  // A promoted summon's whole turn: rolls its own d12 (independent of the
+  // player's pool — that's the point of "bandwidth isn't connected to the
+  // pool anymore"), then spends it action-point by action-point exactly
+  // like an enemy AI turn, via computeAgentStep. Explicit currentEnemy
+  // threading mirrors runEnemyTurn — no reads from the `enemy` closure.
+  const runAgentTurn = useCallback((agent, currentEnemy, currentRound, onDone)=>{
+    const needsRoll = agent.actionpts===0;
+    if(needsRoll){
+      const eRoll=rollD12Energy();
+      const rollover=agent.energyRollover||0;
+      const newAP=Math.max(0,eRoll+rollover-(agent.frozen||0));
+      addLog(`// ${agent.name} rolls d12=${eRoll}${rollover>0?` +${rollover} rollover`:''} -> ${newAP} AP`);
+      const rolled={...agent,actionpts:newAP,frozen:0,energyRollover:0};
+      setSummons(prev=>prev.map(s=>s.id===rolled.id?rolled:s));
+      if(newAP<=0){ onDone(rolled, currentEnemy); return; }
+      setTimeout(()=>runAgentTurn(rolled, currentEnemy, currentRound, onDone), 500);
+      return;
+    }
+    setTimeout(()=>{
+      const blockers=[player.boardPosition, ...summons.filter(s=>s.id!==agent.id).map(s=>s.boardPosition)];
+      const step = computeAgentStep(agent, currentEnemy, blockers);
+      if(step.kind==='hold'){
+        const saved=agent.actionpts;
+        const updatedAgent={...agent,actionpts:0,energyRollover:(agent.energyRollover||0)+saved};
+        addLog(`${agent.name} holds position`);
+        setSummons(prev=>prev.map(s=>s.id===updatedAgent.id?updatedAgent:s));
+        onDone(updatedAgent, currentEnemy);
+        return;
+      }
+      if(step.kind==='move'){
+        const updatedAgent={...agent,boardPosition:step.to,actionpts:agent.actionpts-step.cost};
+        addLog(step.log);
+        setSummons(prev=>prev.map(s=>s.id===updatedAgent.id?updatedAgent:s));
+        setTimeout(()=>{
+          if(updatedAgent.actionpts>0) runAgentTurn(updatedAgent, currentEnemy, currentRound, onDone);
+          else onDone(updatedAgent, currentEnemy);
+        },500);
+        return;
+      }
+      // attack (melee/direct/darkweb)
+      const updatedAgent={...agent,actionpts:agent.actionpts-step.cost,classSkillUsed:step.kind==='melee'?agent.classSkillUsed:true};
+      addLog(step.log);
+      if(step.color) triggerCastFx(currentEnemy.boardPosition, step.color);
+      const newHP=Math.max(0,currentEnemy.health-step.dmg);
+      const updatedEnemy={...currentEnemy,health:newHP};
+      setSummons(prev=>prev.map(s=>s.id===updatedAgent.id?updatedAgent:s));
+      setEnemy(updatedEnemy);
+      if(newHP<=0){
+        addLog(`=== ${currentEnemy.name} defeated by ${agent.name}! ===`);
+        setTimeout(()=>handleEnemyDefeated(player, wave),400);
+        return;
+      }
+      setTimeout(()=>{
+        if(updatedAgent.actionpts>0) runAgentTurn(updatedAgent, updatedEnemy, currentRound, onDone);
+        else onDone(updatedAgent, updatedEnemy);
+      },500);
+    },600);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[addLog,player,wave,summons,triggerCastFx]);
+
+  // Sequences every promoted Agent's turn, one at a time, before handing
+  // off to the rest of the round (summon-command phase or the player's own
+  // act phase). `agentIds` is a snapshot taken once at roll time.
+  const runAgentsSequence = useCallback((agentIds, idx, currentEnemy, currentRound, onDone)=>{
+    if(idx>=agentIds.length){ onDone(currentEnemy); return; }
+    setSummons(curSummons=>{
+      const agent = curSummons.find(s=>s.id===agentIds[idx]);
+      if(!agent || agent.health<=0){
+        runAgentsSequence(agentIds, idx+1, currentEnemy, currentRound, onDone);
+      } else {
+        runAgentTurn(agent, currentEnemy, currentRound, (updatedAgent, updatedEnemy)=>{
+          runAgentsSequence(agentIds, idx+1, updatedEnemy, currentRound, onDone);
+        });
+      }
+      return curSummons;
+    });
+  },[runAgentTurn]);
 
   const checkEndOfRound = useCallback((latestPlayer,latestEnemy,currentRound)=>{
     if(latestPlayer.actionpts>0||latestEnemy.actionpts>0) return;
@@ -2254,6 +2397,13 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       const eMinCost=eElData?getSkillCost(currentEnemy.elementCategory,currentEnemy.element):1;
       const eRanged = eElData?.isEarth||eElData?.isAir||eElData?.isWater;
       const canUseSkill=(eRanged?true:adjacent)&&currentEnemy.element&&!currentEnemy.skillUsed&&currentEnemy.actionpts>=eMinCost&&Math.random()<0.6;
+      // Class skill (only meaningful for Training's Rank-1 enemy, which is
+      // the only single-enemy context with `enemyClass`/`canClass` set —
+      // Gauntlet goblins/wardens never have a class). Reuses the exact
+      // Campaign decision logic; Deploy is skipped here rather than adding
+      // enemy-side summon-commanding to the single-enemy engine — Direct
+      // (Compass Slash) and Dark Web both still work.
+      const canUseClassSkill = currentEnemy.canClass && currentEnemy.enemyClass && !currentEnemy.classSkillUsed && currentEnemy.actionpts>=2 && Math.random()<0.6;
 
       const lowHP = currentEnemy.health <= currentEnemy.maxHealth * 0.3;
       const healTile = findHealingTile(tiles);
@@ -2304,6 +2454,46 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           else finishEnemyToPlayer(updatedPlayer,updatedEnemy,currentRound);
         },600);
         return;
+      }
+
+      if(canUseClassSkill){
+        const decision = resolveEnemyClassSkill(currentEnemy, currentPlayer, summons);
+        if(decision?.kind==='direct'){
+          const dmg=60;
+          const newHP=Math.max(0,currentPlayer.health-dmg);
+          const facing=facingToward(currentEnemy.boardPosition,currentPlayer.boardPosition);
+          addLog(`${currentEnemy.name} Compass Slash -> ${dmg} dmg`);
+          triggerCastFx(currentPlayer.boardPosition,'#9b6cff');
+          updatedPlayer={...currentPlayer,health:newHP};
+          updatedEnemy={...currentEnemy,actionpts:currentEnemy.actionpts-2,classSkillUsed:true,facing};
+          setPlayer(updatedPlayer); setEnemy(updatedEnemy);
+          if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
+          setTimeout(()=>{
+            if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,currentRound);
+            else finishEnemyToPlayer(updatedPlayer,updatedEnemy,currentRound);
+          },600);
+          return;
+        }
+        if(decision?.kind==='darkweb'){
+          const acc=rollD100Accuracy();
+          const dmg=applyAccuracy(70,acc);
+          const facing=facingToward(currentEnemy.boardPosition,currentPlayer.boardPosition);
+          const newHP=Math.max(0,currentPlayer.health-dmg);
+          addLog(`${currentEnemy.name} Dark Web -> ${dmg} dmg (${acc}% ${accuracyTierLabel(acc)})`);
+          triggerCastFx(currentPlayer.boardPosition,'#a0a0a0');
+          updatedPlayer={...currentPlayer,health:newHP};
+          updatedEnemy={...currentEnemy,actionpts:currentEnemy.actionpts-2,classSkillUsed:true,facing,
+            boardPosition: newHP<=0 ? currentPlayer.boardPosition : currentEnemy.boardPosition};
+          setPlayer(updatedPlayer); setEnemy(updatedEnemy);
+          if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
+          setTimeout(()=>{
+            if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,currentRound);
+            else finishEnemyToPlayer(updatedPlayer,updatedEnemy,currentRound);
+          },600);
+          return;
+        }
+        // Deploy (or no valid decision) — not supported for the single-enemy
+        // engine; falls through to elemental/melee/approach below instead.
       }
 
       if(canUseSkill){
@@ -2512,14 +2702,24 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     addLog(`You roll d12=${roll}${rollover>0?` +${rollover} rollover`:''} = ${total} Energy${frozenPenalty>0?` (freeze -${frozenPenalty})`:''}  ->  ${newAP} AP`);
     const rolledPlayer = { ...player, actionpts:newAP, frozen:0, energyRollover:0 };
     setPlayer(rolledPlayer);
-    if(summons.some(s=>!s.promoted)){
-      setEnemy(curE=>{ beginSummonCommandPhase(rolledPlayer, curE, round); return curE; });
+    const proceed = ()=>{
+      if(summons.some(s=>!s.promoted)){
+        setEnemy(curE=>{ beginSummonCommandPhase(rolledPlayer, curE, round); return curE; });
+      } else {
+        setEnergyPhase('act');
+        addLog('=== Spend your Energy ===');
+      }
+    };
+    // Promoted Agents act first, automatically — the same "pawns clear the
+    // way" ordering, extended to the pieces that have already evolved.
+    const agentIds = summons.filter(s=>s.promoted&&s.health>0).map(s=>s.id);
+    if(agentIds.length>0){
+      setEnemy(curE=>{ runAgentsSequence(agentIds, 0, curE, round, proceed); return curE; });
     } else {
-      setEnergyPhase('act');
-      addLog('=== Spend your Energy ===');
+      proceed();
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[player,summons,round,addLog,beginSummonCommandPhase]);
+  },[player,summons,round,addLog,beginSummonCommandPhase,runAgentsSequence]);
 
   // ── ENEMY DEFEAT / REWARDS / WAVES ──
   const handleEnemyDefeated = useCallback((curPlayer, curWave)=>{
@@ -3059,7 +3259,10 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           if(res.playerHP!==updatedPlayer.health){ updatedPlayer = {...updatedPlayer, health:res.playerHP}; triggerCastFx(updatedPlayer.boardPosition,'#ff6644'); }
           setSummons(updatedSummons);
           if(updatedPlayer!==currentPlayer) setPlayer(updatedPlayer);
-          setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
+          // Any promoted-this-step summons join the roster now — too late to
+          // act themselves this round (the sequence already started), but
+          // present and player-attackable starting next round.
+          setEnemies([...allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e), ...res.promoted]);
           if(updatedPlayer.health<=0){ addLog('=== DEFEAT ==='); return; }
         }
       }
@@ -3394,13 +3597,27 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     addLog(`You roll d12=${roll}${rollover>0?` +${rollover} rollover`:''} = ${total} Energy${frozenPenalty>0?` (freeze -${frozenPenalty})`:''}  ->  ${newAP} AP`);
     const rolledPlayer={...player,actionpts:newAP,frozen:0,energyRollover:0};
     setPlayer(rolledPlayer);
-    if(summons.some(s=>s.side==='player'&&!s.promoted)){
-      beginSummonCommandPhase(rolledPlayer, null, round);
+    const proceed = ()=>{
+      if(summons.some(s=>s.side==='player'&&!s.promoted)){
+        beginSummonCommandPhase(rolledPlayer, null, round);
+      } else {
+        setEnergyPhase('act');
+        addLog('=== Spend your Energy ===');
+      }
+    };
+    // Promoted Agents act first, automatically — same "pawns clear the way"
+    // ordering, extended to the pieces that have already evolved.
+    const agentIds = summons.filter(s=>s.side==='player'&&s.promoted&&s.health>0).map(s=>s.id);
+    if(agentIds.length>0){
+      runAgentsSequenceMulti(agentIds, 0, enemies, round, proceed);
     } else {
-      setEnergyPhase('act');
-      addLog('=== Spend your Energy ===');
+      proceed();
     }
-  },[player,summons,round,addLog,beginSummonCommandPhase]);
+  // runAgentsSequenceMulti is defined later in the file (const, TDZ) —
+  // referenced only inside this handler's own body, invoked well after
+  // render completes, so the forward reference is safe; can't list it here.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[player,summons,enemies,round,addLog,beginSummonCommandPhase]);
 
   const handleEndTurnMulti = useCallback(()=>{
     const saved=player.actionpts;
@@ -3634,6 +3851,89 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     return 'move';
   },[player,summonForwardTile]);
 
+  // ── PROMOTED AGENTS (autonomous, player-side, multi-enemy) ──
+  // Same shape as the single-enemy runAgentTurn, but picks its own target
+  // from the live roster (nearest by tile distance) each step instead of
+  // having exactly one enemy to aim at.
+  const runAgentTurnMulti = useCallback((agent, currentEnemies, currentRound, onDone)=>{
+    const needsRoll = agent.actionpts===0;
+    if(needsRoll){
+      const eRoll=rollD12Energy();
+      const rollover=agent.energyRollover||0;
+      const newAP=Math.max(0,eRoll+rollover-(agent.frozen||0));
+      addLog(`// ${agent.name} rolls d12=${eRoll}${rollover>0?` +${rollover} rollover`:''} -> ${newAP} AP`);
+      const rolled={...agent,actionpts:newAP,frozen:0,energyRollover:0};
+      setSummons(prev=>prev.map(s=>s.id===rolled.id?rolled:s));
+      if(newAP<=0){ onDone(rolled, currentEnemies); return; }
+      setTimeout(()=>runAgentTurnMulti(rolled, currentEnemies, currentRound, onDone), 500);
+      return;
+    }
+    const living = currentEnemies.filter(e=>e.health>0);
+    if(living.length===0){ onDone(agent, currentEnemies); return; }
+    setTimeout(()=>{
+      const target = living.reduce((best,e)=>manhattan(agent.boardPosition,e.boardPosition)<manhattan(agent.boardPosition,best.boardPosition)?e:best, living[0]);
+      const blockers=[player.boardPosition, ...summons.filter(s=>s.id!==agent.id).map(s=>s.boardPosition),
+        ...currentEnemies.filter(e=>e.id!==target.id).map(e=>e.boardPosition)];
+      const step = computeAgentStep(agent, target, blockers);
+      if(step.kind==='hold'){
+        const saved=agent.actionpts;
+        const updatedAgent={...agent,actionpts:0,energyRollover:(agent.energyRollover||0)+saved};
+        addLog(`${agent.name} holds position`);
+        setSummons(prev=>prev.map(s=>s.id===updatedAgent.id?updatedAgent:s));
+        onDone(updatedAgent, currentEnemies);
+        return;
+      }
+      if(step.kind==='move'){
+        const updatedAgent={...agent,boardPosition:step.to,actionpts:agent.actionpts-step.cost};
+        addLog(step.log);
+        setSummons(prev=>prev.map(s=>s.id===updatedAgent.id?updatedAgent:s));
+        setTimeout(()=>{
+          if(updatedAgent.actionpts>0) runAgentTurnMulti(updatedAgent, currentEnemies, currentRound, onDone);
+          else onDone(updatedAgent, currentEnemies);
+        },500);
+        return;
+      }
+      const updatedAgent={...agent,actionpts:agent.actionpts-step.cost,classSkillUsed:step.kind==='melee'?agent.classSkillUsed:true};
+      addLog(step.log);
+      if(step.color) triggerCastFx(target.boardPosition, step.color);
+      const newHP=Math.max(0,target.health-step.dmg);
+      setSummons(prev=>prev.map(s=>s.id===updatedAgent.id?updatedAgent:s));
+      if(newHP<=0){
+        const remaining=currentEnemies.filter(e=>e.id!==target.id);
+        setEnemies(remaining);
+        addLog(`=== ${target.name} defeated by ${agent.name}! ===`);
+        setTimeout(()=>handleEnemyDefeatedMulti(target.id, player, currentEnemies),400);
+        setTimeout(()=>{
+          if(updatedAgent.actionpts>0) runAgentTurnMulti(updatedAgent, remaining, currentRound, onDone);
+          else onDone(updatedAgent, remaining);
+        },500);
+        return;
+      }
+      const updatedEnemies=currentEnemies.map(e=>e.id===target.id?{...e,health:newHP}:e);
+      setEnemies(updatedEnemies);
+      setTimeout(()=>{
+        if(updatedAgent.actionpts>0) runAgentTurnMulti(updatedAgent, updatedEnemies, currentRound, onDone);
+        else onDone(updatedAgent, updatedEnemies);
+      },500);
+    },600);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[addLog,player,summons,triggerCastFx]);
+
+  const runAgentsSequenceMulti = useCallback((agentIds, idx, currentEnemies, currentRound, onDone)=>{
+    if(idx>=agentIds.length){ onDone(currentEnemies); return; }
+    setSummons(curSummons=>{
+      const agent = curSummons.find(s=>s.id===agentIds[idx]);
+      if(!agent || agent.health<=0){
+        runAgentsSequenceMulti(agentIds, idx+1, currentEnemies, currentRound, onDone);
+      } else {
+        runAgentTurnMulti(agent, currentEnemies, currentRound, (updatedAgent, updatedEnemies)=>{
+          runAgentsSequenceMulti(agentIds, idx+1, updatedEnemies, currentRound, onDone);
+        });
+      }
+      return curSummons;
+    });
+  },[runAgentTurnMulti]);
+
   const resolveSummonActionMulti = useCallback((summonId, tile)=>{
     const s=summons.find(z=>z.id===summonId);
     if(!s) return;
@@ -3657,8 +3957,13 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       }
     } else if(tile.y===ENEMY_BACK_ROW){
       // Stays on the board, marked promoted — reads as an evolved Agent
-      // instead of vanishing from play. No further movement (staged).
-      setSummons(prev=>prev.map(z=>z.id===summonId?{...z,boardPosition:tile,promoted:true}:z));
+      // instead of vanishing from play, and becomes an autonomous unit:
+      // no more manual commanding, it rolls and acts for itself each round
+      // (see runAgentTurn/runAgentTurnMulti), fighting under one of the
+      // currently-implemented classes.
+      const agentClass = ENEMY_CLASS_POOL[Math.floor(Math.random()*ENEMY_CLASS_POOL.length)];
+      setSummons(prev=>prev.map(z=>z.id===summonId?{...z,boardPosition:tile,promoted:true,agentClass,
+        actionpts:0,energyRollover:0,frozen:0,classSkillUsed:false}:z));
       addLog(`★ ${s.name} reaches the back row → promotes to Agent (autonomous staged)`);
     } else {
       setSummons(prev=>prev.map(z=>z.id===summonId?{...z,boardPosition:tile}:z));
