@@ -676,7 +676,10 @@ const computeElementalStrike = (attacker, target, tiles) => {
     const maxLine=getForwardTiles(attacker.boardPosition,castFacing,SIZE);
     const targetStep=maxLine.findIndex(t=>t.x===target.boardPosition.x&&t.y===target.boardPosition.y);
     const targetDist=targetStep>=0?targetStep+1:-1;
-    const canReach=targetDist>0&&targetDist<dieRoll;
+    // Distance can equal the roll (a roll of 1 at range 1 is a legal shot —
+    // it just won't clear the bonus-damage threshold, so it floors to
+    // RANGED_SKILL_MIN_DMG instead of missing outright).
+    const canReach=targetDist>0&&targetDist<=dieRoll;
     const chosenRange=canReach?targetDist:Math.max(1,dieRoll-1);
     const base=Math.max(0,(dieRoll-chosenRange)*SKILL_DICE_MULT);
     const line=getForwardTiles(attacker.boardPosition,castFacing,chosenRange);
@@ -895,6 +898,68 @@ const ClassUnlockModal = ({show, onSelect, onClose, freeSelect}) => {
   );
 };
 
+// Campaign's opening character-creation step — name the Proxie, pick a
+// class, pick an element, before Battle 1 spawns. Unlike Gauntlet (class
+// unlocks after a boss kill) and Training's Classes scene (free swapping),
+// Campaign locks these choices in up front, like loading into a real run.
+const CampaignIntroModal = ({show, onSubmit}) => {
+  const [name, setName] = useState('');
+  const [cls, setCls] = useState(null);
+  const [element, setElement] = useState(null);
+  if(!show) return null;
+  const canSubmit = name.trim().length>0 && cls && element;
+  const elMeta = element ? ELEMENTS.base[element] : null;
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.9)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:5000,padding:'2rem'}}>
+      <div style={{background:'#080e14',border:'2px solid #cc4422',borderRadius:12,padding:'1.6rem',maxWidth:520,width:'100%',maxHeight:'90vh',overflowY:'auto',color:'#b0dff4',boxShadow:'0 0 50px rgba(204,68,34,0.4)'}}>
+        <div style={{textAlign:'center',marginBottom:18}}>
+          <div style={{fontSize:'11px',letterSpacing:'0.2em',textTransform:'uppercase',color:'#cc4422'}}>// Campaign — New Proxie</div>
+          <h2 style={{fontSize:'1.3rem',letterSpacing:'0.1em',textTransform:'uppercase',color:'#ff8866',marginTop:6}}>Load Into the Grid</h2>
+          <div style={{fontSize:'11px',color:'#5a7a8a',marginTop:4}}>Name your Proxie, choose its class and element. These lock in for the run.</div>
+        </div>
+
+        <div style={{marginBottom:16}}>
+          <div style={{fontSize:'10px',color:'#3a5a6a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:6}}>Proxie Name</div>
+          <input value={name} onChange={e=>setName(e.target.value)} maxLength={24} placeholder="e.g. Specter.EXE"
+            style={{width:'100%',padding:'9px 12px',background:'#0a1218',border:'1px solid #1e3a4a',borderRadius:6,color:'#b0dff4',fontSize:14,fontFamily:"'Rajdhani',sans-serif"}} />
+        </div>
+
+        <div style={{marginBottom:16}}>
+          <div style={{fontSize:'10px',color:'#3a5a6a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:6}}>Class</div>
+          {UNLOCKABLE_CLASSES.map(c=>(
+            <div key={c.id} onClick={()=>setCls(c.id)}
+              style={{background:'#0a1218',border:`1px solid ${cls===c.id?c.color:c.color+'44'}`,borderRadius:8,padding:'10px 12px',marginBottom:8,cursor:'pointer',boxShadow:cls===c.id?`0 0 12px ${c.color}55`:'none'}}>
+              <div style={{display:'flex',alignItems:'center',gap:8}}>
+                <span style={{fontSize:18}}>{c.icon}</span>
+                <span style={{fontSize:13,fontWeight:'bold',color:c.color}}>{c.name}</span>
+                <span style={{fontSize:10,color:'#7a9db5',marginLeft:'auto'}}>{c.tagline}</span>
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div style={{marginBottom:20}}>
+          <div style={{fontSize:'10px',color:'#3a5a6a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:6}}>Element</div>
+          <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+            {Object.entries(ELEMENTS.base).map(([name2,d])=>(
+              <button key={name2} onClick={()=>setElement(name2)}
+                style={{flex:'1 0 40%',display:'flex',alignItems:'center',gap:6,padding:'8px 10px',background:element===name2?`${d.color}22`:'#0a1218',border:`1px solid ${element===name2?d.color:d.color+'44'}`,borderRadius:6,color:element===name2?d.color:'#b0dff4',cursor:'pointer'}}>
+                <span style={{fontSize:16}}>{d.icon}</span><span style={{fontWeight:'bold',fontSize:12}}>{name2}</span>
+              </button>
+            ))}
+          </div>
+          {elMeta&&<div style={{fontSize:10,color:'#7a9db5',marginTop:8,lineHeight:1.5}}>{elMeta.description}</div>}
+        </div>
+
+        <button onClick={()=>canSubmit&&onSubmit(name.trim(),cls,element)} disabled={!canSubmit}
+          style={{width:'100%',padding:13,background:canSubmit?'rgba(204,68,34,0.18)':'rgba(20,30,40,0.6)',border:`1px solid ${canSubmit?'#cc4422':'#1e3a4a'}`,borderRadius:6,color:canSubmit?'#ff8866':'#2a4a5e',fontSize:14,fontWeight:'bold',cursor:canSubmit?'pointer':'not-allowed',letterSpacing:'0.08em'}}>
+          {canSubmit ? 'Deploy to Battle 1' : 'Name your Proxie, pick a class and element'}
+        </button>
+      </div>
+    </div>
+  );
+};
+
 // Mastermind mode picker — appears when the Summoner activates Mastermind.
 // Forks into Direct (Compass Slash) or Deploy (Circuit Sigil).
 const MastermindModeModal = ({show, canDeploy, deployReason, onPickDirect, onPickDeploy, onClose}) => {
@@ -1026,7 +1091,7 @@ const ElementPickerModal = ({selectedCategory,selectedElement,onSelect,onClose,r
   );
 };
 
-const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedElement,onElementSelect,canAttack,canSkill,onMelee,onSkill,onEndTurn,onRollEnergy,energyPhase,onSurrender,enemy,enemyRolledEnergy,enemies,enemyRolledEnergyById,selectedEnemyId,onSelectEnemy,isPlayerTurn,playerClass,summons,canMastermind,onMastermind,canRotate,onRotate,canDarkWeb,onDarkWeb,hideElementalSkill,restrictElementsToBase}) => {
+const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedElement,onElementSelect,canAttack,canSkill,onMelee,onSkill,onEndTurn,onRollEnergy,energyPhase,onSurrender,enemy,enemyRolledEnergy,enemies,enemyRolledEnergyById,selectedEnemyId,onSelectEnemy,isPlayerTurn,playerClass,summons,canMastermind,onMastermind,canRotate,onRotate,canDarkWeb,onDarkWeb,hideElementalSkill,restrictElementsToBase,lockElementPicker}) => {
   const [showPicker,setShowPicker]=useState(false);
   const allEl={...ELEMENTS.base,...ELEMENTS.minor,...ELEMENTS.major};
   const elData=allEl[selectedElement];
@@ -1049,13 +1114,13 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
             <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',borderBottom:'1px solid #1e3a4a',paddingBottom:'6px',marginBottom:'10px',gap:6}}>
               <div style={{fontSize:'0.75rem',letterSpacing:'0.15em',textTransform:'uppercase',color:'#00c8ff',display:'flex',alignItems:'center',gap:'5px',whiteSpace:'nowrap'}}><span>o</span>Proxy</div>
               {!hideElementalSkill&&(
-                <button onClick={()=>setShowPicker(true)}
-                  style={{display:'flex',alignItems:'center',gap:'4px',background:`${elData&&elData.color||'#00c8ff'}11`,border:`1px solid ${elData&&elData.color||'#00c8ff'}55`,borderRadius:'4px',padding:'2px 7px',cursor:'pointer',transition:'all 0.15s',minWidth:0}}
-                  onMouseEnter={e=>e.currentTarget.style.borderColor=elData&&elData.color||'#00c8ff'}
-                  onMouseLeave={e=>e.currentTarget.style.borderColor=`${elData&&elData.color||'#00c8ff'}55`}>
+                <button onClick={lockElementPicker?undefined:()=>setShowPicker(true)}
+                  style={{display:'flex',alignItems:'center',gap:'4px',background:`${elData&&elData.color||'#00c8ff'}11`,border:`1px solid ${elData&&elData.color||'#00c8ff'}55`,borderRadius:'4px',padding:'2px 7px',cursor:lockElementPicker?'default':'pointer',transition:'all 0.15s',minWidth:0}}
+                  onMouseEnter={lockElementPicker?undefined:e=>e.currentTarget.style.borderColor=elData&&elData.color||'#00c8ff'}
+                  onMouseLeave={lockElementPicker?undefined:e=>e.currentTarget.style.borderColor=`${elData&&elData.color||'#00c8ff'}55`}>
                   <span style={{fontSize:'12px'}}>{elData&&elData.icon}</span>
                   <span style={{fontSize:'11px',fontWeight:'bold',color:elData&&elData.color||'#b0dff4',overflow:'hidden',textOverflow:'ellipsis',whiteSpace:'nowrap'}}>{selectedElement}</span>
-                  <span style={{fontSize:'9px',color:'#3a6a8a'}}>v</span>
+                  {!lockElementPicker&&<span style={{fontSize:'9px',color:'#3a6a8a'}}>v</span>}
                 </button>
               )}
             </div>
@@ -1223,7 +1288,7 @@ const tileClassName = (t) => {
   }
 };
 
-const Grid = ({playerPos,enemyPos,enemies,selectedEnemyId,validSquares,onSquareClick,playerSelected,tiles,playerFacing,enemyFacing,aoeTiles,knightTiles,summons,deployTiles}) => {
+const Grid = ({playerPos,enemyPos,enemies,selectedEnemyId,validSquares,onSquareClick,playerSelected,tiles,playerFacing,enemyFacing,aoeTiles,knightTiles,summons,deployTiles,castFx}) => {
   const cells=[];
   for(let y=0;y<SIZE;y++) for(let x=0;x<SIZE;x++){
     const isP=playerPos.x===x&&playerPos.y===y;
@@ -1249,11 +1314,13 @@ const Grid = ({playerPos,enemyPos,enemies,selectedEnemyId,validSquares,onSquareC
     if(isAoe) cls+=' aoePreview';
     if(isKnight) cls+=' knightPreview';
     if(isDeploy) cls+=' deployTile';
+    const fxHere = castFx && castFx.x===x && castFx.y===y;
     cells.push(
       <div key={`${x}-${y}`} className={cls} onClick={()=>onSquareClick(x,y)}
         onMouseEnter={e=>e.currentTarget.classList.add('hovered')}
         onMouseLeave={e=>e.currentTarget.classList.remove('hovered')}>
         {label}
+        {fxHere&&<div key={castFx.key} className="castFxRing" style={{'--fx-color':castFx.color}} />}
       </div>
     );
   }
@@ -1473,7 +1540,7 @@ const AirGaleForceSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRol
           </div>
           {airRange&&(
             <div style={{textAlign:'center',fontSize:'11px',color:'#5a7a8a',marginBottom:12}}>
-              Range <span style={{color:elColor,fontWeight:'bold'}}>{airRange}</span> selected — need d8 &gt; {airRange} to deal damage
+              Range <span style={{color:elColor,fontWeight:'bold'}}>{airRange}</span> selected — any hit deals at least {RANGED_SKILL_MIN_DMG} dmg; d8 &gt; {airRange} adds a bonus on top
               {onLine && airRange!==enemyDistance && <span style={{color:'#ff6644'}}> · won't reach enemy at {enemyDistance}</span>}
             </div>
           )}
@@ -1856,6 +1923,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const [campaignBattle,   setCampaignBattle]   = useState(1);
   const [campaignComplete, setCampaignComplete] = useState(false);
   const [showBattleComplete, setShowBattleComplete] = useState(false);
+  // Shown once, before Battle 1 — Campaign locks name/class/element up front
+  // instead of Gauntlet's post-boss unlock or Training's free swapping.
+  const [showCampaignIntro, setShowCampaignIntro] = useState(isCampaign);
   const [selectedEnemyId,  setSelectedEnemyId]  = useState(null);
   const [enemyRolledEnergyById, setEnemyRolledEnergyById] = useState({});
   const [tiles,          setTiles]          = useState(()=>{
@@ -1938,6 +2008,18 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
 
   const addLog = useCallback((msg)=>setLogs(prev=>[...prev,msg]),[]);
 
+  // Color-coded skill-cast flash: a brief ring on whichever tile a skill
+  // lands on, tinted to the element/class color that cast it. Purely
+  // cosmetic (setCastFx clears itself), so it's safe to fire from anywhere,
+  // player or enemy side, either engine.
+  const [castFx, setCastFx] = useState(null);
+  const triggerCastFx = useCallback((tile,color)=>{
+    if(!tile) return;
+    const key = `${Date.now()}-${Math.random()}`;
+    setCastFx({x:tile.x,y:tile.y,color,key});
+    setTimeout(()=>setCastFx(fx=>fx&&fx.key===key?null:fx),700);
+  },[]);
+
   const skillCost = getSkillCost(selCategory, selElement);
   const elData = ELEMENTS[selCategory]?.[selElement];
   const canAttack = isPlayerTurn && energyPhase==='act' && player.actionpts>0 && isAdjacent(player.boardPosition,enemy.boardPosition);
@@ -1946,7 +2028,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     (elData?.isEarth||elData?.isAir||elData?.isWater ? true : isAdjacent(player.boardPosition,enemy.boardPosition));
   // Campaign Mode equivalents — same gates, checked against any living enemy
   // in the roster instead of the single `enemy`.
-  const canAttackMulti = isPlayerTurn && energyPhase==='act' && player.actionpts>0 && enemies.some(e=>isAdjacent(player.boardPosition,e.boardPosition));
+  const canAttackMulti = isPlayerTurn && energyPhase==='act' && player.actionpts>0 &&
+    (enemies.some(e=>isAdjacent(player.boardPosition,e.boardPosition)) || summons.some(s=>s.side==='enemy'&&isAdjacent(player.boardPosition,s.boardPosition)));
   const canSkillMulti  = sceneAllowSkill && isPlayerTurn && energyPhase==='act' && !player.skillUsed && player.actionpts >= skillCost &&
     (elData?.isEarth||elData?.isAir||elData?.isWater ? true : enemies.some(e=>isAdjacent(player.boardPosition,e.boardPosition)));
   // Mastermind: available to a Summoner during the act phase, once per turn,
@@ -2051,6 +2134,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       const dmg=s.atk;
       const newHP=Math.max(0,enemy.health-dmg);
       addLog(`${s.name} strikes ${enemy.name} → ${dmg} dmg (${newHP}/${enemy.maxHealth})`);
+      triggerCastFx(enemy.boardPosition,'#66dd88');
       setEnemy({...enemy,health:newHP});
       if(newHP<=0){
         addLog('=== Enemy defeated by summons! ===');
@@ -2071,7 +2155,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // handleEnemyDefeated is defined later in the file (const, TDZ) — referenced
   // in the closure body only, can't be listed here without a definition-order crash.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[summons,player,enemy,addLog,summonActionAt,wave]);
+  },[summons,player,enemy,addLog,summonActionAt,wave,triggerCastFx]);
 
   const checkEndOfRound = useCallback((latestPlayer,latestEnemy,currentRound)=>{
     if(latestPlayer.actionpts>0||latestEnemy.actionpts>0) return;
@@ -2102,7 +2186,13 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       const newAP = Math.max(0, total - frozenPenalty);
       setEnemyRolledEnergy(total);
       addLog(`// Enemy rolls d12=${eRoll}${rollover>0?` +${rollover} rollover`:''} = ${total} Energy${frozenPenalty>0?` (freeze -${frozenPenalty})`:''}  ->  ${newAP} AP`);
-      const rolledEnemy = { ...currentEnemy, actionpts:newAP, frozen:0, energyRollover:0 };
+      // Flee-or-not is decided once per turn, here, and carried on the enemy
+      // object for the rest of the turn (see `fleeCommit` below) — rolling it
+      // fresh on every action-point step let the unit flip-flop step to step
+      // (flee one tile, fight the next), which read as running around at
+      // random instead of committing to a retreat.
+      const fleeCommit = currentEnemy.element ? Math.random()<0.6 : true;
+      const rolledEnemy = { ...currentEnemy, actionpts:newAP, frozen:0, energyRollover:0, fleeCommit };
       setEnemy(rolledEnemy);
       if(newAP <= 0){
         addLog(`// Enemy has 0 Energy - passing`);
@@ -2125,7 +2215,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       const lowHP = currentEnemy.health <= currentEnemy.maxHealth * 0.3;
       const healTile = findHealingTile(tiles);
       const onHealTile = healTile && currentEnemy.boardPosition.x===healTile.x && currentEnemy.boardPosition.y===healTile.y;
-      const willFlee = lowHP && healTile && (currentEnemy.element ? Math.random()<0.6 : true);
+      const willFlee = lowHP && healTile && currentEnemy.fleeCommit;
 
       if(willFlee && !onHealTile){
         const moves=getMoveToward(currentEnemy.boardPosition.x,currentEnemy.boardPosition.y,healTile.x,healTile.y);
@@ -2209,7 +2299,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           const maxLine=getForwardTiles(currentEnemy.boardPosition,castFacing,SIZE);
           const playerStep=maxLine.findIndex(t=>t.x===currentPlayer.boardPosition.x&&t.y===currentPlayer.boardPosition.y);
           const playerDist=playerStep>=0?playerStep+1:-1;
-          const canReach = playerDist>0 && playerDist<dieRoll;
+          // Distance can equal the roll — a roll of 1 at range 1 is a legal
+          // shot that floors to RANGED_SKILL_MIN_DMG rather than missing.
+          const canReach = playerDist>0 && playerDist<=dieRoll;
           const chosenRange = canReach ? playerDist : Math.max(1,dieRoll-1);
           const base=Math.max(0,(dieRoll-chosenRange)*SKILL_DICE_MULT);
           const line=getForwardTiles(currentEnemy.boardPosition,castFacing,chosenRange);
@@ -2260,6 +2352,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           updatedPlayer={...updatedPlayer,health:newHP};
           updatedEnemy={...currentEnemy,actionpts:Math.max(0,currentEnemy.actionpts-eCost),skillUsed:true,facing:castFacing};
           setPlayer(updatedPlayer); setEnemy(updatedEnemy);
+          triggerCastFx(currentPlayer.boardPosition, ELEMENTS.base[currentEnemy.element]?.color||'#ff4422');
           if(newHP<=0){addLog('=== DEFEAT ===');return;}
         } else if(heal>0){
           updatedEnemy={...currentEnemy,health:Math.min(currentEnemy.maxHealth,currentEnemy.health+heal),actionpts:Math.max(0,currentEnemy.actionpts-eCost),skillUsed:true,facing:castFacing};
@@ -2274,11 +2367,32 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         const dmg=tier.meleeBase+flank.bonus;
         const newHP=Math.max(0,currentPlayer.health-dmg);
         addLog(`${currentEnemy.name} melee ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tier.heavy?' [heavy]':''}`);
+        triggerCastFx(currentPlayer.boardPosition,'#ff4422');
         updatedPlayer={...currentPlayer,health:newHP};
         const eMeleeFacing=facingToward(currentEnemy.boardPosition,currentPlayer.boardPosition);
         updatedEnemy={...currentEnemy,actionpts:currentEnemy.actionpts-1,facing:eMeleeFacing};
         setPlayer(updatedPlayer); setEnemy(updatedEnemy);
         if(newHP<=0){addLog('=== DEFEAT ===');return;}
+      } else if(summons.find(s=>isAdjacent(currentEnemy.boardPosition,s.boardPosition))){
+        // A summon blocking the enemy's path is now a real target, not just
+        // an inert obstacle — the enemy strikes it down instead of standing
+        // there forever, so parking a summon in front of an enemy is a
+        // genuine (but destructible) defensive play rather than a permafreeze.
+        const targetSummon=summons.find(s=>isAdjacent(currentEnemy.boardPosition,s.boardPosition));
+        const tier=enemyTier(currentEnemy.level);
+        const dmg=tier.meleeBase;
+        const newHP=Math.max(0,targetSummon.health-dmg);
+        const eMeleeFacing=facingToward(currentEnemy.boardPosition,targetSummon.boardPosition);
+        addLog(`${currentEnemy.name} strikes ${targetSummon.name} -> ${dmg} dmg (${newHP}/${targetSummon.maxHealth})`);
+        triggerCastFx(targetSummon.boardPosition,'#ff4422');
+        updatedEnemy={...currentEnemy,actionpts:currentEnemy.actionpts-1,facing:eMeleeFacing};
+        if(newHP<=0){
+          setSummons(prev=>prev.filter(s=>s.id!==targetSummon.id));
+          addLog(`${targetSummon.name} destroyed!`);
+        } else {
+          setSummons(prev=>prev.map(s=>s.id===targetSummon.id?{...s,health:newHP}:s));
+        }
+        setEnemy(updatedEnemy);
       } else {
         const tier=enemyTier(currentEnemy.level);
         const summonBlockers=summons.map(s=>s.boardPosition);
@@ -2314,7 +2428,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       },600);
     },900);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[addLog,tiles,summons,wave]);
+  },[addLog,tiles,summons,wave,triggerCastFx]);
   // ── ROUND ORCHESTRATION ──
   const beginRound = useCallback((rP, rE, currentRound)=>{
     summonPhaseRanRef.current = false; // reset; set true only if command phase runs
@@ -2451,6 +2565,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const newHP=Math.max(0,enemy.health-dmg);
     const meleeFacing=facingToward(player.boardPosition,enemy.boardPosition);
     addLog(`You melee ${dmg} dmg${flank.label?' ['+flank.label+']':''}`);
+    triggerCastFx(enemy.boardPosition,'#ffd700');
     const updatedPlayer={...player,actionpts:player.actionpts-1,facing:meleeFacing};
     const updatedEnemy={...enemy,health:newHP};
     if(newHP<=0){
@@ -2460,7 +2575,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[canAttack,player,enemy,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction]);
+  },[canAttack,player,enemy,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx]);
 
   // ── END TURN / SURRENDER ──
   const handleEndTurn = useCallback(()=>{
@@ -2564,6 +2679,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       updatedEnemy.health=Math.max(0,enemy.health-dmg);
       addLog(`${selElement} ${ability.name} -> ${dmg} dmg${flank.label?' ['+flank.label+']':''} (${acc}% (${accuracyTierLabel(acc)}))`);
     }
+    triggerCastFx(enemy.boardPosition, ELEMENTS.base[selElement]?.color||'#00c8ff');
     resetDiceModal();
     if(updatedEnemy.health<=0){
       setPlayer(updatedPlayer); setEnemy(updatedEnemy);
@@ -2572,7 +2688,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[dicePhase,accuracyRoll,selCategory,selElement,player,enemy,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction]);
+  },[dicePhase,accuracyRoll,selCategory,selElement,player,enemy,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction,triggerCastFx]);
 
   // Fire handlers
   const handleFireProceedToAccuracy = useCallback(()=>{ setDicePhase('accuracy'); setAccuracyRoll(null); },[]);
@@ -2587,11 +2703,12 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-3),skillUsed:true};
     const updatedEnemy={...enemy,health:Math.max(0,enemy.health-dmg)};
     addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tileBoost>0?' [Fire tile +20]':''}`);
+    triggerCastFx(enemy.boardPosition, ELEMENTS.base.Fire.color);
     resetDiceModal();
     if(updatedEnemy.health<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[diceRolls,player,enemy,tiles,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction]);
+  },[diceRolls,player,enemy,tiles,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction,triggerCastFx]);
 
   // Earth handlers
   const handleSetEarthRange = useCallback((r)=>setEarthRange(r),[]);
@@ -2608,11 +2725,12 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
     const updatedEnemy={...enemy,health:Math.max(0,enemy.health-dmg)};
     addLog(`Tremor [d6=${dieRoll}, ${earthRange} tile${earthRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg'+(tileBoost>0?' [Earth tile +20]':''):'MISS (enemy not in line)'}`);
+    if(hit) triggerCastFx(enemy.boardPosition, ELEMENTS.base.Earth.color);
     resetDiceModal();
     if(updatedEnemy.health<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[diceRolls,player,enemy,tiles,earthRange,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction]);
+  },[diceRolls,player,enemy,tiles,earthRange,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction,triggerCastFx]);
 
   // Air handlers
   const handleSetAirRange = useCallback((r)=>setAirRange(r),[]);
@@ -2636,11 +2754,12 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     } else {
       addLog(`Gale Force [d8=${dieRoll}, range ${airRange}] -> MISS`);
     }
+    if(hit) triggerCastFx(enemy.boardPosition, ELEMENTS.base.Air.color);
     resetDiceModal();
     if(updatedEnemy.health<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[diceRolls,player,enemy,tiles,airRange,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction]);
+  },[diceRolls,player,enemy,tiles,airRange,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction,triggerCastFx]);
 
   // Water handlers
   const handleSetWaterAoe = useCallback((aoe)=>setWaterAoe(aoe),[]);
@@ -2657,11 +2776,12 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
     const updatedEnemy={...enemy,health:Math.max(0,enemy.health-dmg)};
     addLog(`Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[waterAoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS (enemy outside blast)'}`);
+    if(hit) triggerCastFx(enemy.boardPosition, ELEMENTS.base.Water.color);
     resetDiceModal();
     if(updatedEnemy.health<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[diceRolls,player,enemy,tiles,waterAoe,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction]);
+  },[diceRolls,player,enemy,tiles,waterAoe,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction,triggerCastFx]);
 
   // ── ROTATE (0 cost, once per turn) ──
   const handleRotateOpen = useCallback(()=>{
@@ -2709,12 +2829,13 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const slashFacing=facingToward(player.boardPosition,targetTile);
     const newHP=Math.max(0,enemy.health-dmg);
     addLog(`Compass Slash -> ${dmg} dmg (${newHP}/${enemy.maxHealth})`);
+    triggerCastFx(enemy.boardPosition,'#9b6cff');
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true,facing:slashFacing};
     const updatedEnemy={...enemy,health:newHP};
     if(newHP<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[player,enemy,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction]);
+  },[player,enemy,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx]);
 
   // ── DARK WEB (Rogue skill) ──
   // Chess-knight strike pattern. Per Codex Protocols §V (Melee & Displacement):
@@ -2741,6 +2862,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const strikeFacing=facingToward(player.boardPosition,targetTile);
     const newHP=Math.max(0,enemy.health-dmg);
     const updatedEnemy={...enemy,health:newHP};
+    triggerCastFx(enemy.boardPosition,'#a0a0a0');
     if(newHP<=0){
       // Finishing blow — Rogue claims the target's tile, same as a melee kill.
       const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true,facing:strikeFacing,boardPosition:targetTile};
@@ -2753,7 +2875,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true,facing:strikeFacing};
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[player,enemy,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction]);
+  },[player,enemy,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx]);
 
   const handlePickDeploy = useCallback(()=>{
     setShowMmModal(false);
@@ -2875,7 +2997,11 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       const newAP=Math.max(0,total-frozenPenalty);
       setEnemyRolledEnergyById(prev=>({...prev,[thisEnemy.id]:total}));
       addLog(`// ${thisEnemy.name} (R${thisEnemy.rank}) rolls d12=${eRoll}${rollover>0?` +${rollover} rollover`:''} = ${total} Energy${frozenPenalty>0?` (freeze -${frozenPenalty})`:''}  ->  ${newAP} AP`);
-      const rolledEnemy={...thisEnemy,actionpts:newAP,frozen:0,energyRollover:0};
+      // Flee-or-not decided once per turn (see the matching comment in
+      // runEnemyTurn) — re-rolling it every action-point step made the unit
+      // flip-flop between fleeing and fighting step to step.
+      const fleeCommit = thisEnemy.element ? Math.random()<0.6 : true;
+      const rolledEnemy={...thisEnemy,actionpts:newAP,frozen:0,energyRollover:0,fleeCommit};
       const rolledEnemies=allEnemies.map(e=>e.id===rolledEnemy.id?rolledEnemy:e);
       setEnemies(rolledEnemies);
       if(newAP<=0){
@@ -2899,7 +3025,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           res.logs.forEach(addLog);
           updatedSummons = res.nextSummons;
           updatedEnemy = {...updatedEnemy, actionpts:updatedEnemy.actionpts-res.apSpent};
-          if(res.playerHP!==updatedPlayer.health) updatedPlayer = {...updatedPlayer, health:res.playerHP};
+          if(res.playerHP!==updatedPlayer.health){ updatedPlayer = {...updatedPlayer, health:res.playerHP}; triggerCastFx(updatedPlayer.boardPosition,'#ff6644'); }
           setSummons(updatedSummons);
           if(updatedPlayer!==currentPlayer) setPlayer(updatedPlayer);
           setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
@@ -2917,7 +3043,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       const lowHP = updatedEnemy.health <= updatedEnemy.maxHealth*0.3;
       const healTile = findHealingTile(tiles);
       const onHealTile = healTile && updatedEnemy.boardPosition.x===healTile.x && updatedEnemy.boardPosition.y===healTile.y;
-      const willFlee = lowHP && healTile && (updatedEnemy.element ? Math.random()<0.6 : true);
+      const willFlee = lowHP && healTile && updatedEnemy.fleeCommit;
       const moveBlockers = [...others.map(e=>e.boardPosition), ...updatedSummons.map(s=>s.boardPosition)];
 
       const finishStep = ()=>{
@@ -2970,6 +3096,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           const newHP=Math.max(0,updatedPlayer.health-dmg);
           const facing=facingToward(updatedEnemy.boardPosition,updatedPlayer.boardPosition);
           addLog(`${updatedEnemy.name} Compass Slash -> ${dmg} dmg`);
+          triggerCastFx(updatedPlayer.boardPosition,'#9b6cff');
           updatedPlayer={...updatedPlayer,health:newHP};
           updatedEnemy={...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-2),classSkillUsed:true,facing};
           setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
@@ -2983,6 +3110,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           updatedSummons=[...updatedSummons,s];
           setSummons(updatedSummons);
           addLog(`◈ ${updatedEnemy.name} deploys ${s.name} at (${decision.tile.x},${decision.tile.y})`);
+          triggerCastFx(decision.tile,'#9b6cff');
           updatedEnemy={...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-2),classSkillUsed:true};
           setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
           finishStep();
@@ -2994,6 +3122,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           const facing=facingToward(updatedEnemy.boardPosition,updatedPlayer.boardPosition);
           const newHP=Math.max(0,updatedPlayer.health-dmg);
           addLog(`${updatedEnemy.name} Dark Web -> ${dmg} dmg (${acc}% ${accuracyTierLabel(acc)})`);
+          triggerCastFx(updatedPlayer.boardPosition,'#a0a0a0');
           updatedPlayer={...updatedPlayer,health:newHP};
           updatedEnemy={...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-2),classSkillUsed:true,facing,
             boardPosition: newHP<=0 ? updatedPlayer.boardPosition : updatedEnemy.boardPosition};
@@ -3011,6 +3140,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           updatedEnemy={...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-strike.eCost),skillUsed:true,facing:strike.castFacing};
           if(strike.dmg>0){
             const newHP=Math.max(0,updatedPlayer.health-strike.dmg);
+            triggerCastFx(updatedPlayer.boardPosition, ELEMENTS.base[updatedEnemy.element]?.color||'#ff4422');
             updatedPlayer={...updatedPlayer,health:newHP,boardPosition:strike.knockbackPos||updatedPlayer.boardPosition};
             setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
             if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
@@ -3028,11 +3158,38 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         const dmg=tier.meleeBase+flank.bonus;
         const newHP=Math.max(0,updatedPlayer.health-dmg);
         addLog(`${updatedEnemy.name} melee ${dmg} dmg${flank.label?' ['+flank.label+']':''}`);
+        triggerCastFx(updatedPlayer.boardPosition,'#ff4422');
         updatedPlayer={...updatedPlayer,health:newHP};
         const eMeleeFacing=facingToward(updatedEnemy.boardPosition,updatedPlayer.boardPosition);
         updatedEnemy={...updatedEnemy,actionpts:updatedEnemy.actionpts-1,facing:eMeleeFacing};
         setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
         if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
+        finishStep();
+        return;
+      }
+
+      // A player-side summon blocking this enemy's path is a real target,
+      // not just an inert obstacle — destroying it clears the way instead of
+      // the enemy standing there forever. Only fires when no-melee ranks
+      // can't take it (they still can't attack at all) and the enemy isn't
+      // already adjacent to the player.
+      const adjacentOwnSummon = updatedEnemy.canMelee && updatedSummons.find(s=>s.side==='player'&&isAdjacent(updatedEnemy.boardPosition,s.boardPosition));
+      if(adjacentOwnSummon){
+        const tier=enemyTier(updatedEnemy.level);
+        const dmg=tier.meleeBase;
+        const newHP=Math.max(0,adjacentOwnSummon.health-dmg);
+        const eMeleeFacing=facingToward(updatedEnemy.boardPosition,adjacentOwnSummon.boardPosition);
+        addLog(`${updatedEnemy.name} strikes ${adjacentOwnSummon.name} -> ${dmg} dmg (${newHP}/${adjacentOwnSummon.maxHealth})`);
+        triggerCastFx(adjacentOwnSummon.boardPosition,'#ff4422');
+        updatedEnemy={...updatedEnemy,actionpts:updatedEnemy.actionpts-1,facing:eMeleeFacing};
+        if(newHP<=0){
+          updatedSummons=updatedSummons.filter(s=>s.id!==adjacentOwnSummon.id);
+          addLog(`${adjacentOwnSummon.name} destroyed!`);
+        } else {
+          updatedSummons=updatedSummons.map(s=>s.id===adjacentOwnSummon.id?{...s,health:newHP}:s);
+        }
+        setSummons(updatedSummons);
+        setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
         finishStep();
         return;
       }
@@ -3068,7 +3225,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       finishStep();
     },700);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[addLog,tiles,summons]);
+  },[addLog,tiles,summons,triggerCastFx]);
 
   // Sequences the roster: each living enemy takes its full independent turn
   // (own roll, own AP pool) before control returns to the player. Mirrors
@@ -3170,6 +3327,16 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     addLog(`=== Battle ${nextStage}/3 — ${battle.name} ===`);
   },[addLog]);
 
+  const handleCampaignIntroSubmit = useCallback((name, cls, element)=>{
+    setPlayer(p=>({...p, name}));
+    setPlayerClass(cls);
+    setClassUnlocked(true);
+    setSelCategory('base');
+    setSelElement(element);
+    setShowCampaignIntro(false);
+    addLog(`=== ${name} deployed — ${cls} · ${element} ===`);
+  },[addLog]);
+
   const handleRollEnergyMulti = useCallback(()=>{
     const roll=rollD12Energy();
     const rollover=player.energyRollover||0;
@@ -3215,12 +3382,34 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(!canAttackMulti) return;
     const adjacentEnemies = enemies.filter(e=>isAdjacent(player.boardPosition,e.boardPosition));
     const target = adjacentEnemies.find(e=>e.id===selectedEnemyId) || adjacentEnemies[0];
-    if(!target) return;
+    if(!target){
+      // No enemy character in range — an enemy-deployed summon blocking the
+      // way is a valid target too, so parking behind one doesn't grant it
+      // immunity.
+      const targetSummon = summons.find(s=>s.side==='enemy'&&isAdjacent(player.boardPosition,s.boardPosition));
+      if(!targetSummon) return;
+      const flank=getFlankBonus(player.boardPosition,targetSummon.boardPosition,targetSummon.facing);
+      const dmg=playerMeleeBase(player.level)+flank.bonus;
+      const newHP=Math.max(0,targetSummon.health-dmg);
+      const meleeFacing=facingToward(player.boardPosition,targetSummon.boardPosition);
+      addLog(`You melee ${targetSummon.name} -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}`);
+      triggerCastFx(targetSummon.boardPosition,'#ffd700');
+      const updatedPlayer={...player,actionpts:player.actionpts-1,facing:meleeFacing};
+      if(newHP<=0){
+        setSummons(prev=>prev.filter(s=>s.id!==targetSummon.id));
+        addLog(`${targetSummon.name} destroyed!`);
+      } else {
+        setSummons(prev=>prev.map(s=>s.id===targetSummon.id?{...s,health:newHP}:s));
+      }
+      routeAfterPlayerActionMulti(updatedPlayer, enemies);
+      return;
+    }
     const flank=getFlankBonus(player.boardPosition,target.boardPosition,target.facing);
     const dmg=playerMeleeBase(player.level)+flank.bonus;
     const newHP=Math.max(0,target.health-dmg);
     const meleeFacing=facingToward(player.boardPosition,target.boardPosition);
     addLog(`You melee ${target.name} -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}`);
+    triggerCastFx(target.boardPosition,'#ffd700');
     const updatedPlayer={...player,actionpts:player.actionpts-1,facing:meleeFacing};
     if(newHP<=0){
       const remaining=enemies.map(e=>e.id===target.id?{...e,health:0}:e);
@@ -3229,7 +3418,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       return;
     }
     routeAfterPlayerActionMulti(updatedPlayer, enemies.map(e=>e.id===target.id?{...e,health:newHP}:e));
-  },[canAttackMulti,player,enemies,selectedEnemyId,addLog,handleEnemyDefeatedMulti,routeAfterPlayerActionMulti]);
+  },[canAttackMulti,player,enemies,summons,selectedEnemyId,addLog,handleEnemyDefeatedMulti,routeAfterPlayerActionMulti,triggerCastFx]);
 
   // ── Elemental skill (generic + Fire/Earth/Air/Water apply) ──
   // All five share one shape: resolve `target` from selectedEnemyId (falling
@@ -3240,11 +3429,12 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     return inRange.find(e=>e.id===selectedEnemyId) || inRange[0] || null;
   },[enemies,selectedEnemyId]);
 
-  const applySkillResultMulti = useCallback((target, dmg, updatedPlayer, extra={})=>{
+  const applySkillResultMulti = useCallback((target, dmg, updatedPlayer, extra={}, color)=>{
     if(!target || dmg<=0){
       routeAfterPlayerActionMulti(updatedPlayer, enemies);
       return;
     }
+    if(color) triggerCastFx(target.boardPosition, color);
     const newHP=Math.max(0,target.health-dmg);
     if(newHP<=0){
       const remaining=enemies.map(e=>e.id===target.id?{...e,health:0,...extra}:e);
@@ -3253,7 +3443,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       return;
     }
     routeAfterPlayerActionMulti(updatedPlayer, enemies.map(e=>e.id===target.id?{...e,health:newHP,...extra}:e));
-  },[enemies,handleEnemyDefeatedMulti,routeAfterPlayerActionMulti]);
+  },[enemies,handleEnemyDefeatedMulti,routeAfterPlayerActionMulti,triggerCastFx]);
 
   const handleModalAbilityMulti = useCallback((ability,accuracy)=>{
     if(dicePhase==='roll'){ setPendingAbility(ability); setDicePhase('accuracy'); setAccuracyRoll(null); return; }
@@ -3269,7 +3459,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(heal>0){ updatedPlayer.health=Math.min(updatedPlayer.maxHealth,updatedPlayer.health+heal); addLog(`${selElement} ${ability.name} — heal +${heal} HP`); }
     if(dmg>0 && target) addLog(`${selElement} ${ability.name} -> ${dmg} dmg${flank.label?' ['+flank.label+']':''} (${acc}% (${accuracyTierLabel(acc)}))`);
     resetDiceModal();
-    applySkillResultMulti(target, dmg, updatedPlayer);
+    applySkillResultMulti(target, dmg, updatedPlayer, {}, ELEMENTS[selCategory]?.[selElement]?.color);
   },[dicePhase,accuracyRoll,selCategory,selElement,player,addLog,resetDiceModal,resolveTargetForSkill,applySkillResultMulti]);
 
   const handleFireApplyWithAccuracyMulti = useCallback((acc)=>{
@@ -3284,7 +3474,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-3),skillUsed:true};
     if(target) addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tileBoost>0?' [Fire tile +20]':''}`);
     resetDiceModal();
-    applySkillResultMulti(target, dmg, updatedPlayer);
+    applySkillResultMulti(target, dmg, updatedPlayer, {}, ELEMENTS.base.Fire.color);
   },[diceRolls,player,tiles,addLog,resetDiceModal,resolveTargetForSkill,applySkillResultMulti]);
 
   const handleEarthApplyWithAccuracyMulti = useCallback((acc)=>{
@@ -3298,7 +3488,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
     addLog(`Tremor [d6=${dieRoll}, ${earthRange} tile${earthRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${target?dmg+' dmg'+(tileBoost>0?' [Earth tile +20]':''):'MISS (no enemy in line)'}`);
     resetDiceModal();
-    applySkillResultMulti(target, dmg, updatedPlayer);
+    applySkillResultMulti(target, dmg, updatedPlayer, {}, ELEMENTS.base.Earth.color);
   },[diceRolls,player,tiles,earthRange,enemies,addLog,resetDiceModal,applySkillResultMulti]);
 
   const handleAirApplyWithAccuracyMulti = useCallback((acc)=>{
@@ -3319,7 +3509,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       addLog(`Gale Force [d8=${dieRoll}, range ${airRange}] -> MISS`);
     }
     resetDiceModal();
-    applySkillResultMulti(target, dmg, updatedPlayer, extra);
+    applySkillResultMulti(target, dmg, updatedPlayer, extra, ELEMENTS.base.Air.color);
   },[diceRolls,player,tiles,airRange,enemies,addLog,resetDiceModal,applySkillResultMulti]);
 
   const handleWaterApplyWithAccuracyMulti = useCallback((acc)=>{
@@ -3334,7 +3524,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
     addLog(`Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[waterAoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${target?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS (no enemy in blast)'}`);
     resetDiceModal();
-    applySkillResultMulti(target, dmg, updatedPlayer);
+    applySkillResultMulti(target, dmg, updatedPlayer, {}, ELEMENTS.base.Water.color);
   },[diceRolls,player,tiles,waterAoe,enemies,addLog,resetDiceModal,applySkillResultMulti]);
 
   // ── Mastermind / Dark Web targeting resolution ──
@@ -3358,7 +3548,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const slashFacing=facingToward(player.boardPosition,targetTile);
     addLog(`Compass Slash -> ${dmg} dmg`);
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true,facing:slashFacing};
-    applySkillResultMulti(target, dmg, updatedPlayer);
+    applySkillResultMulti(target, dmg, updatedPlayer, {}, '#9b6cff');
   },[player,enemies,addLog,applySkillResultMulti,routeAfterPlayerActionMulti]);
 
   const resolveDarkWebMulti = useCallback((targetTile)=>{
@@ -3377,7 +3567,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     let updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true,facing:strikeFacing};
     if(newHP<=0) updatedPlayer={...updatedPlayer,boardPosition:targetTile};
     addLog(`Dark Web -> ${dmg} dmg (${acc}% ${accuracyTierLabel(acc)})${newHP<=0?' — finishing blow, claims tile':''}`);
-    applySkillResultMulti(target, dmg, updatedPlayer);
+    applySkillResultMulti(target, dmg, updatedPlayer, {}, '#a0a0a0');
   },[player,enemies,addLog,applySkillResultMulti,routeAfterPlayerActionMulti]);
 
   const resolveDeployPlacementMulti = useCallback((tile)=>{
@@ -3414,6 +3604,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       const dmg=s.atk;
       const newHP=Math.max(0,target.health-dmg);
       addLog(`${s.name} strikes ${target.name} -> ${dmg} dmg (${newHP}/${target.maxHealth})`);
+      triggerCastFx(target.boardPosition,'#66dd88');
       if(newHP<=0){
         const remaining=enemies.filter(e=>e.id!==target.id);
         setEnemies(remaining);
@@ -3432,7 +3623,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setSelectedSummonId(null);
     setValidSquares([]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[summons,player,enemies,addLog,summonActionAtMulti]);
+  },[summons,player,enemies,addLog,summonActionAtMulti,triggerCastFx]);
 
   // ── GRID CLICK ROUTER ──
   const handleSquareClick = useCallback((x,y)=>{
@@ -3676,6 +3867,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
                 canRotate={canRotate} onRotate={handleRotateOpen}
                 canDarkWeb={canDarkWeb} onDarkWeb={handleDarkWeb}
                 hideElementalSkill={!sceneAllowSkill} restrictElementsToBase={sceneRestrictBaseElements}
+                lockElementPicker={isCampaign}
               />
             </div>
 
@@ -3695,6 +3887,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
                     playerSelected={playerSel} tiles={tiles}
                     playerFacing={player.facing} enemyFacing={enemy.facing}
                     aoeTiles={aoeTiles} knightTiles={darkWebTiles} summons={summons} deployTiles={gridDeployHighlights}
+                    castFx={castFx}
                   />
                 </div>
               </div>
@@ -3793,6 +3986,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         onContinue={()=>{ setShowBattleComplete(false); startNextCampaignBattle(player, campaignBattle+1); }}
         onFinish={()=>{ setShowBattleComplete(false); onCampaignComplete?.(); }}
       />
+      <CampaignIntroModal show={isCampaign&&showCampaignIntro} onSubmit={handleCampaignIntroSubmit} />
 
       {/* Change Class — Training Mode's Classes scene only, lets the player
           reopen the picker and swap freely instead of a one-time choice. */}
@@ -3867,6 +4061,18 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           font-size: 15px; cursor: pointer;
           transition: background 0.12s, box-shadow 0.12s, border-color 0.12s;
           color: #b0dff4; user-select: none;
+          position: relative;
+        }
+        .castFxRing {
+          position: absolute; inset: -3px; border-radius: 4px; pointer-events: none;
+          border: 3px solid var(--fx-color, #00c8ff);
+          box-shadow: 0 0 18px 4px var(--fx-color, #00c8ff);
+          animation: castFxPulse 0.7s ease-out forwards;
+        }
+        @keyframes castFxPulse {
+          0% { opacity: 1; transform: scale(0.7); }
+          60% { opacity: 0.9; transform: scale(1.15); }
+          100% { opacity: 0; transform: scale(1.4); }
         }
         .square.hovered { border-color: #00c8ff; box-shadow: inset 0 0 8px rgba(0,200,255,0.25); }
         .square.available { background: linear-gradient(135deg, #0a2535, #061520); border-color: #1e5a7a; box-shadow: inset 0 0 6px rgba(0,200,255,0.18); }
