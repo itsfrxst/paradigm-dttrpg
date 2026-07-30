@@ -2201,14 +2201,14 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           addLog('=== Summons done — enemy turn ===');
           setIsPlayerTurn(false);
           setEnemyRolledEnergy(0);
-          setTimeout(()=>runEnemyTurn({...curE,actionpts:0}, curP, ctx.round), 400);
+          setTimeout(()=>runEnemyTurn({...curE,actionpts:0}, curP, summons, ctx.round), 400);
         }
         return curE;
       });
       return curP;
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[addLog,round]);
+  },[addLog,round,summons]);
 
   // Resolves a single summon's move/attack against the current (closured)
   // player/enemy/summons state — deliberately NOT nested setState updaters.
@@ -2362,7 +2362,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[addLog]);
   // ── ENEMY TURN ──
-  const runEnemyTurn = useCallback((currentEnemy,currentPlayer,currentRound)=>{
+  const runEnemyTurn = useCallback((currentEnemy,currentPlayer,currentSummons,currentRound)=>{
     const needsRoll = currentEnemy.actionpts === 0;
     if(needsRoll){
       const eRoll = rollD12Energy();
@@ -2385,13 +2385,13 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         finishEnemyToPlayer(currentPlayer, rolledEnemy, currentRound);
         return;
       }
-      setTimeout(()=>runEnemyTurn(rolledEnemy, currentPlayer, currentRound), 600);
+      setTimeout(()=>runEnemyTurn(rolledEnemy, currentPlayer, currentSummons, currentRound), 600);
       return;
     }
 
     addLog(`// Enemy computing... (${currentEnemy.actionpts} Energy)`);
     setTimeout(()=>{
-      let updatedPlayer=currentPlayer, updatedEnemy=currentEnemy;
+      let updatedPlayer=currentPlayer, updatedEnemy=currentEnemy, updatedSummons=currentSummons;
       const adjacent=isAdjacent(currentEnemy.boardPosition,currentPlayer.boardPosition);
       const eElData=currentEnemy.element?ELEMENTS[currentEnemy.elementCategory]&&ELEMENTS[currentEnemy.elementCategory][currentEnemy.element]:null;
       const eMinCost=eElData?getSkillCost(currentEnemy.elementCategory,currentEnemy.element):1;
@@ -2414,7 +2414,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         const moves=getMoveToward(currentEnemy.boardPosition.x,currentEnemy.boardPosition.y,healTile.x,healTile.y);
         let moved=false;
         for(const m of moves){
-          const onSummon=summons.some(s=>s.boardPosition.x===m.x&&s.boardPosition.y===m.y);
+          const onSummon=updatedSummons.some(s=>s.boardPosition.x===m.x&&s.boardPosition.y===m.y);
           if(m.x>=0&&m.x<SIZE&&m.y>=0&&m.y<SIZE&&!(m.x===currentPlayer.boardPosition.x&&m.y===currentPlayer.boardPosition.y)&&!onSummon){
             const nf=facingFromMove(currentEnemy.boardPosition,m);
             let healed=false, newHP=currentEnemy.health;
@@ -2436,7 +2436,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         if(!moved){ updatedEnemy={...currentEnemy,actionpts:currentEnemy.actionpts-1}; addLog(`${currentEnemy.name} blocked from healing path`); }
         setEnemy(updatedEnemy);
         setTimeout(()=>{
-          if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,currentRound);
+          if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound);
           else finishEnemyToPlayer(updatedPlayer,updatedEnemy,currentRound);
         },600);
         return;
@@ -2450,14 +2450,14 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         addLog(`${currentEnemy.name} heals on tile → +100 HP (${newHP}/${currentEnemy.maxHealth})`);
         setEnemy(updatedEnemy);
         setTimeout(()=>{
-          if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,currentRound);
+          if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound);
           else finishEnemyToPlayer(updatedPlayer,updatedEnemy,currentRound);
         },600);
         return;
       }
 
       if(canUseClassSkill){
-        const decision = resolveEnemyClassSkill(currentEnemy, currentPlayer, summons);
+        const decision = resolveEnemyClassSkill(currentEnemy, currentPlayer, updatedSummons);
         if(decision?.kind==='direct'){
           const dmg=60;
           const newHP=Math.max(0,currentPlayer.health-dmg);
@@ -2469,7 +2469,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           setPlayer(updatedPlayer); setEnemy(updatedEnemy);
           if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
           setTimeout(()=>{
-            if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,currentRound);
+            if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound);
             else finishEnemyToPlayer(updatedPlayer,updatedEnemy,currentRound);
           },600);
           return;
@@ -2487,7 +2487,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           setPlayer(updatedPlayer); setEnemy(updatedEnemy);
           if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
           setTimeout(()=>{
-            if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,currentRound);
+            if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound);
             else finishEnemyToPlayer(updatedPlayer,updatedEnemy,currentRound);
           },600);
           return;
@@ -2606,12 +2606,12 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         updatedEnemy={...currentEnemy,actionpts:currentEnemy.actionpts-1,facing:eMeleeFacing};
         setPlayer(updatedPlayer); setEnemy(updatedEnemy);
         if(newHP<=0){addLog('=== DEFEAT ===');return;}
-      } else if(summons.find(s=>isAdjacent(currentEnemy.boardPosition,s.boardPosition))){
+      } else if(updatedSummons.find(s=>isAdjacent(currentEnemy.boardPosition,s.boardPosition))){
         // A summon blocking the enemy's path is now a real target, not just
         // an inert obstacle — the enemy strikes it down instead of standing
         // there forever, so parking a summon in front of an enemy is a
         // genuine (but destructible) defensive play rather than a permafreeze.
-        const targetSummon=summons.find(s=>isAdjacent(currentEnemy.boardPosition,s.boardPosition));
+        const targetSummon=updatedSummons.find(s=>isAdjacent(currentEnemy.boardPosition,s.boardPosition));
         const tier=enemyTier(currentEnemy.level);
         const dmg=tier.meleeBase;
         const newHP=Math.max(0,targetSummon.health-dmg);
@@ -2620,22 +2620,23 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         triggerCastFx(targetSummon.boardPosition,'#ff4422');
         updatedEnemy={...currentEnemy,actionpts:currentEnemy.actionpts-1,facing:eMeleeFacing};
         if(newHP<=0){
-          setSummons(prev=>prev.filter(s=>s.id!==targetSummon.id));
+          updatedSummons=updatedSummons.filter(s=>s.id!==targetSummon.id);
           addLog(`${targetSummon.name} destroyed!`);
         } else {
-          setSummons(prev=>prev.map(s=>s.id===targetSummon.id?{...s,health:newHP}:s));
+          updatedSummons=updatedSummons.map(s=>s.id===targetSummon.id?{...s,health:newHP}:s);
         }
+        setSummons(updatedSummons);
         setEnemy(updatedEnemy);
       } else {
         const tier=enemyTier(currentEnemy.level);
-        const summonBlockers=summons.map(s=>s.boardPosition);
+        const summonBlockers=updatedSummons.map(s=>s.boardPosition);
         const target=pickApproachTile(currentEnemy.boardPosition,currentPlayer.boardPosition,currentPlayer.facing,tier,[currentPlayer.boardPosition,...summonBlockers]);
         const goal = target || currentPlayer.boardPosition;
         const curDist = manhattan(currentEnemy.boardPosition, goal);
         const moves=getMoveToward(currentEnemy.boardPosition.x,currentEnemy.boardPosition.y,goal.x,goal.y);
         let moved=false;
         for(const m of moves){
-          const onSummon=summons.some(s=>s.boardPosition.x===m.x&&s.boardPosition.y===m.y);
+          const onSummon=updatedSummons.some(s=>s.boardPosition.x===m.x&&s.boardPosition.y===m.y);
           if(m.x>=0&&m.x<SIZE&&m.y>=0&&m.y<SIZE&&!(m.x===currentPlayer.boardPosition.x&&m.y===currentPlayer.boardPosition.y)&&!onSummon){
             if(manhattan(m,goal) < curDist){
               const nf=facingFromMove(currentEnemy.boardPosition,m);
@@ -2656,12 +2657,12 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         setEnemy(updatedEnemy);
       }
       setTimeout(()=>{
-        if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,currentRound);
+        if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound);
         else finishEnemyToPlayer(updatedPlayer,updatedEnemy,currentRound);
       },600);
     },900);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[addLog,tiles,summons,wave,triggerCastFx]);
+  },[addLog,tiles,wave,triggerCastFx]);
   // ── ROUND ORCHESTRATION ──
   const beginRound = useCallback((rP, rE, currentRound)=>{
     setIsPlayerTurn(true);
@@ -2787,9 +2788,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     addLog('=== Enemy Turn ===');
     setIsPlayerTurn(false);
     setEnemyRolledEnergy(0);
-    setTimeout(()=>runEnemyTurn({...updatedEnemy,actionpts:0}, updatedPlayer, round), 400);
+    setTimeout(()=>runEnemyTurn({...updatedEnemy,actionpts:0}, updatedPlayer, summons, round), 400);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[round,addLog,runEnemyTurn]);
+  },[round,summons,addLog,runEnemyTurn]);
 
   // ── MELEE ──
   const handleMelee = useCallback(()=>{
@@ -2822,9 +2823,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setIsPlayerTurn(false);
     setEnemyRolledEnergy(0);
     addLog('=== Enemy Turn ===');
-    setTimeout(()=>runEnemyTurn({...enemy,actionpts:0}, updatedPlayer, round), 400);
+    setTimeout(()=>runEnemyTurn({...enemy,actionpts:0}, updatedPlayer, summons, round), 400);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[player,enemy,round,addLog,runEnemyTurn]);
+  },[player,enemy,summons,round,addLog,runEnemyTurn]);
 
   const handleSurrender = useCallback(()=>{
     addLog('=== You surrendered. Restarting... ===');
@@ -3218,7 +3219,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // resulting pool one decision at a time (own-summons, class skill,
   // elemental skill, melee, approach-move, hold), recursing via setTimeout
   // exactly the way the single-enemy engine's runEnemyTurn already does.
-  const runSingleEnemyAITurn = useCallback((thisEnemy, allEnemies, currentPlayer, currentRound, onDone)=>{
+  const runSingleEnemyAITurn = useCallback((thisEnemy, allEnemies, currentPlayer, currentSummons, currentRound, onDone)=>{
     const needsRoll = thisEnemy.actionpts===0;
     if(needsRoll){
       const eRoll=rollD12Energy();
@@ -3237,20 +3238,20 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       setEnemies(rolledEnemies);
       if(newAP<=0){
         addLog(`// ${thisEnemy.name} has 0 Energy — passing`);
-        onDone(currentPlayer,rolledEnemies);
+        onDone(currentPlayer,rolledEnemies,currentSummons);
         return;
       }
-      setTimeout(()=>runSingleEnemyAITurn(rolledEnemy,rolledEnemies,currentPlayer,currentRound,onDone),500);
+      setTimeout(()=>runSingleEnemyAITurn(rolledEnemy,rolledEnemies,currentPlayer,currentSummons,currentRound,onDone),500);
       return;
     }
 
     setTimeout(()=>{
       const others = allEnemies.filter(e=>e.id!==thisEnemy.id && e.health>0);
-      let updatedPlayer=currentPlayer, updatedEnemy=thisEnemy, updatedSummons=summons;
+      let updatedPlayer=currentPlayer, updatedEnemy=thisEnemy, updatedSummons=currentSummons;
 
       // Own-summon command (Summoner enemies only) — batched once at the top
       // of this enemy's AP-spend pass.
-      if(thisEnemy.canClass && thisEnemy.enemyClass==='Summoner' && summons.some(s=>s.side==='enemy'&&s.ownerId===thisEnemy.id) && updatedEnemy.actionpts>0){
+      if(thisEnemy.canClass && thisEnemy.enemyClass==='Summoner' && updatedSummons.some(s=>s.side==='enemy'&&s.ownerId===thisEnemy.id) && updatedEnemy.actionpts>0){
         const res = commandEnemySummons(updatedEnemy, updatedSummons, others, updatedPlayer);
         if(res.apSpent>0){
           res.logs.forEach(addLog);
@@ -3282,8 +3283,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
 
       const finishStep = ()=>{
         setTimeout(()=>{
-          if(updatedEnemy.actionpts>0) runSingleEnemyAITurn(updatedEnemy,allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e),updatedPlayer,currentRound,onDone);
-          else onDone(updatedPlayer,allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
+          if(updatedEnemy.actionpts>0) runSingleEnemyAITurn(updatedEnemy,allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e),updatedPlayer,updatedSummons,currentRound,onDone);
+          else onDone(updatedPlayer,allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e),updatedSummons);
         },600);
       };
 
@@ -3452,14 +3453,14 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         addLog(`${updatedEnemy.name} holds position — saving ${saved} Energy`);
         updatedEnemy={...updatedEnemy,actionpts:0,energyRollover:(updatedEnemy.energyRollover||0)+saved};
         setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
-        onDone(updatedPlayer,allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
+        onDone(updatedPlayer,allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e),updatedSummons);
         return;
       }
       setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
       finishStep();
     },700);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[addLog,tiles,summons,triggerCastFx]);
+  },[addLog,tiles,triggerCastFx]);
 
   // Sequences the roster: each living enemy takes its full independent turn
   // (own roll, own AP pool) before control returns to the player. Mirrors
@@ -3468,7 +3469,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // move, per the Codex's chess framing. Only re-sorted at the start of a
   // fresh sequence (idx===0); the resulting order is then threaded through
   // the recursive chain like everything else here.
-  const runEnemiesSequence = useCallback((idx, currentEnemies, currentPlayer, currentRound)=>{
+  const runEnemiesSequence = useCallback((idx, currentEnemies, currentPlayer, currentSummons, currentRound)=>{
     if(currentPlayer.health<=0) return; // mirrors the single-enemy engine's own lack of a game-over flow
     const ordered = idx===0 ? [...currentEnemies].sort((a,b)=>b.rank-a.rank) : currentEnemies;
     if(idx>=ordered.length){
@@ -3477,12 +3478,12 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     }
     const thisEnemy=ordered[idx];
     if(!thisEnemy||thisEnemy.health<=0){
-      runEnemiesSequence(idx+1,ordered,currentPlayer,currentRound);
+      runEnemiesSequence(idx+1,ordered,currentPlayer,currentSummons,currentRound);
       return;
     }
-    runSingleEnemyAITurn(thisEnemy,ordered,currentPlayer,currentRound,(updatedPlayer,updatedEnemies)=>{
+    runSingleEnemyAITurn(thisEnemy,ordered,currentPlayer,currentSummons,currentRound,(updatedPlayer,updatedEnemies,updatedSummons)=>{
       if(updatedPlayer.health<=0) return;
-      runEnemiesSequence(idx+1,updatedEnemies,updatedPlayer,currentRound);
+      runEnemiesSequence(idx+1,updatedEnemies,updatedPlayer,updatedSummons,currentRound);
     });
   },[finishEnemiesToPlayerMulti,runSingleEnemyAITurn]);
 
@@ -3505,14 +3506,14 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           addLog('=== Summons done — enemies act ===');
           setIsPlayerTurn(false);
           setEnemyRolledEnergyById({});
-          setTimeout(()=>runEnemiesSequence(0, curE.map(e=>({...e,actionpts:0})), curP, ctx.round), 400);
+          setTimeout(()=>runEnemiesSequence(0, curE.map(e=>({...e,actionpts:0})), curP, summons, ctx.round), 400);
         }
         return curE;
       });
       return curP;
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[addLog,round]);
+  },[addLog,round,summons]);
 
   const routeAfterPlayerActionMulti = useCallback((updatedPlayer, updatedEnemies)=>{
     if(updatedPlayer.actionpts>0){
@@ -3523,8 +3524,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     addLog("=== Enemies' Turn ===");
     setIsPlayerTurn(false);
     setEnemyRolledEnergyById({});
-    setTimeout(()=>runEnemiesSequence(0, updatedEnemies.map(e=>({...e,actionpts:0})), updatedPlayer, round), 400);
-  },[round,addLog,runEnemiesSequence]);
+    setTimeout(()=>runEnemiesSequence(0, updatedEnemies.map(e=>({...e,actionpts:0})), updatedPlayer, summons, round), 400);
+  },[round,summons,addLog,runEnemiesSequence]);
 
   const handleEnemyDefeatedMulti = useCallback((defeatedId, curPlayer, curEnemies)=>{
     const dead = curEnemies.find(e=>e.id===defeatedId);
@@ -3628,9 +3629,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setIsPlayerTurn(false);
     setEnemyRolledEnergyById({});
     addLog("=== Enemies' Turn ===");
-    setTimeout(()=>runEnemiesSequence(0, enemies.map(e=>({...e,actionpts:0})), updatedPlayer, round), 400);
+    setTimeout(()=>runEnemiesSequence(0, enemies.map(e=>({...e,actionpts:0})), updatedPlayer, summons, round), 400);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[player,enemies,round,addLog,runEnemiesSequence]);
+  },[player,enemies,summons,round,addLog,runEnemiesSequence]);
 
   const handleSurrenderMulti = useCallback(()=>{
     addLog('=== You retreat from the Campaign. ===');
