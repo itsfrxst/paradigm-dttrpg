@@ -403,8 +403,30 @@ const SUMMON_HP = 100;
 const SUMMON_ATK = 30;
 const SUMMON_MOVE = 1;          // tiles forward per summon turn
 const BANDWIDTH = 2;            // max simultaneous summons
-const SUMMON_ROW = 7;          // Summoner's second row
+const SUMMON_ROW = 7;          // player Summoner's deploy row (row 8 is the player's own spawn row)
+const ENEMY_SUMMON_ROW = 1;    // enemy Summoner's deploy row (row 0 is the enemy's own spawn row)
 const ENEMY_BACK_ROW = 0;      // promotion line (Novice -> Agent)
+
+// Pawn geometry, shared by every summon regardless of who owns it or which
+// engine is running: move is one tile straight ahead (never diagonal, never
+// backward — `facing` is fixed at spawn and can't turn), but the class
+// attacks any of the 3 tiles directly ahead of it (left/center/right),
+// widening a pawn's diagonal-only capture into "anything in front." Pure
+// geometry off boardPosition/facing, so it works identically for a
+// player-side summon marching toward row 0 and an enemy-side one marching
+// toward row 8.
+const summonForwardTile = (s) => {
+  const dy = s.facing==='down' ? 1 : -1;
+  const ahead = {x:s.boardPosition.x, y:s.boardPosition.y+dy};
+  if(ahead.y<0||ahead.y>=SIZE) return null;
+  return ahead;
+};
+const summonAttackTiles = (s) => {
+  const dy = s.facing==='down' ? 1 : -1;
+  const y = s.boardPosition.y+dy;
+  if(y<0||y>=SIZE) return [];
+  return [-1,0,1].map(dx=>({x:s.boardPosition.x+dx,y})).filter(t=>t.x>=0&&t.x<SIZE);
+};
 
 // d100 tier bands for the Mastermind summon roll.
 const summonTierFromRoll = (roll) => {
@@ -435,6 +457,9 @@ const makeSummon = (tier, pos, side='player', ownerId=null) => ({
   promoted: false,       // becomes true on reaching the far row (Agent — staged)
   side,
   ownerId,
+  actedRound: -1,        // last round this summon acted -- rate-limits enemy-side
+                          // autonomous commanding to one action per round, same as
+                          // actedSummonIds does for player-commanded summons
 });
 
 const TILE_LEGEND = [
@@ -479,13 +504,18 @@ const calcAvailableSquares = (pos,ap) => {
   return sq;
 };
 
-// Legal Deploy tiles: row 7, normal tile only (no boost/healing), not occupied
-// by the player, enemy, or an existing summon.
-const getDeployTiles = (tiles, playerPos, enemyPositions, summons) => {
+// Legal Deploy tiles on `row`: normal tile only (no boost/healing), not
+// occupied by the player, any enemy, or an existing summon. Shared by both
+// sides — the player always deploys on SUMMON_ROW, an enemy Summoner always
+// deploys on ENEMY_SUMMON_ROW, regardless of where the casting unit itself
+// is currently standing. A fixed row (rather than "wherever the caster
+// happens to be") is what keeps a summon's spawn point predictable instead
+// of appearing anywhere the caster has wandered to.
+const getDeployTilesOnRow = (row, tiles, playerPos, enemyPositions, summons) => {
   const enemyList = Array.isArray(enemyPositions) ? enemyPositions : [enemyPositions];
   const out=[];
   for(let x=0;x<SIZE;x++){
-    const y=SUMMON_ROW;
+    const y=row;
     if(tiles?.[y]?.[x]!==TILE_TYPES.NORMAL) continue;
     if(playerPos.x===x&&playerPos.y===y) continue;
     if(enemyList.some(p=>p.x===x&&p.y===y)) continue;
@@ -494,6 +524,8 @@ const getDeployTiles = (tiles, playerPos, enemyPositions, summons) => {
   }
   return out;
 };
+const getDeployTiles = (tiles, playerPos, enemyPositions, summons) =>
+  getDeployTilesOnRow(SUMMON_ROW, tiles, playerPos, enemyPositions, summons);
 
 const calcAbilities = (category,elementName,rolls) => {
   const el=ELEMENTS[category]?.[elementName];
@@ -735,34 +767,40 @@ const computeElementalStrike = (attacker, target, tiles) => {
   return { dmg, eCost, castFacing, knockbackPos, log };
 };
 
-// Auto-resolves every un-acted summon owned by `thisEnemy` in one batch, 1 AP
-// each: march one tile toward the player (row+1, opposite of a player
-// summon's row-1 march) or, if already lined up ahead, strike the player
-// directly. Mirrors the player's own summon move/attack rule for the
-// opposite marching direction. Pure — returns results, writes no state.
-const commandEnemySummons = (thisEnemy, allSummons, otherEnemies, player) => {
+// Auto-resolves every un-acted-this-round summon owned by `thisEnemy` in one
+// batch, 1 AP each: strike the player if it's on one of the 3 tiles ahead
+// (pawn geometry, see summonAttackTiles), else march the single tile
+// straight ahead (summonForwardTile) if clear. `actedRound` rate-limits each
+// summon to exactly one action per round — without it, a Summoner with a
+// long multi-AP turn would re-command the same summons on every one of its
+// own recursive AP-spend steps, letting them move or strike repeatedly in a
+// single round instead of once, the way a chess pawn would. Pure — returns
+// results, writes no state.
+const commandEnemySummons = (thisEnemy, allSummons, otherEnemies, player, currentRound) => {
   let nextSummons = allSummons;
   let apLeft = thisEnemy.actionpts;
   let playerHP = player.health;
   const logs = [];
   const promoted = [];
-  const owned = allSummons.filter(s=>s.side==='enemy' && s.ownerId===thisEnemy.id && !s.promoted);
+  const owned = allSummons.filter(s=>s.side==='enemy' && s.ownerId===thisEnemy.id && !s.promoted && s.actedRound!==currentRound);
   for(const s of owned){
     if(apLeft<=0) break;
     const cur = nextSummons.find(z=>z.id===s.id);
     if(!cur) continue;
-    const fwd = {x:cur.boardPosition.x, y:cur.boardPosition.y+1};
-    if(fwd.x===player.boardPosition.x && fwd.y===player.boardPosition.y){
+    const inAttackRange = summonAttackTiles(cur).some(t=>t.x===player.boardPosition.x&&t.y===player.boardPosition.y);
+    if(inAttackRange){
       const dmg=cur.atk;
       playerHP=Math.max(0,playerHP-dmg);
       logs.push(`${cur.name} (enemy) strikes you -> ${dmg} dmg`);
+      nextSummons = nextSummons.map(z=>z.id===cur.id?{...z,actedRound:currentRound}:z);
       apLeft--;
       continue;
     }
-    if(fwd.y>=SIZE){
-      // Reaching the line promotes it into a full independent enemy roster
-      // entry (see promoteSummonToEnemy) — removed from summons entirely,
-      // not just flagged, since it's no longer a summon at all.
+    const fwd = summonForwardTile(cur);
+    if(!fwd){
+      // Reaching the far edge promotes it into a full independent enemy
+      // roster entry (see promoteSummonToEnemy) — removed from summons
+      // entirely, not just flagged, since it's no longer a summon at all.
       nextSummons = nextSummons.filter(z=>z.id!==cur.id);
       const newEnemy = promoteSummonToEnemy(cur, thisEnemy.level);
       promoted.push(newEnemy);
@@ -771,9 +809,10 @@ const commandEnemySummons = (thisEnemy, allSummons, otherEnemies, player) => {
       continue;
     }
     const blocked = nextSummons.some(z=>z.id!==cur.id&&z.boardPosition.x===fwd.x&&z.boardPosition.y===fwd.y)
-      || otherEnemies.some(e=>e.boardPosition.x===fwd.x&&e.boardPosition.y===fwd.y);
-    if(blocked) continue;
-    nextSummons = nextSummons.map(z=>z.id===cur.id?{...z,boardPosition:fwd}:z);
+      || otherEnemies.some(e=>e.boardPosition.x===fwd.x&&e.boardPosition.y===fwd.y)
+      || (player.boardPosition.x===fwd.x&&player.boardPosition.y===fwd.y);
+    if(blocked) continue; // no legal move this pass -- retries next pass, doesn't count as having acted
+    nextSummons = nextSummons.map(z=>z.id===cur.id?{...z,boardPosition:fwd,actedRound:currentRound}:z);
     logs.push(`${cur.name} (enemy) advances -> (${fwd.x},${fwd.y})`);
     apLeft--;
   }
@@ -782,11 +821,13 @@ const commandEnemySummons = (thisEnemy, allSummons, otherEnemies, player) => {
 
 // Decides whether `thisEnemy` uses its class skill this pass, and how.
 // Summoner: Compass-Slash-equivalent (60 dmg) if the player is in the 8
-// surrounding tiles, else Deploy a Novice on the tile directly ahead if
-// bandwidth allows. Rogue: Dark Web if the player is a knight-move away.
-// Pure decision — no state writes, no dice rolled here (that happens where
-// the result is applied, same separation `computeElementalStrike` uses).
-const resolveEnemyClassSkill = (thisEnemy, currentPlayer, currentSummons) => {
+// surrounding tiles, else Deploy a Novice onto ENEMY_SUMMON_ROW if bandwidth
+// allows — a fixed row, not wherever the caster currently stands, so a
+// mobile Summoner can't scatter summons anywhere it's walked to. Rogue: Dark
+// Web if the player is a knight-move away. Pure decision — no state writes,
+// no dice rolled here (that happens where the result is applied, same
+// separation `computeElementalStrike` uses).
+const resolveEnemyClassSkill = (thisEnemy, currentPlayer, currentSummons, tiles, enemyPositions) => {
   if(thisEnemy.enemyClass==='Rogue'){
     if(isKnightMove(thisEnemy.boardPosition, currentPlayer.boardPosition)) return { kind:'darkweb' };
     return null;
@@ -795,11 +836,12 @@ const resolveEnemyClassSkill = (thisEnemy, currentPlayer, currentSummons) => {
     if(isAdjacent8(thisEnemy.boardPosition, currentPlayer.boardPosition)) return { kind:'direct' };
     const ownCount = currentSummons.filter(s=>s.side==='enemy'&&s.ownerId===thisEnemy.id).length;
     if(ownCount<BANDWIDTH){
-      const fwd = {x:thisEnemy.boardPosition.x,y:thisEnemy.boardPosition.y+1};
-      const blocked = fwd.y>=SIZE
-        || currentSummons.some(s=>s.boardPosition.x===fwd.x&&s.boardPosition.y===fwd.y)
-        || (currentPlayer.boardPosition.x===fwd.x&&currentPlayer.boardPosition.y===fwd.y);
-      if(!blocked) return { kind:'deploy', tile:fwd };
+      const legal = getDeployTilesOnRow(ENEMY_SUMMON_ROW, tiles, currentPlayer.boardPosition, enemyPositions, currentSummons);
+      if(legal.length>0){
+        const tile = legal.reduce((best,t)=>
+          Math.abs(t.x-thisEnemy.boardPosition.x)<Math.abs(best.x-thisEnemy.boardPosition.x)?t:best, legal[0]);
+        return { kind:'deploy', tile };
+      }
     }
     return null;
   }
@@ -1379,7 +1421,7 @@ const Grid = ({playerPos,enemyPos,enemies,selectedEnemyId,validSquares,onSquareC
     let label='';
     if(isP){ cls+=' player'+(playerSelected?' playerSelected':''); label=facingArrow(playerFacing); }
     else if(isE){
-      cls+=' enemy'+(enemyHere&&enemyHere.id===selectedEnemyId?' enemySelected':'');
+      cls+=' enemy'+(enemyHere&&enemyHere.id===selectedEnemyId?' enemySelected':'')+(isA?' attackable':'');
       label=facingArrow(enemyHere?enemyHere.facing:enemyFacing);
     }
     else if(summon){
@@ -2152,20 +2194,22 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   },[addLog]);
 
   // ── SUMMON COMMAND SUB-PHASE (A: player-directed) ──
-  const summonForwardTile = useCallback((s)=>{
-    const ahead={x:s.boardPosition.x,y:s.boardPosition.y-1};
-    if(ahead.y<0) return null;
-    return ahead;
-  },[]);
-
+  // A tile with a living enemy on it is only a legal target if it's within
+  // the pawn's 3-tile attack arc (summonAttackTiles); otherwise the only
+  // legal tile is the single square straight ahead (summonForwardTile), and
+  // only if it's actually empty — move and attack are mutually exclusive per
+  // tile, matching "moves like a pawn, attacks any tile in front."
   const summonActionAt = useCallback((s, tile, curEnemy, curSummons)=>{
+    const enemyHere = curEnemy.health>0 && curEnemy.boardPosition.x===tile.x && curEnemy.boardPosition.y===tile.y;
+    if(enemyHere){
+      return summonAttackTiles(s).some(t=>t.x===tile.x&&t.y===tile.y) ? 'attack' : null;
+    }
     const ahead=summonForwardTile(s);
     if(!ahead||ahead.x!==tile.x||ahead.y!==tile.y) return null;
     if(player.boardPosition.x===tile.x&&player.boardPosition.y===tile.y) return null;
     if(curSummons.some(o=>o.id!==s.id&&o.boardPosition.x===tile.x&&o.boardPosition.y===tile.y)) return null;
-    if(curEnemy.health>0&&curEnemy.boardPosition.x===tile.x&&curEnemy.boardPosition.y===tile.y) return 'attack';
     return 'move';
-  },[player,summonForwardTile]);
+  },[player]);
 
   const beginSummonCommandPhase = useCallback((rP, rE, currentRound)=>{
     summonCtxRef.current = { round: currentRound };
@@ -2457,7 +2501,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       }
 
       if(canUseClassSkill){
-        const decision = resolveEnemyClassSkill(currentEnemy, currentPlayer, updatedSummons);
+        const decision = resolveEnemyClassSkill(currentEnemy, currentPlayer, updatedSummons, tiles, [currentEnemy.boardPosition]);
         if(decision?.kind==='direct'){
           const dmg=60;
           const newHP=Math.max(0,currentPlayer.health-dmg);
@@ -3252,7 +3296,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       // Own-summon command (Summoner enemies only) — batched once at the top
       // of this enemy's AP-spend pass.
       if(thisEnemy.canClass && thisEnemy.enemyClass==='Summoner' && updatedSummons.some(s=>s.side==='enemy'&&s.ownerId===thisEnemy.id) && updatedEnemy.actionpts>0){
-        const res = commandEnemySummons(updatedEnemy, updatedSummons, others, updatedPlayer);
+        const res = commandEnemySummons(updatedEnemy, updatedSummons, others, updatedPlayer, currentRound);
         if(res.apSpent>0){
           res.logs.forEach(addLog);
           updatedSummons = res.nextSummons;
@@ -3325,7 +3369,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       }
 
       if(canUseClass){
-        const decision = resolveEnemyClassSkill(updatedEnemy, updatedPlayer, updatedSummons);
+        const decision = resolveEnemyClassSkill(updatedEnemy, updatedPlayer, updatedSummons, tiles, [updatedEnemy.boardPosition, ...others.map(e=>e.boardPosition)]);
         if(decision?.kind==='direct'){
           const dmg=60;
           const newHP=Math.max(0,updatedPlayer.health-dmg);
@@ -3844,13 +3888,16 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
 
   // ── Player's own summons (side:'player') attacking one of several enemies ──
   const summonActionAtMulti = useCallback((s, tile, curEnemies, curSummons)=>{
+    const target = curEnemies.find(e=>e.health>0 && e.boardPosition.x===tile.x && e.boardPosition.y===tile.y);
+    if(target){
+      return summonAttackTiles(s).some(t=>t.x===tile.x&&t.y===tile.y) ? 'attack' : null;
+    }
     const ahead=summonForwardTile(s);
     if(!ahead||ahead.x!==tile.x||ahead.y!==tile.y) return null;
     if(player.boardPosition.x===tile.x&&player.boardPosition.y===tile.y) return null;
     if(curSummons.some(o=>o.id!==s.id&&o.boardPosition.x===tile.x&&o.boardPosition.y===tile.y)) return null;
-    if(curEnemies.some(e=>e.health>0&&e.boardPosition.x===tile.x&&e.boardPosition.y===tile.y)) return 'attack';
     return 'move';
-  },[player,summonForwardTile]);
+  },[player]);
 
   // ── PROMOTED AGENTS (autonomous, player-side, multi-enemy) ──
   // Same shape as the single-enemy runAgentTurn, but picks its own target
@@ -3993,17 +4040,27 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       if(clickedSummon){
         if(actedSummonIds.includes(clickedSummon.id)){ addLog('// That summon already acted'); return; }
         setSelectedSummonId(clickedSummon.id);
-        const fwd=summonForwardTile(clickedSummon);
-        setValidSquares(fwd?[{x:fwd.x,y:fwd.y,distance:1}]:[]);
+        // Highlight every tile summonActionAt(Multi) would actually accept a
+        // click on right now — the single forward move tile plus whichever
+        // of the 3 forward attack tiles currently hold a live enemy. Single
+        // source of truth shared with the click-resolution below, so the
+        // highlight can never drift out of sync with what's actually legal.
+        const candidates=[summonForwardTile(clickedSummon), ...summonAttackTiles(clickedSummon)]
+          .filter(Boolean)
+          .filter((t,i,arr)=>arr.findIndex(u=>u.x===t.x&&u.y===t.y)===i);
+        const legal=candidates.filter(t=>(isCampaign
+          ? summonActionAtMulti(clickedSummon,t,enemies,summons)
+          : summonActionAt(clickedSummon,t,enemy,summons)));
+        setValidSquares(legal.map(t=>({...t,distance:1})));
         return;
       }
       if(selectedSummonId){
         const s=ownSummons.find(z=>z.id===selectedSummonId);
-        if(s){
-          const fwd=summonForwardTile(s);
-          if(fwd&&fwd.x===x&&fwd.y===y){ (isCampaign?resolveSummonActionMulti:resolveSummonAction)(selectedSummonId,{x,y}); return; }
-        }
-        addLog('// Click the highlighted forward tile, or another summon');
+        const kind = s && (isCampaign
+          ? summonActionAtMulti(s,{x,y},enemies,summons)
+          : summonActionAt(s,{x,y},enemy,summons));
+        if(kind){ (isCampaign?resolveSummonActionMulti:resolveSummonAction)(selectedSummonId,{x,y}); return; }
+        addLog('// Click the highlighted tile — forward to move, an enemy ahead to attack');
       }
       return;
     }
@@ -4043,7 +4100,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setPlayerSel(false);
     setValidSquares([]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[isCampaign,showDeploy,awaitingPlacement,compassTargeting,darkWebTargeting,summonPhaseActive,energyPhase,summons,actedSummonIds,selectedSummonId,isPlayerTurn,player,enemy,enemies,playerSel,validSquares,tiles,addLog,resolveDeployPlacement,resolveDeployPlacementMulti,resolveCompassSlash,resolveCompassSlashMulti,resolveDarkWeb,resolveDarkWebMulti,summonForwardTile,resolveSummonAction,resolveSummonActionMulti]);
+  },[isCampaign,showDeploy,awaitingPlacement,compassTargeting,darkWebTargeting,summonPhaseActive,energyPhase,summons,actedSummonIds,selectedSummonId,isPlayerTurn,player,enemy,enemies,playerSel,validSquares,tiles,addLog,resolveDeployPlacement,resolveDeployPlacementMulti,resolveCompassSlash,resolveCompassSlashMulti,resolveDarkWeb,resolveDarkWebMulti,summonActionAt,summonActionAtMulti,resolveSummonAction,resolveSummonActionMulti]);
 
   // Auto-end the summon command phase once all of the PLAYER's own summons
   // have acted (or pool is empty) — enemy-deployed summons in Campaign act
@@ -4436,6 +4493,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         .square.playerSelected { animation: pulseCyan 1s infinite; }
         .square.enemy { background: radial-gradient(circle, #ff4422, #8a1500); border-color: #ff6644; color: #1a0500; font-weight: bold; box-shadow: 0 0 12px rgba(255,68,34,0.55); }
         .square.enemy.enemySelected { border-color: #ffd700; box-shadow: 0 0 14px rgba(255,215,0,0.75), inset 0 0 8px rgba(255,215,0,0.5); }
+        .square.enemy.attackable { border-color: #66dd88; box-shadow: 0 0 14px rgba(102,221,136,0.7), inset 0 0 8px rgba(102,221,136,0.45); }
         .square.summon { background: radial-gradient(circle, #9b6cff, #5a2a9a); border-color: #b08cff; color: #fff; font-weight: bold; box-shadow: 0 0 10px rgba(155,108,255,0.55); }
         .square.summon.enemySide { background: radial-gradient(circle, #ff6644, #8a2a10); border-color: #ff9966; box-shadow: 0 0 10px rgba(255,102,68,0.55); }
         .square.summon.promoted { border-color: #ffd700; box-shadow: 0 0 14px rgba(255,215,0,0.75), inset 0 0 8px rgba(255,215,0,0.5); font-size: 12px; }
