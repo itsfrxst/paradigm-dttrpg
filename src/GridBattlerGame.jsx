@@ -555,6 +555,21 @@ const MELEE_PER_LEVEL=5; // player gains +5 melee damage per level
 // (Enemies use the tier system's meleeBase instead — left untouched.)
 const playerMeleeBase = (level) => MELEE_BASE + (level-1)*MELEE_PER_LEVEL;
 
+// How many melee "hits" worth of AP an enemy auto-spends in one burst: enough
+// to defeat the target if it has the energy for it, capped at whatever AP it
+// actually has left. Replaces resolving N separate 1-AP melee actions (and N
+// log lines/recursive turn-steps) with a single calculated Melee (Nx)
+// command — the same total damage a fully-committed melee enemy would have
+// landed anyway, just without the step-by-step churn. Capping at the kill
+// threshold (rather than always spending everything) means a target that
+// dies quickly doesn't eat AP the enemy could still spend elsewhere this
+// turn — mirrors how leftover AP behaved before, when a mid-sequence kill
+// freed the remaining single-hit steps for something else.
+const meleeBurstMultiplier = (actionpts, perHitDamage, targetHealth) => {
+  const neededHits = Math.max(1, Math.ceil(targetHealth / perHitDamage));
+  return Math.max(1, Math.min(actionpts, neededHits));
+};
+
 // Enemy behavior tiers are cumulative and keyed off enemy level. A unit at level
 // N has every capability unlocked at or below N:
 //   Lv1+  survive: attack, flee-to-heal, and save/rest (bank AP when nothing
@@ -1192,6 +1207,52 @@ const DeployRollModal = ({show, rolling, roll, tier, awaitingPlacement, onRoll, 
           : null}
         <button onClick={onClose}
           style={{width:'100%',marginTop:12,padding:8,background:'transparent',color:'#3a5a6a',border:'1px solid #1e3a4a',borderRadius:5,cursor:'pointer',fontSize:12}}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+};
+// Lets the player commit multiple Energy to a single melee swing instead of
+// clicking Melee once per point — mirrors the enemy AI's auto-batched burst
+// (meleeBurstMultiplier) but as a player-driven choice rather than an
+// automatic cap, since the player may want to hold Energy back.
+const MeleeMultiplierModal = ({show, perHitDamage, maxMultiplier, targetLabel, onConfirm, onClose}) => {
+  const [mult, setMult] = useState(1);
+  useEffect(()=>{ if(show) setMult(1); },[show]);
+  if(!show) return null;
+  const gold='#ffd700';
+  const dmg = perHitDamage*mult;
+  return (
+    <div onClick={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.82)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:2500}}>
+      <div onClick={e=>e.stopPropagation()} style={{background:'#080e14',border:`2px solid ${gold}`,borderRadius:10,padding:'1.4rem',maxWidth:380,width:'92%',color:'#b0dff4',boxShadow:`0 0 40px ${gold}44`}}>
+        <div style={{textAlign:'center',marginBottom:16}}>
+          <span style={{fontSize:24}}>⚔</span>
+          <h2 style={{fontSize:'1.05rem',letterSpacing:'0.12em',textTransform:'uppercase',color:gold,marginTop:4}}>Melee Burst</h2>
+          <div style={{fontSize:'11px',color:'#5a7a8a',marginTop:2}}>Spend Energy on {targetLabel||'the target'} — 1 Energy per hit.</div>
+        </div>
+        <div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:14,marginBottom:14}}>
+          <button onClick={()=>setMult(m=>Math.max(1,m-1))} disabled={mult<=1}
+            style={{width:38,height:38,borderRadius:6,background:`${gold}18`,border:`1px solid ${gold}`,color:gold,fontSize:18,fontWeight:'bold',cursor:mult<=1?'not-allowed':'pointer',opacity:mult<=1?0.4:1}}>-</button>
+          <div style={{minWidth:70,textAlign:'center'}}>
+            <div style={{fontSize:28,fontWeight:'bold',color:gold}}>{mult}x</div>
+            <div style={{fontSize:10,color:'#5a7a8a'}}>energy</div>
+          </div>
+          <button onClick={()=>setMult(m=>Math.min(maxMultiplier,m+1))} disabled={mult>=maxMultiplier}
+            style={{width:38,height:38,borderRadius:6,background:`${gold}18`,border:`1px solid ${gold}`,color:gold,fontSize:18,fontWeight:'bold',cursor:mult>=maxMultiplier?'not-allowed':'pointer',opacity:mult>=maxMultiplier?0.4:1}}>+</button>
+        </div>
+        <input type="range" min={1} max={maxMultiplier} value={mult} onChange={e=>setMult(Number(e.target.value))}
+          style={{width:'100%',marginBottom:14,accentColor:gold}} />
+        <div style={{background:'#0a1218',border:`1px solid ${gold}55`,borderRadius:8,padding:'10px 14px',marginBottom:14,textAlign:'center'}}>
+          <div style={{fontSize:11,color:'#7a9db5'}}>{perHitDamage} dmg/hit × {mult}</div>
+          <div style={{fontSize:22,fontWeight:'bold',color:gold,marginTop:2}}>{dmg} damage</div>
+        </div>
+        <button onClick={()=>onConfirm(mult)}
+          style={{width:'100%',padding:14,background:`${gold}22`,color:gold,border:`1px solid ${gold}`,borderRadius:6,fontSize:16,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.1em'}}>
+          Melee ({mult}x)
+        </button>
+        <button onClick={onClose}
+          style={{width:'100%',marginTop:10,padding:8,background:'transparent',color:'#3a5a6a',border:'1px solid #1e3a4a',borderRadius:5,cursor:'pointer',fontSize:12}}>
           Cancel
         </button>
       </div>
@@ -2140,6 +2201,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const [loadoutUnlocked, setLoadoutUnlocked] = useState(scene==='skills');  // gate flag (post-boss, or immediate in the Battle Skills scene)
   const [sceneComplete,   setSceneComplete]   = useState(false);  // Training Mode: this scene's single enemy is down
   const [showLoadoutModal,setShowLoadoutModal]= useState(false);  // unlock picker
+  const [meleeModalCtx,setMeleeModalCtx]= useState(null);  // {perHitDamage,maxMultiplier,targetLabel,targetId} while the melee burst modal is open
   // Landscape-only game: true when the viewport is taller than it is wide, which
   // triggers a rotate-your-device overlay (the 3-panel row needs the width).
   const [isPortrait, setIsPortrait] = useState(
@@ -2678,13 +2740,15 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       } else if(adjacent){
         const tier=enemyTier(currentEnemy.level);
         const flank=getFlankBonus(currentEnemy.boardPosition,currentPlayer.boardPosition,currentPlayer.facing);
-        const dmg=tier.meleeBase+flank.bonus;
+        const perHit=tier.meleeBase+flank.bonus;
+        const mult=meleeBurstMultiplier(currentEnemy.actionpts,perHit,currentPlayer.health);
+        const dmg=perHit*mult;
         const newHP=Math.max(0,currentPlayer.health-dmg);
-        addLog(`${currentEnemy.name} melee ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tier.heavy?' [heavy]':''}`);
+        addLog(`${currentEnemy.name} melee${mult>1?` (${mult}x ${perHit})`:''} -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tier.heavy?' [heavy]':''}`);
         triggerCastFx(currentPlayer.boardPosition,'#ff4422');
         updatedPlayer={...currentPlayer,health:newHP};
         const eMeleeFacing=facingToward(currentEnemy.boardPosition,currentPlayer.boardPosition);
-        updatedEnemy={...currentEnemy,actionpts:currentEnemy.actionpts-1,facing:eMeleeFacing};
+        updatedEnemy={...currentEnemy,actionpts:currentEnemy.actionpts-mult,facing:eMeleeFacing};
         setPlayer(updatedPlayer); setEnemy(updatedEnemy);
         if(newHP<=0){addLog('=== DEFEAT ===');return;}
       } else if(updatedSummons.find(s=>isAdjacent(currentEnemy.boardPosition,s.boardPosition))){
@@ -2694,12 +2758,14 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         // genuine (but destructible) defensive play rather than a permafreeze.
         const targetSummon=updatedSummons.find(s=>isAdjacent(currentEnemy.boardPosition,s.boardPosition));
         const tier=enemyTier(currentEnemy.level);
-        const dmg=tier.meleeBase;
+        const perHit=tier.meleeBase;
+        const mult=meleeBurstMultiplier(currentEnemy.actionpts,perHit,targetSummon.health);
+        const dmg=perHit*mult;
         const newHP=Math.max(0,targetSummon.health-dmg);
         const eMeleeFacing=facingToward(currentEnemy.boardPosition,targetSummon.boardPosition);
-        addLog(`${currentEnemy.name} strikes ${targetSummon.name} -> ${dmg} dmg (${newHP}/${targetSummon.maxHealth})`);
+        addLog(`${currentEnemy.name} strikes ${targetSummon.name}${mult>1?` (${mult}x ${perHit})`:''} -> ${dmg} dmg (${newHP}/${targetSummon.maxHealth})`);
         triggerCastFx(targetSummon.boardPosition,'#ff4422');
-        updatedEnemy={...currentEnemy,actionpts:currentEnemy.actionpts-1,facing:eMeleeFacing};
+        updatedEnemy={...currentEnemy,actionpts:currentEnemy.actionpts-mult,facing:eMeleeFacing};
         if(newHP<=0){
           updatedSummons=updatedSummons.filter(s=>s.id!==targetSummon.id);
           addLog(`${targetSummon.name} destroyed!`);
@@ -2874,16 +2940,23 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   },[round,summons,addLog,runEnemyTurn]);
 
   // ── MELEE ──
-  const handleMelee = useCallback(()=>{
+  const handleMeleeOpen = useCallback(()=>{
     if(!canAttack) return;
     const flank=getFlankBonus(player.boardPosition,enemy.boardPosition,enemy.facing);
-    const base=playerMeleeBase(player.level);
-    const dmg=base+flank.bonus;
+    const perHitDamage=playerMeleeBase(player.level)+flank.bonus;
+    setMeleeModalCtx({perHitDamage,maxMultiplier:player.actionpts,targetLabel:enemy.name});
+  },[canAttack,player,enemy]);
+
+  const resolveMelee = useCallback((mult)=>{
+    setMeleeModalCtx(null);
+    const flank=getFlankBonus(player.boardPosition,enemy.boardPosition,enemy.facing);
+    const perHit=playerMeleeBase(player.level)+flank.bonus;
+    const dmg=perHit*mult;
     const newHP=Math.max(0,enemy.health-dmg);
     const meleeFacing=facingToward(player.boardPosition,enemy.boardPosition);
-    addLog(`You melee ${dmg} dmg${flank.label?' ['+flank.label+']':''}`);
+    addLog(`You melee${mult>1?` (${mult}x ${perHit})`:''} -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}`);
     triggerCastFx(enemy.boardPosition,'#ffd700');
-    const updatedPlayer={...player,actionpts:player.actionpts-1,facing:meleeFacing};
+    const updatedPlayer={...player,actionpts:player.actionpts-mult,facing:meleeFacing};
     const updatedEnemy={...enemy,health:newHP};
     if(newHP<=0){
       setPlayer(updatedPlayer); setEnemy(updatedEnemy);
@@ -2892,7 +2965,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[canAttack,player,enemy,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx]);
+  },[player,enemy,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx]);
 
   // ── END TURN / SURRENDER ──
   const handleEndTurn = useCallback(()=>{
@@ -2918,7 +2991,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setIsPlayerTurn(true); setPlayerSel(false); setValidSquares([]);
     setSelCategory('base'); setSelElement('Fire');
     setLockedRoll(null); setHealingConsumed(false);
-    setPlayerClass(null); setClassUnlocked(false); setSummons([]);
+    setLoadout([]); setLoadoutUnlocked(false); setSummons([]);
     setSummonPhaseActive(false); setSelectedSummonId(null);
     setLogs(['=== Battle Initiated ===','Move adjacent to attack. Position for bonuses.']);
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3483,13 +3556,15 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       if(updatedEnemy.canMelee && adjacent){
         const tier=enemyTier(updatedEnemy.level);
         const flank=getFlankBonus(updatedEnemy.boardPosition,updatedPlayer.boardPosition,updatedPlayer.facing);
-        const dmg=tier.meleeBase+flank.bonus;
+        const perHit=tier.meleeBase+flank.bonus;
+        const mult=meleeBurstMultiplier(updatedEnemy.actionpts,perHit,updatedPlayer.health);
+        const dmg=perHit*mult;
         const newHP=Math.max(0,updatedPlayer.health-dmg);
-        addLog(`${updatedEnemy.name} melee ${dmg} dmg${flank.label?' ['+flank.label+']':''}`);
+        addLog(`${updatedEnemy.name} melee${mult>1?` (${mult}x ${perHit})`:''} -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}`);
         triggerCastFx(updatedPlayer.boardPosition,'#ff4422');
         updatedPlayer={...updatedPlayer,health:newHP};
         const eMeleeFacing=facingToward(updatedEnemy.boardPosition,updatedPlayer.boardPosition);
-        updatedEnemy={...updatedEnemy,actionpts:updatedEnemy.actionpts-1,facing:eMeleeFacing};
+        updatedEnemy={...updatedEnemy,actionpts:updatedEnemy.actionpts-mult,facing:eMeleeFacing};
         setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
         if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
         finishStep();
@@ -3504,12 +3579,14 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       const adjacentOwnSummon = updatedEnemy.canMelee && updatedSummons.find(s=>s.side==='player'&&isAdjacent(updatedEnemy.boardPosition,s.boardPosition));
       if(adjacentOwnSummon){
         const tier=enemyTier(updatedEnemy.level);
-        const dmg=tier.meleeBase;
+        const perHit=tier.meleeBase;
+        const mult=meleeBurstMultiplier(updatedEnemy.actionpts,perHit,adjacentOwnSummon.health);
+        const dmg=perHit*mult;
         const newHP=Math.max(0,adjacentOwnSummon.health-dmg);
         const eMeleeFacing=facingToward(updatedEnemy.boardPosition,adjacentOwnSummon.boardPosition);
-        addLog(`${updatedEnemy.name} strikes ${adjacentOwnSummon.name} -> ${dmg} dmg (${newHP}/${adjacentOwnSummon.maxHealth})`);
+        addLog(`${updatedEnemy.name} strikes ${adjacentOwnSummon.name}${mult>1?` (${mult}x ${perHit})`:''} -> ${dmg} dmg (${newHP}/${adjacentOwnSummon.maxHealth})`);
         triggerCastFx(adjacentOwnSummon.boardPosition,'#ff4422');
-        updatedEnemy={...updatedEnemy,actionpts:updatedEnemy.actionpts-1,facing:eMeleeFacing};
+        updatedEnemy={...updatedEnemy,actionpts:updatedEnemy.actionpts-mult,facing:eMeleeFacing};
         if(newHP<=0){
           updatedSummons=updatedSummons.filter(s=>s.id!==adjacentOwnSummon.id);
           addLog(`${adjacentOwnSummon.name} destroyed!`);
@@ -3733,7 +3810,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   },[addLog,onCampaignComplete]);
 
   // ── Melee ──
-  const handleMeleeMulti = useCallback(()=>{
+  const handleMeleeOpenMulti = useCallback(()=>{
     if(!canAttackMulti) return;
     const adjacentEnemies = enemies.filter(e=>isAdjacent(player.boardPosition,e.boardPosition));
     const target = adjacentEnemies.find(e=>e.id===selectedEnemyId) || adjacentEnemies[0];
@@ -3744,12 +3821,30 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       const targetSummon = summons.find(s=>s.side==='enemy'&&isAdjacent(player.boardPosition,s.boardPosition));
       if(!targetSummon) return;
       const flank=getFlankBonus(player.boardPosition,targetSummon.boardPosition,targetSummon.facing);
-      const dmg=playerMeleeBase(player.level)+flank.bonus;
+      const perHitDamage=playerMeleeBase(player.level)+flank.bonus;
+      setMeleeModalCtx({perHitDamage,maxMultiplier:player.actionpts,targetLabel:targetSummon.name,targetKind:'summon',targetId:targetSummon.id});
+      return;
+    }
+    const flank=getFlankBonus(player.boardPosition,target.boardPosition,target.facing);
+    const perHitDamage=playerMeleeBase(player.level)+flank.bonus;
+    setMeleeModalCtx({perHitDamage,maxMultiplier:player.actionpts,targetLabel:target.name,targetKind:'enemy',targetId:target.id});
+  },[canAttackMulti,player,enemies,summons,selectedEnemyId]);
+
+  const resolveMeleeMulti = useCallback((mult)=>{
+    const ctx=meleeModalCtx;
+    setMeleeModalCtx(null);
+    if(!ctx) return;
+    if(ctx.targetKind==='summon'){
+      const targetSummon = summons.find(s=>s.id===ctx.targetId);
+      if(!targetSummon) return;
+      const flank=getFlankBonus(player.boardPosition,targetSummon.boardPosition,targetSummon.facing);
+      const perHit=playerMeleeBase(player.level)+flank.bonus;
+      const dmg=perHit*mult;
       const newHP=Math.max(0,targetSummon.health-dmg);
       const meleeFacing=facingToward(player.boardPosition,targetSummon.boardPosition);
-      addLog(`You melee ${targetSummon.name} -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}`);
+      addLog(`You melee ${targetSummon.name}${mult>1?` (${mult}x ${perHit})`:''} -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}`);
       triggerCastFx(targetSummon.boardPosition,'#ffd700');
-      const updatedPlayer={...player,actionpts:player.actionpts-1,facing:meleeFacing};
+      const updatedPlayer={...player,actionpts:player.actionpts-mult,facing:meleeFacing};
       if(newHP<=0){
         setSummons(prev=>prev.filter(s=>s.id!==targetSummon.id));
         addLog(`${targetSummon.name} destroyed!`);
@@ -3759,13 +3854,16 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       routeAfterPlayerActionMulti(updatedPlayer, enemies);
       return;
     }
+    const target = enemies.find(e=>e.id===ctx.targetId);
+    if(!target) return;
     const flank=getFlankBonus(player.boardPosition,target.boardPosition,target.facing);
-    const dmg=playerMeleeBase(player.level)+flank.bonus;
+    const perHit=playerMeleeBase(player.level)+flank.bonus;
+    const dmg=perHit*mult;
     const newHP=Math.max(0,target.health-dmg);
     const meleeFacing=facingToward(player.boardPosition,target.boardPosition);
-    addLog(`You melee ${target.name} -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}`);
+    addLog(`You melee ${target.name}${mult>1?` (${mult}x ${perHit})`:''} -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}`);
     triggerCastFx(target.boardPosition,'#ffd700');
-    const updatedPlayer={...player,actionpts:player.actionpts-1,facing:meleeFacing};
+    const updatedPlayer={...player,actionpts:player.actionpts-mult,facing:meleeFacing};
     if(newHP<=0){
       const remaining=enemies.map(e=>e.id===target.id?{...e,health:0}:e);
       setPlayer(updatedPlayer); setEnemies(remaining);
@@ -3773,7 +3871,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       return;
     }
     routeAfterPlayerActionMulti(updatedPlayer, enemies.map(e=>e.id===target.id?{...e,health:newHP}:e));
-  },[canAttackMulti,player,enemies,summons,selectedEnemyId,addLog,handleEnemyDefeatedMulti,routeAfterPlayerActionMulti,triggerCastFx]);
+  },[meleeModalCtx,player,enemies,summons,addLog,handleEnemyDefeatedMulti,routeAfterPlayerActionMulti,triggerCastFx]);
 
   // ── Elemental skill (generic + Fire/Earth/Air/Water apply) ──
   // All five share one shape: resolve `target` from selectedEnemyId (falling
@@ -4321,7 +4419,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
                 selectedCategory={selCategory} selectedElement={selElement}
                 onElementSelect={(c,e)=>{setSelCategory(c);setSelElement(e);}}
                 canAttack={isCampaign?canAttackMulti:canAttack} canSkill={isCampaign?canSkillMulti:canSkill}
-                onMelee={isCampaign?handleMeleeMulti:handleMelee} onSkill={handleSkill} onEndTurn={isCampaign?handleEndTurnMulti:handleEndTurn}
+                onMelee={isCampaign?handleMeleeOpenMulti:handleMeleeOpen} onSkill={handleSkill} onEndTurn={isCampaign?handleEndTurnMulti:handleEndTurn}
                 onRollEnergy={isCampaign?handleRollEnergyMulti:handleRollEnergy} energyPhase={energyPhase}
                 onSurrender={isCampaign?handleSurrenderMulti:handleSurrender} enemy={enemy} enemyRolledEnergy={enemyRolledEnergy}
                 enemies={isCampaign?enemies:undefined} enemyRolledEnergyById={enemyRolledEnergyById}
@@ -4444,6 +4542,14 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       <DeployRollModal
         show={showDeploy} rolling={deployRolling} roll={deployRoll} tier={deployTier}
         awaitingPlacement={awaitingPlacement} onRoll={handleDeployRoll} onClose={handleCloseDeploy}
+      />
+      <MeleeMultiplierModal
+        show={!!meleeModalCtx}
+        perHitDamage={meleeModalCtx?.perHitDamage}
+        maxMultiplier={meleeModalCtx?.maxMultiplier||1}
+        targetLabel={meleeModalCtx?.targetLabel}
+        onConfirm={isCampaign?resolveMeleeMulti:resolveMelee}
+        onClose={()=>setMeleeModalCtx(null)}
       />
       <RewardModal show={reward.show} html={reward.html} />
       <SceneCompleteModal show={sceneComplete} sceneMeta={sceneMeta} onReturn={()=>onSceneComplete?.()} />
