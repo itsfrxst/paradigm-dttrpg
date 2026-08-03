@@ -1,5 +1,5 @@
 import React from 'react';
-import { ELEMENTS, getXPThreshold, UNLOCKABLE_CLASSES } from './GridBattlerGame.jsx';
+import { ELEMENTS, getXPThreshold, BATTLE_SKILLS } from './GridBattlerGame.jsx';
 
 const StatBar = ({ label, current, max, color }) => {
   const pct = max > 0 ? Math.max(0, Math.min(100, (current / max) * 100)) : 0;
@@ -35,9 +35,9 @@ const CharacterScreen = ({ liveState, hasActiveSession, onLaunch }) => {
     );
   }
 
-  const { player, playerClass, wave, hexas } = liveState;
+  const { player, loadout, wave, hexas } = liveState;
   const xpNeeded = getXPThreshold(player.level);
-  const classMeta = playerClass ? UNLOCKABLE_CLASSES.find(c=>c.id===playerClass) : null;
+  const loadoutMeta = (loadout||[]).map(id=>BATTLE_SKILLS.find(s=>s.id===id)).filter(Boolean);
   const allElements = [
     ...Object.entries(ELEMENTS.base).map(([name,d])=>({name,d,cat:'Base'})),
     ...Object.entries(ELEMENTS.minor).map(([name,d])=>({name,d,cat:'Minor Fusion'})),
@@ -52,13 +52,17 @@ const CharacterScreen = ({ liveState, hasActiveSession, onLaunch }) => {
           <h1 style={{fontFamily:"'Advent Pro',sans-serif",fontSize:'1.4rem',letterSpacing:'0.12em',textTransform:'uppercase',color:'#00c8ff',margin:0}}>{player.name}</h1>
           <div style={{fontSize:12,color:'#7a9db5'}}>Level {player.level} · Wave {wave} · <span style={{color:'#ffd700'}}>{hexas} Hexas</span></div>
         </div>
-        {classMeta ? (
-          <div style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:8,padding:'6px 12px',background:`${classMeta.color}18`,border:`1px solid ${classMeta.color}66`,borderRadius:6}}>
-            <span style={{fontSize:18}}>{classMeta.icon}</span>
-            <span style={{color:classMeta.color,fontWeight:'bold',fontSize:13}}>{classMeta.name}</span>
+        {loadoutMeta.length>0 ? (
+          <div style={{marginLeft:'auto',display:'flex',alignItems:'center',gap:10,flexWrap:'wrap'}}>
+            {loadoutMeta.map(m=>(
+              <div key={m.id} style={{display:'flex',alignItems:'center',gap:6,padding:'6px 12px',background:`${m.color}18`,border:`1px solid ${m.color}66`,borderRadius:6}}>
+                <span style={{fontSize:16}}>{m.icon}</span>
+                <span style={{color:m.color,fontWeight:'bold',fontSize:12}}>{m.name}</span>
+              </div>
+            ))}
           </div>
         ) : (
-          <div style={{marginLeft:'auto',fontSize:11,color:'#3a5a6a',fontStyle:'italic'}}>Unclassed — defeat a boss to unlock a class path</div>
+          <div style={{marginLeft:'auto',fontSize:11,color:'#3a5a6a',fontStyle:'italic'}}>No loadout — defeat a boss to unlock Battle Skills</div>
         )}
       </div>
 

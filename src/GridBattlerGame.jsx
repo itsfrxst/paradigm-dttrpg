@@ -384,19 +384,26 @@ const pickApproachTile = (enemyPos, def, defFacing, tier, blockers) => {
   return {x:pool[0].x,y:pool[0].y,quality:pool[0].quality};
 };
 
-// skillUsed gates elemental skills; classSkillUsed gates class abilities
-// (Mastermind, Dark Web, ...) as a separate once-per-round limit — per the
-// Codex: "a player may use their class skill once and one elemental skill
-// per turn, but cannot repeat the same skill."
+// skillUsed gates elemental skills; classSkillUsed gates the enemy side's
+// single class ability (enemies still work the old class-locked way — see
+// the Battle Skills note above BATTLE_SKILLS) as a separate once-per-round
+// limit. The player side now tracks the same "once per round" rule per
+// loadout skill instead, via usedSkillIds (see markSkillUsed) — each
+// equipped Tactical/Core skill gets its own independent use, since a
+// loadout can hold more than one at a time.
 const makeCharacter = (name,hp,level,agi,ap,pos,element,elementCategory) => ({
   name,level,agi,health:hp,maxHealth:hp,actionpts:ap,boardPosition:pos,
   playerXp:0,facing:'down',frozen:0,slowed:false,skillUsed:false,rotateUsed:false,classSkillUsed:false,
+  usedSkillIds:[],
   element:element||null,elementCategory:elementCategory||null,energyRollover:0,
 });
+// Marks `skillId` as used-this-round on a player object, for the loadout's
+// per-skill once-per-round gate.
+const markSkillUsed = (p, skillId) => ({...p, usedSkillIds:[...(p.usedSkillIds||[]), skillId]});
 
-// ─── SUMMONS (Summoner class) ──────────────────────────────────────────────────
-// Novice summons deployed via Mastermind's Deploy mode. Provisional stats for
-// v4.0; behavior is forward-only toward the enemy back row (row 0). Bug / Virus /
+// ─── SUMMONS (Circuit Sigil skill) ──────────────────────────────────────────────
+// Novice summons deployed via Circuit Sigil. Provisional stats for v4.0;
+// behavior is forward-only toward the enemy back row (row 0). Bug / Virus /
 // Malware share Novice behavior this pass (Virus species ability + Malware
 // custom behavior are staged pending species/crafting systems).
 const SUMMON_HP = 100;
@@ -428,7 +435,7 @@ const summonAttackTiles = (s) => {
   return [-1,0,1].map(dx=>({x:s.boardPosition.x+dx,y})).filter(t=>t.x>=0&&t.x<SIZE);
 };
 
-// d100 tier bands for the Mastermind summon roll.
+// d100 tier bands for the Circuit Sigil summon roll.
 const summonTierFromRoll = (roll) => {
   if(roll<=34) return 'Bug';
   if(roll<=67) return 'Virus';
@@ -488,9 +495,9 @@ const makePlainTiles = () => Array.from({length:SIZE},()=>Array(SIZE).fill(TILE_
 // screen (which reads it to render the selection cards).
 export const TUTORIAL_SCENES = [
   { id:'movement', name:'Movement & Melee',   icon:'🧭', color:'#00c8ff',
-    blurb:'Learn tile movement, positioning, and basic melee combat. No elemental skill or class abilities yet.' },
-  { id:'classes',  name:'Classes',            icon:'⚔',  color:'#9b6cff',
-    blurb:'Both classes unlocked immediately — swap between Summoner and Rogue freely to try their abilities.' },
+    blurb:'Learn tile movement, positioning, and basic melee combat. No elemental skill or Tactical Skills yet.' },
+  { id:'skills',   name:'Battle Skills',       icon:'⚔',  color:'#9b6cff',
+    blurb:'Every Tactical Skill unlocked immediately — toggle Compass Slash and Dark Web freely to try them.' },
   { id:'elements', name:'Elements & Terrain', icon:'🔥', color:'#ff6b00',
     blurb:'Cast Fire, Water, Earth, or Air freely on a grid with elemental boost and healing tiles.' },
 ];
@@ -897,24 +904,46 @@ const computeAgentStep = (agent, target, blockers) => {
   return { kind:'hold' };
 };
 
-// Available classes for the post-boss unlock modal. The list is structured
-// so more classes (Paladin, Gunner, Wizard) can slot in later per the Codex
-// Class Registry — each entry here is one step of that integration.
-export const UNLOCKABLE_CLASSES = [
+// Battle Skills loadout registry. Classes (Summoner/Rogue) are gone on the
+// player side — what were once class-locked abilities are now individually
+// selectable skills, organized into two categories so the loadout stays
+// legible as more skills get added later:
+//   Core Skills    — the strong, slower-growing kit. Melee is the only one
+//                    available today; Circuit Sigil (summoning) is built
+//                    and intended, but stays crafting-locked until that
+//                    system exists, so it isn't offered in the picker yet.
+//   Tactical Skills — the faster-growing pool of situational actions.
+//                    Compass Slash and Dark Web (formerly Mastermind's
+//                    Direct mode and the Rogue class skill) are the first
+//                    two, unlocked from the start.
+// Loadout caps below are a soft ceiling for future growth, not a target —
+// there's currently only one Core skill (unselectable) and two Tactical
+// skills, so a starting loadout is really just "pick your Tacticals."
+const CORE_SKILL_CAP = 3;
+const TACTICAL_SKILL_CAP = 2;
+export const BATTLE_SKILLS = [
   {
-    id:'Summoner',
-    name:'Summoner',
-    icon:'🜨',
-    color:'#9b6cff',
-    tagline:'Mastermind — strike or deploy entities from the cyberworld.',
-    blurb:'Hybrid skill chosen on activation. Direct: Compass Slash (60 dmg, any of 8 surrounding tiles). Deploy: roll a circuit sigil to call a Bug, Virus, or Malware onto your second row. Bandwidth 2.',
+    id:'melee', category:'core', baseline:true,
+    name:'Melee', icon:'⚔', color:'#ffd700',
+    tagline:'Basic contact strike — always equipped.',
+    blurb:'Every Proxie\'s baseline attack. Not part of the loadout pick; it\'s always available regardless of what else you equip.',
   },
   {
-    id:'Rogue',
-    name:'Rogue',
-    icon:'⚔',
-    color:'#a0a0a0',
-    tagline:'Dark Web — strike from angles no defender expects.',
+    id:'circuitSigil', category:'core', locked:true, unlockHint:'Unlocks via Crafting',
+    name:'Circuit Sigil', icon:'◈', color:'#9b6cff',
+    tagline:'Summon entities from the cyberworld.',
+    blurb:'Roll a circuit sigil to call a Bug, Virus, or Malware onto your second row. Bandwidth 2. Intended as a strong Core skill — stays locked until Crafting unlocks it.',
+  },
+  {
+    id:'compassSlash', category:'tactical',
+    name:'Compass Slash', icon:'⊕', color:'#9b6cff',
+    tagline:'An omnidirectional strike.',
+    blurb:'60 dmg to any of the 8 surrounding tiles. 2 Energy, once per turn.',
+  },
+  {
+    id:'darkWeb', category:'tactical',
+    name:'Dark Web', icon:'✕', color:'#a0a0a0',
+    tagline:'Strike from angles no defender expects.',
     blurb:'Moves and attacks in an L-pattern, like a chess knight — striking any of 8 offset tiles, bypassing adjacent defenders entirely. 70 base damage, 2 Energy, once per turn. A finishing blow claims the target\'s tile, same as any melee kill.',
   },
 ];
@@ -973,60 +1002,101 @@ const PanelTitle = ({children,icon}) => (
   </div>
 );
 
-// Post-boss class unlock modal — first gated-content test. Presents available
-// classes; selection persists on the Proxy.
-const ClassUnlockModal = ({show, onSelect, onClose, freeSelect}) => {
+// Post-boss loadout unlock modal — presents Battle Skills grouped by
+// category (Core / Tactical), each toggleable up to its cap. Replaces the
+// old single-pick class modal now that a player builds a loadout instead of
+// equipping one exclusive class. `loadout` / `onToggle` are controlled by
+// the caller so the same component works for Gauntlet's post-boss unlock,
+// Training's free-swap scene, and (as a picker for Campaign's own intro
+// modal) skill selection.
+const LoadoutModal = ({show, loadout, onToggle, onConfirm, onClose, freeSelect}) => {
   if(!show) return null;
+  const core = BATTLE_SKILLS.filter(s=>s.category==='core');
+  const tactical = BATTLE_SKILLS.filter(s=>s.category==='tactical');
+  const tacticalCount = loadout.filter(id=>tactical.some(s=>s.id===id)).length;
   return (
     <div onClick={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.85)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:4000}}>
       <div onClick={e=>e.stopPropagation()} style={{background:'#080e14',border:'2px solid #9b6cff',borderRadius:12,padding:'1.6rem',maxWidth:460,width:'92%',maxHeight:'85vh',overflowY:'auto',color:'#b0dff4',boxShadow:'0 0 50px rgba(155,108,255,0.4)'}}>
         <div style={{textAlign:'center',marginBottom:18}}>
-          <div style={{fontSize:'11px',letterSpacing:'0.2em',textTransform:'uppercase',color:'#9b6cff'}}>{freeSelect ? '// Training Scene — Try Any Class' : '// Boss Defeated — Class Unlocked'}</div>
-          <h2 style={{fontSize:'1.3rem',letterSpacing:'0.1em',textTransform:'uppercase',color:'#b08cff',marginTop:6}}>Choose Your Path</h2>
-          <div style={{fontSize:'11px',color:'#5a7a8a',marginTop:4}}>{freeSelect ? 'Select a class to try. Swap anytime with the Change Class button.' : 'Select a class to equip on your Proxy. This persists for the run.'}</div>
+          <div style={{fontSize:'11px',letterSpacing:'0.2em',textTransform:'uppercase',color:'#9b6cff'}}>{freeSelect ? '// Training Scene — Try Any Skill' : '// Boss Defeated — Loadout Unlocked'}</div>
+          <h2 style={{fontSize:'1.3rem',letterSpacing:'0.1em',textTransform:'uppercase',color:'#b08cff',marginTop:6}}>Choose Your Loadout</h2>
+          <div style={{fontSize:'11px',color:'#5a7a8a',marginTop:4}}>{freeSelect ? `Toggle up to ${TACTICAL_SKILL_CAP} Tactical Skills to try. Swap anytime with the Change Loadout button.` : `Select up to ${TACTICAL_SKILL_CAP} Tactical Skills to equip. This persists for the run.`}</div>
         </div>
-        {UNLOCKABLE_CLASSES.map(c=>(
-          <div key={c.id} onClick={()=>onSelect(c.id)}
-            style={{background:'#0a1218',border:`1px solid ${c.color}66`,borderRadius:8,padding:'14px 16px',marginBottom:10,cursor:'pointer',transition:'border-color 0.15s'}}
-            onMouseEnter={e=>e.currentTarget.style.borderColor=c.color}
-            onMouseLeave={e=>e.currentTarget.style.borderColor=`${c.color}66`}>
-            <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:6}}>
-              <span style={{fontSize:'22px'}}>{c.icon}</span>
-              <div>
-                <div style={{fontSize:'15px',fontWeight:'bold',color:c.color}}>{c.name}</div>
-                <div style={{fontSize:'11px',color:'#7a9db5'}}>{c.tagline}</div>
+
+        <div style={{fontSize:'10px',color:'#3a5a6a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:8}}>Core Skills (max {CORE_SKILL_CAP})</div>
+        {core.map(s=>(
+          <div key={s.id}
+            style={{background:'#0a1218',border:`1px solid ${s.color}44`,borderRadius:8,padding:'12px 14px',marginBottom:8,opacity:s.locked?0.6:1}}>
+            <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:4}}>
+              <span style={{fontSize:'18px'}}>{s.icon}</span>
+              <div style={{flex:1}}>
+                <div style={{fontSize:'13px',fontWeight:'bold',color:s.color}}>{s.name}</div>
+                <div style={{fontSize:'10px',color:'#7a9db5'}}>{s.tagline}</div>
               </div>
+              <span style={{fontSize:'10px',color:s.locked?'#ff8866':'#66dd88',fontWeight:'bold',letterSpacing:'0.05em'}}>
+                {s.locked ? `🔒 ${s.unlockHint}` : 'EQUIPPED'}
+              </span>
             </div>
-            <div style={{fontSize:'11px',color:'#8ab5cc',lineHeight:1.5}}>{c.blurb}</div>
+            <div style={{fontSize:'10px',color:'#8ab5cc',lineHeight:1.5}}>{s.blurb}</div>
           </div>
         ))}
-        <button onClick={onClose}
-          style={{width:'100%',marginTop:6,padding:9,background:'transparent',color:'#5a7a8a',border:'1px solid #1e3a4a',borderRadius:6,cursor:'pointer',fontSize:12,letterSpacing:'0.05em'}}>
-          Decide later
+
+        <div style={{fontSize:'10px',color:'#3a5a6a',textTransform:'uppercase',letterSpacing:'0.1em',margin:'14px 0 8px'}}>Tactical Skills — pick up to {TACTICAL_SKILL_CAP}</div>
+        {tactical.map(s=>{
+          const picked = loadout.includes(s.id);
+          const disabled = !picked && tacticalCount>=TACTICAL_SKILL_CAP;
+          return (
+            <div key={s.id} onClick={()=>!disabled&&onToggle(s.id)}
+              style={{background:'#0a1218',border:`1px solid ${picked?s.color:disabled?'#1e3a4a':`${s.color}66`}`,borderRadius:8,padding:'14px 16px',marginBottom:10,cursor:disabled?'not-allowed':'pointer',opacity:disabled?0.5:1,boxShadow:picked?`0 0 12px ${s.color}55`:'none',transition:'border-color 0.15s'}}>
+              <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:6}}>
+                <span style={{fontSize:'22px'}}>{s.icon}</span>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:'15px',fontWeight:'bold',color:s.color}}>{s.name}</div>
+                  <div style={{fontSize:'11px',color:'#7a9db5'}}>{s.tagline}</div>
+                </div>
+                {picked&&<span style={{fontSize:'16px',color:s.color}}>✓</span>}
+              </div>
+              <div style={{fontSize:'11px',color:'#8ab5cc',lineHeight:1.5}}>{s.blurb}</div>
+            </div>
+          );
+        })}
+        <button onClick={onConfirm}
+          style={{width:'100%',marginTop:6,padding:11,background:'rgba(155,108,255,0.18)',color:'#b08cff',border:'1px solid #9b6cff',borderRadius:6,cursor:'pointer',fontSize:13,fontWeight:'bold',letterSpacing:'0.06em'}}>
+          Confirm Loadout
         </button>
+        {freeSelect&&(
+          <button onClick={onClose}
+            style={{width:'100%',marginTop:8,padding:9,background:'transparent',color:'#5a7a8a',border:'1px solid #1e3a4a',borderRadius:6,cursor:'pointer',fontSize:12,letterSpacing:'0.05em'}}>
+            Close
+          </button>
+        )}
       </div>
     </div>
   );
 };
 
 // Campaign's opening character-creation step — name the Proxie, pick a
-// class, pick an element, before Battle 1 spawns. Unlike Gauntlet (class
-// unlocks after a boss kill) and Training's Classes scene (free swapping),
-// Campaign locks these choices in up front, like loading into a real run.
+// loadout, pick an element, before Battle 1 spawns. Unlike Gauntlet
+// (loadout unlocks after a boss kill) and Training's Battle Skills scene
+// (free swapping), Campaign locks these choices in up front, like loading
+// into a real run.
 const CampaignIntroModal = ({show, onSubmit}) => {
   const [name, setName] = useState('');
-  const [cls, setCls] = useState(null);
+  const [loadout, setLoadout] = useState([]);
   const [element, setElement] = useState(null);
   if(!show) return null;
-  const canSubmit = name.trim().length>0 && cls && element;
+  const canSubmit = name.trim().length>0 && loadout.length>0 && element;
   const elMeta = element ? ELEMENTS.base[element] : null;
+  const tactical = BATTLE_SKILLS.filter(s=>s.category==='tactical');
+  const toggleSkill = (id) => setLoadout(prev=>prev.includes(id) ? prev.filter(x=>x!==id)
+    : prev.length<TACTICAL_SKILL_CAP ? [...prev,id] : prev);
   return (
     <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.9)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:5000,padding:'2rem'}}>
       <div style={{background:'#080e14',border:'2px solid #cc4422',borderRadius:12,padding:'1.6rem',maxWidth:520,width:'100%',maxHeight:'90vh',overflowY:'auto',color:'#b0dff4',boxShadow:'0 0 50px rgba(204,68,34,0.4)'}}>
         <div style={{textAlign:'center',marginBottom:18}}>
           <div style={{fontSize:'11px',letterSpacing:'0.2em',textTransform:'uppercase',color:'#cc4422'}}>// Campaign — New Proxie</div>
           <h2 style={{fontSize:'1.3rem',letterSpacing:'0.1em',textTransform:'uppercase',color:'#ff8866',marginTop:6}}>Load Into the Grid</h2>
-          <div style={{fontSize:'11px',color:'#5a7a8a',marginTop:4}}>Name your Proxie, choose its class and element. These lock in for the run.</div>
+          <div style={{fontSize:'11px',color:'#5a7a8a',marginTop:4}}>Name your Proxie, choose its loadout and element. These lock in for the run.</div>
         </div>
 
         <div style={{background:'#0a1218',border:'1px solid #cc442244',borderRadius:8,padding:'12px 14px',marginBottom:18,fontSize:12,color:'#7a9db5',lineHeight:1.6,fontStyle:'italic'}}>
@@ -1040,17 +1110,22 @@ const CampaignIntroModal = ({show, onSubmit}) => {
         </div>
 
         <div style={{marginBottom:16}}>
-          <div style={{fontSize:'10px',color:'#3a5a6a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:6}}>Class</div>
-          {UNLOCKABLE_CLASSES.map(c=>(
-            <div key={c.id} onClick={()=>setCls(c.id)}
-              style={{background:'#0a1218',border:`1px solid ${cls===c.id?c.color:c.color+'44'}`,borderRadius:8,padding:'10px 12px',marginBottom:8,cursor:'pointer',boxShadow:cls===c.id?`0 0 12px ${c.color}55`:'none'}}>
-              <div style={{display:'flex',alignItems:'center',gap:8}}>
-                <span style={{fontSize:18}}>{c.icon}</span>
-                <span style={{fontSize:13,fontWeight:'bold',color:c.color}}>{c.name}</span>
-                <span style={{fontSize:10,color:'#7a9db5',marginLeft:'auto'}}>{c.tagline}</span>
+          <div style={{fontSize:'10px',color:'#3a5a6a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:6}}>Loadout — Tactical Skills (pick up to {TACTICAL_SKILL_CAP})</div>
+          {tactical.map(s=>{
+            const picked = loadout.includes(s.id);
+            const disabled = !picked && loadout.length>=TACTICAL_SKILL_CAP;
+            return (
+              <div key={s.id} onClick={()=>!disabled&&toggleSkill(s.id)}
+                style={{background:'#0a1218',border:`1px solid ${picked?s.color:s.color+'44'}`,borderRadius:8,padding:'10px 12px',marginBottom:8,cursor:disabled?'not-allowed':'pointer',opacity:disabled?0.5:1,boxShadow:picked?`0 0 12px ${s.color}55`:'none'}}>
+                <div style={{display:'flex',alignItems:'center',gap:8}}>
+                  <span style={{fontSize:18}}>{s.icon}</span>
+                  <span style={{fontSize:13,fontWeight:'bold',color:s.color}}>{s.name}</span>
+                  <span style={{fontSize:10,color:'#7a9db5',marginLeft:'auto'}}>{s.tagline}</span>
+                  {picked&&<span style={{fontSize:14,color:s.color}}>✓</span>}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
         </div>
 
         <div style={{marginBottom:20}}>
@@ -1066,55 +1141,9 @@ const CampaignIntroModal = ({show, onSubmit}) => {
           {elMeta&&<div style={{fontSize:10,color:'#7a9db5',marginTop:8,lineHeight:1.5}}>{elMeta.description}</div>}
         </div>
 
-        <button onClick={()=>canSubmit&&onSubmit(name.trim(),cls,element)} disabled={!canSubmit}
+        <button onClick={()=>canSubmit&&onSubmit(name.trim(),loadout,element)} disabled={!canSubmit}
           style={{width:'100%',padding:13,background:canSubmit?'rgba(204,68,34,0.18)':'rgba(20,30,40,0.6)',border:`1px solid ${canSubmit?'#cc4422':'#1e3a4a'}`,borderRadius:6,color:canSubmit?'#ff8866':'#2a4a5e',fontSize:14,fontWeight:'bold',cursor:canSubmit?'pointer':'not-allowed',letterSpacing:'0.08em'}}>
-          {canSubmit ? 'Deploy to Battle 1' : 'Name your Proxie, pick a class and element'}
-        </button>
-      </div>
-    </div>
-  );
-};
-
-// Mastermind mode picker — appears when the Summoner activates Mastermind.
-// Forks into Direct (Compass Slash) or Deploy (Circuit Sigil).
-const MastermindModeModal = ({show, canDeploy, deployReason, onPickDirect, onPickDeploy, onClose}) => {
-  if(!show) return null;
-  const purple='#9b6cff';
-  return (
-    <div onClick={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.82)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:2500}}>
-      <div onClick={e=>e.stopPropagation()} style={{background:'#080e14',border:`2px solid ${purple}`,borderRadius:10,padding:'1.4rem',maxWidth:420,width:'92%',maxHeight:'85vh',overflowY:'auto',color:'#b0dff4',boxShadow:`0 0 40px ${purple}44`}}>
-        <div style={{textAlign:'center',marginBottom:16}}>
-          <span style={{fontSize:24}}>🜨</span>
-          <h2 style={{fontSize:'1.1rem',letterSpacing:'0.12em',textTransform:'uppercase',color:purple,marginTop:4}}>Mastermind</h2>
-          <div style={{fontSize:'11px',color:'#5a7a8a',marginTop:2}}>Choose a mode — costs 2 Energy, one activation this turn.</div>
-        </div>
-        <div onClick={onPickDirect}
-          style={{background:'#0a1218',border:`1px solid ${purple}66`,borderRadius:8,padding:'13px 15px',marginBottom:10,cursor:'pointer'}}
-          onMouseEnter={e=>e.currentTarget.style.borderColor=purple}
-          onMouseLeave={e=>e.currentTarget.style.borderColor=`${purple}66`}>
-          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-            <span style={{fontSize:'14px',fontWeight:'bold',color:'#c9b3ff'}}>⚔ Direct — Compass Slash</span>
-            <span style={{fontSize:'12px',color:purple,fontWeight:'bold'}}>60 dmg</span>
-          </div>
-          <div style={{fontSize:'11px',color:'#8ab5cc',marginTop:4}}>Strike any one of the 8 surrounding tiles. Enemy must occupy the tile.</div>
-        </div>
-        <div onClick={canDeploy?onPickDeploy:undefined}
-          style={{background:'#0a1218',border:`1px solid ${canDeploy?`${purple}66`:'#1e3a4a'}`,borderRadius:8,padding:'13px 15px',cursor:canDeploy?'pointer':'not-allowed',opacity:canDeploy?1:0.55}}
-          onMouseEnter={e=>{if(canDeploy)e.currentTarget.style.borderColor=purple;}}
-          onMouseLeave={e=>{if(canDeploy)e.currentTarget.style.borderColor=`${purple}66`;}}>
-          <div style={{display:'flex',justifyContent:'space-between',alignItems:'center'}}>
-            <span style={{fontSize:'14px',fontWeight:'bold',color:canDeploy?'#c9b3ff':'#3a5a6a'}}>◈ Deploy — Circuit Sigil</span>
-            <span style={{fontSize:'12px',color:canDeploy?purple:'#3a5a6a',fontWeight:'bold'}}>d100 tier</span>
-          </div>
-          <div style={{fontSize:'11px',color:canDeploy?'#8ab5cc':'#5a7a8a',marginTop:4}}>
-            {canDeploy
-              ? 'Roll to call a Bug / Virus / Malware onto your second row, then place it.'
-              : `Unavailable — ${deployReason}`}
-          </div>
-        </div>
-        <button onClick={onClose}
-          style={{width:'100%',marginTop:12,padding:8,background:'transparent',color:'#3a5a6a',border:'1px solid #1e3a4a',borderRadius:5,cursor:'pointer',fontSize:12}}>
-          Cancel
+          {canSubmit ? 'Deploy to Battle 1' : 'Name your Proxie, pick a loadout and element'}
         </button>
       </div>
     </div>
@@ -1206,7 +1235,7 @@ const ElementPickerModal = ({selectedCategory,selectedElement,onSelect,onClose,r
   );
 };
 
-const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedElement,onElementSelect,canAttack,canSkill,onMelee,onSkill,onEndTurn,onRollEnergy,energyPhase,onSurrender,enemy,enemyRolledEnergy,enemies,enemyRolledEnergyById,selectedEnemyId,onSelectEnemy,isPlayerTurn,playerClass,summons,canMastermind,onMastermind,canRotate,onRotate,canDarkWeb,onDarkWeb,hideElementalSkill,restrictElementsToBase,lockElementPicker}) => {
+const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedElement,onElementSelect,canAttack,canSkill,onMelee,onSkill,onEndTurn,onRollEnergy,energyPhase,onSurrender,enemy,enemyRolledEnergy,enemies,enemyRolledEnergyById,selectedEnemyId,onSelectEnemy,isPlayerTurn,loadout,summons,canCompassSlash,onCompassSlash,canCircuitSigil,onCircuitSigil,circuitSigilReason,canRotate,onRotate,canDarkWeb,onDarkWeb,hideElementalSkill,restrictElementsToBase,lockElementPicker}) => {
   const [showPicker,setShowPicker]=useState(false);
   const allEl={...ELEMENTS.base,...ELEMENTS.minor,...ELEMENTS.major};
   const elData=allEl[selectedElement];
@@ -1215,10 +1244,11 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
   const showRollBtn = isPlayerTurn && energyPhase==='roll';
   const showActions = isPlayerTurn && energyPhase==='act';
   const skillCost = getSkillCost(selectedCategory, selectedElement);
-  const classMeta = playerClass ? UNLOCKABLE_CLASSES.find(c=>c.id===playerClass) : null;
-  const hasSummoner = playerClass==='Summoner';
-  const hasRogue = playerClass==='Rogue';
-  const hasClassAction = hasSummoner || hasRogue;
+  const loadoutMeta = loadout.map(id=>BATTLE_SKILLS.find(s=>s.id===id)).filter(Boolean);
+  const hasCompassSlash = loadout.includes('compassSlash');
+  const hasCircuitSigil = loadout.includes('circuitSigil');
+  const hasDarkWeb = loadout.includes('darkWeb');
+  const hasTacticalAction = hasCompassSlash || hasCircuitSigil || hasDarkWeb;
   return (
     <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden',minHeight:0,height:'100%'}}>
         {/* Scrollable body — stats columns live here so they can never push the
@@ -1239,12 +1269,14 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
                 </button>
               )}
             </div>
-            {classMeta&&(
-              <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',background:`${classMeta.color}11`,border:`1px solid ${classMeta.color}44`,borderRadius:4,padding:'3px 8px',marginBottom:8,gap:6}}>
-                <span style={{display:'flex',alignItems:'center',gap:5,fontSize:'11px',color:classMeta.color,fontWeight:'bold',whiteSpace:'nowrap',overflow:'hidden',textOverflow:'ellipsis'}}>
-                  <span>{classMeta.icon}</span>{classMeta.name}
+            {loadoutMeta.length>0&&(
+              <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',background:'rgba(155,108,255,0.07)',border:'1px solid #9b6cff44',borderRadius:4,padding:'3px 8px',marginBottom:8,gap:6,flexWrap:'wrap'}}>
+                <span style={{display:'flex',alignItems:'center',gap:8,fontSize:'11px',flexWrap:'wrap'}}>
+                  {loadoutMeta.map(s=>(
+                    <span key={s.id} style={{display:'flex',alignItems:'center',gap:3,color:s.color,fontWeight:'bold',whiteSpace:'nowrap'}}>{s.icon}{s.name}</span>
+                  ))}
                 </span>
-                {hasSummoner&&<span style={{fontSize:'10px',color:'#8ab5cc',fontFamily:'monospace',whiteSpace:'nowrap'}}>Bandwidth {summons.filter(s=>(!s.side||s.side==='player')&&!s.promoted).length}/{BANDWIDTH}</span>}
+                {hasCircuitSigil&&<span style={{fontSize:'10px',color:'#8ab5cc',fontFamily:'monospace',whiteSpace:'nowrap'}}>Bandwidth {summons.filter(s=>(!s.side||s.side==='player')&&!s.promoted).length}/{BANDWIDTH}</span>}
               </div>
             )}
             <StatLine
@@ -1254,7 +1286,7 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
             />
             <EnergyBar current={player.actionpts} rolled={playerRolledEnergy} rollover={player.energyRollover} />
             {player.frozen>0&&<StatLine label="Freeze" value={`-${player.frozen} Energy next round`} accent="#a0e4ff" />}
-            {hasSummoner&&summons.some(s=>!s.side||s.side==='player')&&(
+            {summons.some(s=>!s.side||s.side==='player')&&(
               <div style={{marginTop:6,borderTop:'1px solid #1e3a4a',paddingTop:6}}>
                 <div style={{fontSize:'9px',color:'#3a6a8a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:4}}>Active Summons</div>
                 {summons.filter(s=>!s.side||s.side==='player').map(s=>{
@@ -1333,7 +1365,7 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
               </button>
               {!hideElementalSkill&&(
                 <button onClick={onSkill} disabled={!canSkill}
-                  style={{flex:hasClassAction?1:1.2,padding:'7px 4px',background:canSkill?'rgba(200,60,0,0.2)':'rgba(20,30,40,0.6)',border:`1px solid ${canSkill?'#cc3300':'#1e3a4a'}`,borderRadius:'4px',color:canSkill?'#ff6644':'#2a4a5e',fontSize:'11px',fontWeight:600,cursor:canSkill?'pointer':'not-allowed',letterSpacing:'.04em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
+                  style={{flex:hasTacticalAction?1:1.2,padding:'7px 4px',background:canSkill?'rgba(200,60,0,0.2)':'rgba(20,30,40,0.6)',border:`1px solid ${canSkill?'#cc3300':'#1e3a4a'}`,borderRadius:'4px',color:canSkill?'#ff6644':'#2a4a5e',fontSize:'11px',fontWeight:600,cursor:canSkill?'pointer':'not-allowed',letterSpacing:'.04em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
                   SKILL<div style={{fontSize:'8px',opacity:0.7}}>{player.skillUsed?'used':`${selectedElement.slice(0,4)}·${skillCost}E`}</div>
                 </button>
               )}
@@ -1341,16 +1373,22 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
                 style={{flex:0.6,padding:'7px 2px',background:canRotate?'rgba(0,200,255,0.12)':'rgba(20,30,40,0.6)',border:`1px solid ${canRotate?'#0090b0':'#1e3a4a'}`,borderRadius:'4px',color:canRotate?'#00c8ff':'#2a4a5e',fontSize:'13px',fontWeight:600,cursor:canRotate?'pointer':'not-allowed',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
                 ⟳<div style={{fontSize:'8px',opacity:0.7}}>{player.rotateUsed?'used':'0E'}</div>
               </button>
-              {hasSummoner&&(
-                <button onClick={onMastermind} disabled={!canMastermind}
-                  style={{flex:1.2,padding:'7px 4px',background:canMastermind?'rgba(155,108,255,0.18)':'rgba(20,30,40,0.6)',border:`1px solid ${canMastermind?'#9b6cff':'#1e3a4a'}`,borderRadius:'4px',color:canMastermind?'#b08cff':'#2a4a5e',fontSize:'11px',fontWeight:600,cursor:canMastermind?'pointer':'not-allowed',letterSpacing:'.03em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
-                  MASTERMIND<div style={{fontSize:'8px',opacity:0.7}}>{player.classSkillUsed?'used':'2E'}</div>
+              {hasCompassSlash&&(
+                <button onClick={onCompassSlash} disabled={!canCompassSlash}
+                  style={{flex:1.2,padding:'7px 4px',background:canCompassSlash?'rgba(155,108,255,0.18)':'rgba(20,30,40,0.6)',border:`1px solid ${canCompassSlash?'#9b6cff':'#1e3a4a'}`,borderRadius:'4px',color:canCompassSlash?'#b08cff':'#2a4a5e',fontSize:'11px',fontWeight:600,cursor:canCompassSlash?'pointer':'not-allowed',letterSpacing:'.03em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
+                  COMPASS SLASH<div style={{fontSize:'8px',opacity:0.7}}>{player.usedSkillIds.includes('compassSlash')?'used':'2E'}</div>
                 </button>
               )}
-              {hasRogue&&(
+              {hasCircuitSigil&&(
+                <button onClick={onCircuitSigil} disabled={!canCircuitSigil} title={!canCircuitSigil&&circuitSigilReason?`Unavailable — ${circuitSigilReason}`:undefined}
+                  style={{flex:1.2,padding:'7px 4px',background:canCircuitSigil?'rgba(155,108,255,0.18)':'rgba(20,30,40,0.6)',border:`1px solid ${canCircuitSigil?'#9b6cff':'#1e3a4a'}`,borderRadius:'4px',color:canCircuitSigil?'#b08cff':'#2a4a5e',fontSize:'11px',fontWeight:600,cursor:canCircuitSigil?'pointer':'not-allowed',letterSpacing:'.03em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
+                  CIRCUIT SIGIL<div style={{fontSize:'8px',opacity:0.7}}>{player.usedSkillIds.includes('circuitSigil')?'used':'2E'}</div>
+                </button>
+              )}
+              {hasDarkWeb&&(
                 <button onClick={onDarkWeb} disabled={!canDarkWeb}
                   style={{flex:1.2,padding:'7px 4px',background:canDarkWeb?'rgba(160,160,160,0.18)':'rgba(20,30,40,0.6)',border:`1px solid ${canDarkWeb?'#a0a0a0':'#1e3a4a'}`,borderRadius:'4px',color:canDarkWeb?'#c8c8c8':'#2a4a5e',fontSize:'11px',fontWeight:600,cursor:canDarkWeb?'pointer':'not-allowed',letterSpacing:'.03em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
-                  DARK WEB<div style={{fontSize:'8px',opacity:0.7}}>{player.classSkillUsed?'used':'2E'}</div>
+                  DARK WEB<div style={{fontSize:'8px',opacity:0.7}}>{player.usedSkillIds.includes('darkWeb')?'used':'2E'}</div>
                 </button>
               )}
               <button onClick={onEndTurn}
@@ -1386,7 +1424,7 @@ const CombatLog = ({logs,gridHeight}) => {
           const isEnergy=l.includes('d12')||l.includes('Energy')||l.includes('rollover');
           const isGood=l.includes('+')||l.includes('heal')||l.includes('HP')||l.includes('Level');
           const isHit=l.includes('dmg')||l.includes('Defeat')||l.includes('DEFEAT');
-          const isSummon=l.includes('Novice')||l.includes('Sigil')||l.includes('Bandwidth')||l.includes('Compass')||l.includes('Mastermind');
+          const isSummon=l.includes('Novice')||l.includes('Sigil')||l.includes('Bandwidth')||l.includes('Compass')||l.includes('Loadout');
           return <div key={i} style={{padding:'2px 0',color:isSummon?'#b08cff':isSys?'#00c8ff':isEnergy?'#ffd700':isHit?'#ff8866':isGood?'#00cc66':'#6a9ab5',borderBottom:'1px solid rgba(30,58,74,0.3)',wordBreak:'break-word'}}>{l}</div>;
         })}
       </div>
@@ -2024,11 +2062,11 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // Training Mode scene config. `scene` is undefined for normal Gauntlet play
   // (every flag below defaults to current behavior). Each scene isolates one
   // new mechanic on top of core movement/melee rather than accumulating —
-  // simplest to reason about and keeps Gauntlet's own logic untouched. Class
-  // availability isn't a separate flag here: classUnlocked only starts true
-  // when scene==='classes', and the boss-defeat unlock path never runs in
-  // scene mode (handleEnemyDefeated returns early), so classes stay
-  // naturally locked in every other scene without an extra check.
+  // simplest to reason about and keeps Gauntlet's own logic untouched. Battle
+  // Skills availability isn't a separate flag here: loadoutUnlocked only
+  // starts true when scene==='skills', and the boss-defeat unlock path never
+  // runs in scene mode (handleEnemyDefeated returns early), so the loadout
+  // stays naturally locked in every other scene without an extra check.
   const sceneAllowSkill = !scene || scene==='elements';
   const sceneIncludeTerrain = !scene || scene==='elements';
   const sceneRestrictBaseElements = scene==='elements';
@@ -2040,11 +2078,11 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const isCampaign = !!campaign;
 
   const initPlayer = () => newHero();
-  // Classes scene: a random Rank 1 Full Proxie (melee+element+class) instead
-  // of a plain goblin — "an even match" now that a promoted Agent can fight
-  // alongside the player, and the only scene where class play (and thus
-  // Agents) is actually reachable.
-  const initEnemy  = (p) => scene==='classes'
+  // Battle Skills scene: a random Rank 1 Full Proxie (melee+element+class)
+  // instead of a plain goblin — "an even match" now that a promoted Agent
+  // can fight alongside the player, and the only scene where loadout play
+  // (and thus Agents) is actually reachable.
+  const initEnemy  = (p) => scene==='skills'
     ? makeEnemyProxie(1, 1, rollBackRowPosition(0))
     : newGoblin(1, p.boardPosition);
 
@@ -2056,7 +2094,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const [campaignComplete, setCampaignComplete] = useState(false);
   const [craftingUnlocked, setCraftingUnlocked] = useState(false);
   const [showBattleComplete, setShowBattleComplete] = useState(false);
-  // Shown once, before Battle 1 — Campaign locks name/class/element up front
+  // Shown once, before Battle 1 — Campaign locks name/loadout/element up front
   // instead of Gauntlet's post-boss unlock or Training's free swapping.
   const [showCampaignIntro, setShowCampaignIntro] = useState(isCampaign);
   const [selectedEnemyId,  setSelectedEnemyId]  = useState(null);
@@ -2097,18 +2135,17 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // round start, the tile relocates to a fresh random spot and this resets.
   const [healingConsumed, setHealingConsumed] = useState(false);
 
-  // ── Summoner / class state (v4.0) ──
-  const [playerClass,    setPlayerClass]    = useState(null);   // null until unlocked+selected
-  const [classUnlocked,  setClassUnlocked]  = useState(scene==='classes');  // gate flag (post-boss, or immediate in the Classes scene)
-  const [sceneComplete,  setSceneComplete]  = useState(false);  // Training Mode: this scene's single enemy is down
-  const [showClassModal, setShowClassModal] = useState(false);  // unlock picker
+  // ── Battle Skills / loadout state ──
+  const [loadout,         setLoadout]         = useState([]);   // equipped non-baseline skill ids
+  const [loadoutUnlocked, setLoadoutUnlocked] = useState(scene==='skills');  // gate flag (post-boss, or immediate in the Battle Skills scene)
+  const [sceneComplete,   setSceneComplete]   = useState(false);  // Training Mode: this scene's single enemy is down
+  const [showLoadoutModal,setShowLoadoutModal]= useState(false);  // unlock picker
   // Landscape-only game: true when the viewport is taller than it is wide, which
   // triggers a rotate-your-device overlay (the 3-panel row needs the width).
   const [isPortrait, setIsPortrait] = useState(
     typeof window!=='undefined' ? window.innerHeight > window.innerWidth : false
   );
   const [summons,        setSummons]        = useState([]);     // active Novice summons
-  const [showMmModal,    setShowMmModal]    = useState(false);  // Mastermind mode picker
   // Deploy sub-flow state
   const [showDeploy,     setShowDeploy]     = useState(false);
   const [deployRolling,  setDeployRolling]  = useState(false);
@@ -2161,13 +2198,13 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     (enemies.some(e=>isAdjacent(player.boardPosition,e.boardPosition)) || summons.some(s=>s.side==='enemy'&&isAdjacent(player.boardPosition,s.boardPosition)));
   const canSkillMulti  = sceneAllowSkill && isPlayerTurn && energyPhase==='act' && !player.skillUsed && player.actionpts >= skillCost &&
     (elData?.isEarth||elData?.isAir||elData?.isWater ? true : enemies.some(e=>isAdjacent(player.boardPosition,e.boardPosition)));
-  // Mastermind: available to a Summoner during the act phase, once per turn,
-  // if at least 2 Energy is available (fixed activation cost). Gated by
-  // classSkillUsed (not skillUsed) — class and elemental skills are separate
-  // once-per-turn limits per the Codex.
-  const canMastermind = playerClass==='Summoner' && isPlayerTurn && energyPhase==='act' && !player.classSkillUsed && player.actionpts >= 2;
-  // Dark Web: Rogue's class ability, same once-per-turn class-skill gate.
-  const canDarkWeb = playerClass==='Rogue' && isPlayerTurn && energyPhase==='act' && !player.classSkillUsed && player.actionpts >= 2;
+  // Each loadout skill gets its own once-per-turn gate (usedSkillIds), not a
+  // single shared class-skill flag — a loadout can hold more than one
+  // Tactical Skill at a time, and each is independently usable once per
+  // turn if 2 Energy is available (fixed activation cost for both).
+  const canCompassSlash = loadout.includes('compassSlash') && isPlayerTurn && energyPhase==='act' && !player.usedSkillIds.includes('compassSlash') && player.actionpts >= 2;
+  const canCircuitSigil = loadout.includes('circuitSigil') && isPlayerTurn && energyPhase==='act' && !player.usedSkillIds.includes('circuitSigil') && player.actionpts >= 2;
+  const canDarkWeb = loadout.includes('darkWeb') && isPlayerTurn && energyPhase==='act' && !player.usedSkillIds.includes('darkWeb') && player.actionpts >= 2;
   // Rotate: 0 Energy, once per turn — a free facing change for tactical
   // repositioning (evade a flank, line up a ranged skill) without spending AP.
   const canRotate = isPlayerTurn && energyPhase==='act' && !player.rotateUsed;
@@ -2397,7 +2434,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setDiceRolls([]); setAbilities([]); setDicePhase('roll');
     setAccuracyRoll(null); setPendingAbility(null); setAirRange(null); setEarthRange(null); setWaterAoe(null);
     addLog(`=== Round ${nextRound} ===`);
-    const rP = { ...latestPlayer, actionpts:0, frozen:latestPlayer.frozen||0, skillUsed:false, rotateUsed:false, classSkillUsed:false };
+    const rP = { ...latestPlayer, actionpts:0, frozen:latestPlayer.frozen||0, skillUsed:false, rotateUsed:false, classSkillUsed:false, usedSkillIds:[] };
     const rE = { ...latestEnemy,  actionpts:0, frozen:latestEnemy.frozen||0, skillUsed:false,
       energyRollover: (latestEnemy.energyRollover||0) + (latestEnemy.actionpts||0) };
     setPlayer(rP);
@@ -2784,20 +2821,20 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setPlayer(leveled);
 
     const defeatedBoss = enemyTier(enemy.level).isBoss && enemy.level>=5;
-    if(defeatedBoss && !classUnlocked){
-      setClassUnlocked(true);
-      setTimeout(()=>setShowClassModal(true), 900);
-      addLog('=== A boss falls — new class path unlocked! ===');
+    if(defeatedBoss && !loadoutUnlocked){
+      setLoadoutUnlocked(true);
+      setTimeout(()=>setShowLoadoutModal(true), 900);
+      addLog('=== A boss falls — new loadout path unlocked! ===');
     }
-    setTimeout(()=>startNextWave(leveled), defeatedBoss && !classUnlocked ? 600 : 1400);
+    setTimeout(()=>startNextWave(leveled), defeatedBoss && !loadoutUnlocked ? 600 : 1400);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[enemy,addLog,applyLevelUp,classUnlocked,scene]);
+  },[enemy,addLog,applyLevelUp,loadoutUnlocked,scene]);
 
   const startNextWave = useCallback((curPlayer)=>{
     const nextWave = wave + 1;
     const enemyLevel = nextWave;
     const freshEnemy = newGoblin(enemyLevel, curPlayer.boardPosition);
-    const resetPlayer = { ...curPlayer, actionpts:0, frozen:0, skillUsed:false, rotateUsed:false, classSkillUsed:false, energyRollover:0,
+    const resetPlayer = { ...curPlayer, actionpts:0, frozen:0, skillUsed:false, rotateUsed:false, classSkillUsed:false, usedSkillIds:[], energyRollover:0,
       boardPosition: rollBackRowPosition(8) };
     const newTiles = makeTiles(resetPlayer.boardPosition, freshEnemy.boardPosition);
     setWave(nextWave);
@@ -3072,25 +3109,20 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setRotateTargeting(false);
   },[player,addLog]);
 
-  // ── MASTERMIND (Summoner skill) ──
+  // ── COMPASS SLASH (Tactical Skill) ──
   const deployTiles = getDeployTiles(tiles, player.boardPosition, enemy.boardPosition, summons);
   const activeSummonCount = summons.filter(s=>!s.promoted).length;
-  const canDeploy = activeSummonCount < BANDWIDTH && deployTiles.length > 0 && player.actionpts >= 2;
+  const canDeploy = canCircuitSigil && activeSummonCount < BANDWIDTH && deployTiles.length > 0;
   const deployBlockedReason = activeSummonCount>=BANDWIDTH ? `bandwidth full (${BANDWIDTH}/${BANDWIDTH})`
                             : deployTiles.length===0 ? 'no legal tiles on row 7'
                             : player.actionpts<2 ? 'need 2 Energy'
                             : '';
 
-  const handleMastermind = useCallback(()=>{
-    if(!canMastermind) return;
-    setShowMmModal(true);
-  },[canMastermind]);
-
-  const handlePickDirect = useCallback(()=>{
-    setShowMmModal(false);
+  const handleCompassSlash = useCallback(()=>{
+    if(!canCompassSlash) return;
     setCompassTargeting(true);
     addLog('// Compass Slash armed — click an adjacent tile (8-dir) where the enemy stands');
-  },[addLog]);
+  },[canCompassSlash,addLog]);
 
   const resolveCompassSlash = useCallback((targetTile)=>{
     if(!isAdjacent8(player.boardPosition,targetTile)){ addLog('// Target not in the 8 surrounding tiles'); return; }
@@ -3098,7 +3130,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setCompassTargeting(false);
     if(!hitsEnemy){
       addLog('// Compass Slash strikes empty tile — 2 Energy spent');
-      const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true};
+      const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2)},'compassSlash');
       routeAfterPlayerAction(updatedPlayer, enemy);
       return;
     }
@@ -3107,14 +3139,14 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const newHP=Math.max(0,enemy.health-dmg);
     addLog(`Compass Slash -> ${dmg} dmg (${newHP}/${enemy.maxHealth})`);
     triggerCastFx(enemy.boardPosition,'#9b6cff');
-    const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true,facing:slashFacing};
+    const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),facing:slashFacing},'compassSlash');
     const updatedEnemy={...enemy,health:newHP};
     if(newHP<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[player,enemy,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx]);
 
-  // ── DARK WEB (Rogue skill) ──
+  // ── DARK WEB (Tactical Skill) ──
   // Chess-knight strike pattern. Per Codex Protocols §V (Melee & Displacement):
   // a finishing blow claims the defeated unit's tile; a survived hit leaves
   // the attacker in place — same rule as ordinary melee.
@@ -3130,7 +3162,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setDarkWebTargeting(false);
     if(!hitsEnemy){
       addLog('// Dark Web strikes empty tile — 2 Energy spent');
-      const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true};
+      const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2)},'darkWeb');
       routeAfterPlayerAction(updatedPlayer, enemy);
       return;
     }
@@ -3141,24 +3173,30 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const updatedEnemy={...enemy,health:newHP};
     triggerCastFx(enemy.boardPosition,'#a0a0a0');
     if(newHP<=0){
-      // Finishing blow — Rogue claims the target's tile, same as a melee kill.
-      const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true,facing:strikeFacing,boardPosition:targetTile};
+      // Finishing blow — Dark Web claims the target's tile, same as a melee kill.
+      const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),facing:strikeFacing,boardPosition:targetTile},'darkWeb');
       addLog(`Dark Web -> ${dmg} dmg (${acc}% ${accuracyTierLabel(acc)}) — finishing blow, claims (${targetTile.x},${targetTile.y})`);
       setPlayer(updatedPlayer); setEnemy(updatedEnemy);
       handleEnemyDefeated(updatedPlayer,wave);
       return;
     }
     addLog(`Dark Web -> ${dmg} dmg (${acc}% ${accuracyTierLabel(acc)}) (${newHP}/${enemy.maxHealth})`);
-    const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true,facing:strikeFacing};
+    const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),facing:strikeFacing},'darkWeb');
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[player,enemy,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx]);
 
-  const handlePickDeploy = useCallback(()=>{
-    setShowMmModal(false);
+  // ── CIRCUIT SIGIL (Core Skill, crafting-locked — dormant until BATTLE_SKILLS
+  // drops the `locked` flag) ── canDeployMulti is defined later in the file
+  // (const, TDZ) — referenced only inside this handler's own body, invoked
+  // well after render completes, so the forward reference is safe; can't
+  // list it in deps without a TDZ crash at render time.
+  const handleCircuitSigil = useCallback(()=>{
+    if(!(isCampaign?canDeployMulti:canDeploy)) return;
     setShowDeploy(true);
     setDeployRoll(null); setDeployTier(null); setAwaitingPlacement(false);
-  },[]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[isCampaign,canDeploy]);
 
   const handleDeployRoll = useCallback(()=>{
     setDeployRolling(true);
@@ -3176,7 +3214,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(!legal){ addLog('// Illegal deploy tile'); return; }
     const s=makeSummon(deployTier, {x:tile.x,y:tile.y});
     setSummons(prev=>[...prev,s]);
-    const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true};
+    const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2)},'circuitSigil');
     addLog(`◈ ${s.name} deployed at (${tile.x},${tile.y}). Bandwidth ${summons.length+1}/${BANDWIDTH}.`);
     setShowDeploy(false); setAwaitingPlacement(false); setDeployRoll(null); setDeployTier(null);
     routeAfterPlayerAction(updatedPlayer, enemy);
@@ -3187,21 +3225,32 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setShowDeploy(false); setAwaitingPlacement(false); setDeployRoll(null); setDeployTier(null);
   },[]);
 
-  const handleSelectClass = useCallback((classId)=>{
-    // Training Mode's Classes scene allows re-opening this picker to swap at
-    // will — clear any class-specific state (active summons, class skill
-    // usage) so a fresh class starts clean. No-op impact on Gauntlet, where
-    // this only ever fires once with playerClass still null.
-    const isSwitch = !!playerClass && playerClass!==classId;
-    setPlayerClass(classId);
-    setShowClassModal(false);
+  // Toggles one Tactical Skill in the loadout (up to TACTICAL_SKILL_CAP);
+  // Core Skills aren't toggled here since Melee is baseline and Circuit
+  // Sigil stays locked until Crafting exists.
+  const handleToggleLoadoutSkill = useCallback((skillId)=>{
+    setLoadout(prev=>{
+      if(prev.includes(skillId)) return prev.filter(id=>id!==skillId);
+      const tacticalCount = prev.filter(id=>BATTLE_SKILLS.find(s=>s.id===id)?.category==='tactical').length;
+      if(tacticalCount>=TACTICAL_SKILL_CAP) return prev;
+      return [...prev,skillId];
+    });
+  },[]);
+
+  const handleConfirmLoadout = useCallback(()=>{
+    // Training Mode's Battle Skills scene allows re-opening this picker to
+    // swap at will — clear summons (a mid-battle skill swap shouldn't carry
+    // stray Novices from a skill you may have just unequipped) and each
+    // skill's used-this-turn flag so the fresh loadout starts clean. No-op
+    // impact on Gauntlet, where this only ever fires once.
+    setShowLoadoutModal(false);
     setSummons([]);
     setSelectedSummonId(null);
-    setPlayer(p=>({...p, classSkillUsed:false}));
-    const meta=UNLOCKABLE_CLASSES.find(c=>c.id===classId);
-    addLog(`=== Class ${isSwitch?'switched to':'equipped'}: ${meta?meta.name:classId}! ===`);
-    showReward(`<h2 style="color:#9b6cff;letter-spacing:.1em">${isSwitch?'CLASS SWITCHED':'CLASS UNLOCKED'}</h2><p style="font-size:1.3rem;margin:10px 0;color:#b08cff">${meta?meta.icon+' '+meta.name:classId}</p><p style="color:#8ab5cc;font-size:.85rem;max-width:320px">${meta?meta.blurb:''}</p>`,3500);
-  },[addLog,showReward,playerClass]);
+    setPlayer(p=>({...p, usedSkillIds:[]}));
+    const names = loadout.map(id=>BATTLE_SKILLS.find(s=>s.id===id)?.name).filter(Boolean).join(', ') || 'Melee only';
+    addLog(`=== Loadout equipped: ${names}! ===`);
+    showReward(`<h2 style="color:#9b6cff;letter-spacing:.1em">LOADOUT EQUIPPED</h2><p style="font-size:1.1rem;margin:10px 0;color:#b08cff">${names}</p>`,3500);
+  },[addLog,showReward,loadout]);
 
   // ══════════════════════════════════════════════════════════════════════════
   // ── CAMPAIGN MODE ENGINE (multi-enemy) ──
@@ -3222,7 +3271,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setDiceRolls([]); setAbilities([]); setDicePhase('roll');
     setAccuracyRoll(null); setPendingAbility(null); setAirRange(null); setEarthRange(null); setWaterAoe(null);
     addLog(`=== Round ${nextRound} ===`);
-    const rP = { ...latestPlayer, actionpts:0, frozen:latestPlayer.frozen||0, skillUsed:false, rotateUsed:false, classSkillUsed:false };
+    const rP = { ...latestPlayer, actionpts:0, frozen:latestPlayer.frozen||0, skillUsed:false, rotateUsed:false, classSkillUsed:false, usedSkillIds:[] };
     const rEnemies = latestEnemies.map(e=>({ ...e, actionpts:0, frozen:e.frozen||0, skillUsed:false, classSkillUsed:false,
       energyRollover:(e.energyRollover||0)+(e.actionpts||0) }));
     setPlayer(rP);
@@ -3600,7 +3649,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
 
   const startNextCampaignBattle = useCallback((curPlayer, nextStage)=>{
     const battle = CAMPAIGN_BATTLES[nextStage-1];
-    const resetPlayer = { ...curPlayer, actionpts:0, frozen:0, skillUsed:false, rotateUsed:false, classSkillUsed:false, energyRollover:0,
+    const resetPlayer = { ...curPlayer, actionpts:0, frozen:0, skillUsed:false, rotateUsed:false, classSkillUsed:false, usedSkillIds:[], energyRollover:0,
       boardPosition: rollBackRowPosition(8) };
     const freshEnemies = spawnCampaignRoster(nextStage, resetPlayer.boardPosition);
     const newTiles = makeTiles(resetPlayer.boardPosition, {x:-1,y:-1}, freshEnemies.map(e=>e.boardPosition));
@@ -3622,14 +3671,15 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     addLog(`=== Battle ${nextStage}/3 — ${battle.name} ===`);
   },[addLog]);
 
-  const handleCampaignIntroSubmit = useCallback((name, cls, element)=>{
+  const handleCampaignIntroSubmit = useCallback((name, pickedLoadout, element)=>{
     setPlayer(p=>({...p, name}));
-    setPlayerClass(cls);
-    setClassUnlocked(true);
+    setLoadout(pickedLoadout);
+    setLoadoutUnlocked(true);
     setSelCategory('base');
     setSelElement(element);
     setShowCampaignIntro(false);
-    addLog(`=== ${name} deployed — ${cls} · ${element} ===`);
+    const skillNames = pickedLoadout.map(id=>BATTLE_SKILLS.find(s=>s.id===id)?.name).filter(Boolean).join(', ');
+    addLog(`=== ${name} deployed — ${skillNames} · ${element} ===`);
   },[addLog]);
 
   const handleRollEnergyMulti = useCallback(()=>{
@@ -3832,9 +3882,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     applySkillResultMulti(target, dmg, updatedPlayer, {}, ELEMENTS.base.Water.color);
   },[diceRolls,player,tiles,waterAoe,enemies,addLog,resetDiceModal,applySkillResultMulti]);
 
-  // ── Mastermind / Dark Web targeting resolution ──
+  // ── Compass Slash / Dark Web targeting resolution ──
   const deployTilesMulti = getDeployTiles(tiles, player.boardPosition, enemies.map(e=>e.boardPosition), summons);
-  const canDeployMulti = summons.filter(s=>s.side==='player'&&!s.promoted).length < BANDWIDTH && deployTilesMulti.length > 0 && player.actionpts >= 2;
+  const canDeployMulti = canCircuitSigil && summons.filter(s=>s.side==='player'&&!s.promoted).length < BANDWIDTH && deployTilesMulti.length > 0;
   const deployBlockedReasonMulti = summons.filter(s=>s.side==='player'&&!s.promoted).length>=BANDWIDTH ? `bandwidth full (${BANDWIDTH}/${BANDWIDTH})`
                             : deployTilesMulti.length===0 ? 'no legal tiles on row 7'
                             : player.actionpts<2 ? 'need 2 Energy'
@@ -3846,13 +3896,13 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setCompassTargeting(false);
     if(!target){
       addLog('// Compass Slash strikes empty tile — 2 Energy spent');
-      routeAfterPlayerActionMulti({...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true}, enemies);
+      routeAfterPlayerActionMulti(markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2)},'compassSlash'), enemies);
       return;
     }
     const dmg=60;
     const slashFacing=facingToward(player.boardPosition,targetTile);
     addLog(`Compass Slash -> ${dmg} dmg`);
-    const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true,facing:slashFacing};
+    const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),facing:slashFacing},'compassSlash');
     applySkillResultMulti(target, dmg, updatedPlayer, {}, '#9b6cff');
   },[player,enemies,addLog,applySkillResultMulti,routeAfterPlayerActionMulti]);
 
@@ -3862,14 +3912,14 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setDarkWebTargeting(false);
     if(!target){
       addLog('// Dark Web strikes empty tile — 2 Energy spent');
-      routeAfterPlayerActionMulti({...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true}, enemies);
+      routeAfterPlayerActionMulti(markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2)},'darkWeb'), enemies);
       return;
     }
     const acc=rollD100Accuracy();
     const dmg=applyAccuracy(70,acc);
     const strikeFacing=facingToward(player.boardPosition,targetTile);
     const newHP=Math.max(0,target.health-dmg);
-    let updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true,facing:strikeFacing};
+    let updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),facing:strikeFacing},'darkWeb');
     if(newHP<=0) updatedPlayer={...updatedPlayer,boardPosition:targetTile};
     addLog(`Dark Web -> ${dmg} dmg (${acc}% ${accuracyTierLabel(acc)})${newHP<=0?' — finishing blow, claims tile':''}`);
     applySkillResultMulti(target, dmg, updatedPlayer, {}, '#a0a0a0');
@@ -3880,7 +3930,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(!legal){ addLog('// Illegal deploy tile'); return; }
     const s=makeSummon(deployTier,{x:tile.x,y:tile.y},'player',null);
     setSummons(prev=>[...prev,s]);
-    const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),classSkillUsed:true};
+    const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2)},'circuitSigil');
     addLog(`◈ ${s.name} deployed at (${tile.x},${tile.y}).`);
     setShowDeploy(false); setAwaitingPlacement(false); setDeployRoll(null); setDeployTier(null);
     routeAfterPlayerActionMulti(updatedPlayer, enemies);
@@ -4145,11 +4195,11 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const didInitRef = useRef(false);
   useEffect(()=>{ didInitRef.current=true; },[]);
 
-  // Classes scene: surface the class picker immediately on entry rather than
-  // requiring a boss defeat — the whole point of this scene is trying classes
-  // out with no grind.
+  // Battle Skills scene: surface the loadout picker immediately on entry
+  // rather than requiring a boss defeat — the whole point of this scene is
+  // trying skills out with no grind.
   useEffect(()=>{
-    if(scene==='classes') setShowClassModal(true);
+    if(scene==='skills') setShowLoadoutModal(true);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[]);
 
@@ -4157,8 +4207,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // screen elsewhere in the app) that isn't otherwise able to see this
   // component's internal state. No-op if no callback was passed in.
   useEffect(()=>{
-    onStateSync?.({ player, playerClass, wave, hexas, craftingUnlocked });
-  },[player, playerClass, wave, hexas, craftingUnlocked, onStateSync]);
+    onStateSync?.({ player, loadout, wave, hexas, craftingUnlocked });
+  },[player, loadout, wave, hexas, craftingUnlocked, onStateSync]);
 
   // Track viewport orientation so the rotate prompt reacts to resize/rotation.
   useEffect(()=>{
@@ -4240,7 +4290,11 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
             {!scene&&!isCampaign&&<span style={{color:'#7a9db5'}}>Wave <span style={{color:'#00c8ff',fontWeight:'bold'}}>{wave}</span></span>}
             <span style={{color:'#7a9db5'}}>Round <span style={{color:'#00c8ff',fontWeight:'bold'}}>{round}</span></span>
             {!scene&&<span style={{color:'#7a9db5'}}>Hexas <span style={{color:'#ffd700',fontWeight:'bold'}}>{hexas}</span></span>}
-            {playerClass&&(()=>{const m=UNLOCKABLE_CLASSES.find(c=>c.id===playerClass);return <span style={{color:m.color,fontWeight:'bold',display:'flex',alignItems:'center',gap:3}}>{m.icon}{m.name}</span>;})()}
+            {loadout.length>0&&(
+              <span style={{display:'flex',alignItems:'center',gap:8}}>
+                {loadout.map(id=>{const m=BATTLE_SKILLS.find(s=>s.id===id); return m ? <span key={id} style={{color:m.color,fontWeight:'bold',display:'flex',alignItems:'center',gap:3}}>{m.icon}{m.name}</span> : null;})}
+              </span>
+            )}
           </div>
         </div>
 
@@ -4273,8 +4327,10 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
                 enemies={isCampaign?enemies:undefined} enemyRolledEnergyById={enemyRolledEnergyById}
                 selectedEnemyId={selectedEnemyId} onSelectEnemy={setSelectedEnemyId}
                 isPlayerTurn={isPlayerTurn}
-                playerClass={playerClass} summons={summons}
-                canMastermind={canMastermind} onMastermind={handleMastermind}
+                loadout={loadout} summons={summons}
+                canCompassSlash={canCompassSlash} onCompassSlash={handleCompassSlash}
+                canCircuitSigil={canCircuitSigil} onCircuitSigil={handleCircuitSigil}
+                circuitSigilReason={isCampaign?deployBlockedReasonMulti:deployBlockedReason}
                 canRotate={canRotate} onRotate={handleRotateOpen}
                 canDarkWeb={canDarkWeb} onDarkWeb={handleDarkWeb}
                 hideElementalSkill={!sceneAllowSkill} restrictElementsToBase={sceneRestrictBaseElements}
@@ -4342,17 +4398,22 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
                 <div style={{color:'#ff6644',fontWeight:'bold',marginBottom:4}}>Skills</div>
                 Once per round. Fire (3E pulses), Earth (1+tiles, ranged line, min {RANGED_SKILL_MIN_DMG} dmg on hit), Air (2E, knockback, min {RANGED_SKILL_MIN_DMG} dmg on hit), Water (2/6/10, AoE matrix). Roll locks for the round. Accuracy d100: ≥79 full · 40–78 half · under 40 quarter.
               </div>
-              {playerClass==='Summoner'&&(
+              {loadout.includes('compassSlash')&&(
                 <div style={{borderLeft:'2px solid #9b6cff',paddingLeft:10}}>
-                  <div style={{color:'#b08cff',fontWeight:'bold',marginBottom:4}}>🜨 Mastermind <span style={{fontSize:'9px',color:'#5a7a8a'}}>(2E, 1/turn)</span></div>
-                  <strong style={{color:'#c9b3ff'}}>Direct:</strong> Compass Slash — 60 dmg to any of 8 surrounding tiles.<br/>
-                  <strong style={{color:'#c9b3ff'}}>Deploy:</strong> Circuit Sigil d100 → Bug (1–34) / Virus (35–67) / Malware (68–100). Places a Novice on row 7. Bandwidth {BANDWIDTH}.<br/>
+                  <div style={{color:'#b08cff',fontWeight:'bold',marginBottom:4}}>⊕ Compass Slash <span style={{fontSize:'9px',color:'#5a7a8a'}}>(Tactical, 2E, 1/turn)</span></div>
+                  60 dmg to any of the 8 surrounding tiles.
+                </div>
+              )}
+              {loadout.includes('circuitSigil')&&(
+                <div style={{borderLeft:'2px solid #9b6cff',paddingLeft:10}}>
+                  <div style={{color:'#b08cff',fontWeight:'bold',marginBottom:4}}>◈ Circuit Sigil <span style={{fontSize:'9px',color:'#5a7a8a'}}>(Core, 2E, 1/turn)</span></div>
+                  d100 → Bug (1–34) / Virus (35–67) / Malware (68–100). Places a Novice on row 7. Bandwidth {BANDWIDTH}.<br/>
                   <span style={{color:'#5a7a8a'}}>Turn order with summons: Summons → Enemy → You. Summons march forward; reaching the back row promotes to Agent (staged).</span>
                 </div>
               )}
-              {playerClass==='Rogue'&&(
+              {loadout.includes('darkWeb')&&(
                 <div style={{borderLeft:'2px solid #a0a0a0',paddingLeft:10}}>
-                  <div style={{color:'#c8c8c8',fontWeight:'bold',marginBottom:4}}>⚔ Dark Web <span style={{fontSize:'9px',color:'#5a7a8a'}}>(2E, 1/turn)</span></div>
+                  <div style={{color:'#c8c8c8',fontWeight:'bold',marginBottom:4}}>✕ Dark Web <span style={{fontSize:'9px',color:'#5a7a8a'}}>(Tactical, 2E, 1/turn)</span></div>
                   Strikes any of the 8 knight-move tiles (chess-knight L-pattern) — bypasses adjacent defenders entirely. 70 base dmg, accuracy roll applies. A finishing blow claims the target's tile, same as any melee kill; a survived hit leaves you in place.
                 </div>
               )}
@@ -4379,11 +4440,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         waterAnchorInBounds={waterAnchorInBounds} waterEnemyInFootprint={waterEnemyInFootprint}
         playerFacing={player.facing} enemyDistance={enemyDistanceForAir}
       />
-      <ClassUnlockModal show={showClassModal} onSelect={handleSelectClass} onClose={()=>setShowClassModal(false)} freeSelect={scene==='classes'} />
-      <MastermindModeModal
-        show={showMmModal} canDeploy={isCampaign?canDeployMulti:canDeploy} deployReason={isCampaign?deployBlockedReasonMulti:deployBlockedReason}
-        onPickDirect={handlePickDirect} onPickDeploy={handlePickDeploy} onClose={()=>setShowMmModal(false)}
-      />
+      <LoadoutModal show={showLoadoutModal} loadout={loadout} onToggle={handleToggleLoadoutSkill} onConfirm={handleConfirmLoadout} onClose={()=>setShowLoadoutModal(false)} freeSelect={scene==='skills'} />
       <DeployRollModal
         show={showDeploy} rolling={deployRolling} roll={deployRoll} tier={deployTier}
         awaitingPlacement={awaitingPlacement} onRoll={handleDeployRoll} onClose={handleCloseDeploy}
@@ -4401,13 +4458,14 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       />
       <CampaignIntroModal show={isCampaign&&showCampaignIntro} onSubmit={handleCampaignIntroSubmit} />
 
-      {/* Change Class — Training Mode's Classes scene only, lets the player
-          reopen the picker and swap freely instead of a one-time choice. */}
-      {scene==='classes'&&!showClassModal&&!sceneComplete&&(
+      {/* Change Loadout — Training Mode's Battle Skills scene only, lets the
+          player reopen the picker and swap freely instead of a one-time
+          choice. */}
+      {scene==='skills'&&!showLoadoutModal&&!sceneComplete&&(
         <div style={{position:'fixed',bottom:20,left:'50%',transform:'translateX(-50%)',zIndex:1500}}>
-          <button onClick={()=>setShowClassModal(true)}
+          <button onClick={()=>setShowLoadoutModal(true)}
             style={{padding:'9px 18px',background:'rgba(155,108,255,0.16)',border:'1px solid #9b6cff',borderRadius:8,color:'#b08cff',fontSize:12,fontWeight:700,letterSpacing:'0.08em',textTransform:'uppercase',cursor:'pointer',fontFamily:"'Rajdhani',sans-serif",boxShadow:'0 0 20px rgba(155,108,255,0.3)'}}>
-            ⇄ Change Class
+            ⇄ Change Loadout
           </button>
         </div>
       )}
