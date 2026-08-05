@@ -62,6 +62,11 @@ function App() {
     setScreen('start')
   },[])
 
+  const handleGauntletQuit = useCallback(()=>{
+    setGauntletStarted(false)
+    setScreen('start')
+  },[])
+
   const startScene = useCallback((sceneId)=>{
     setActiveScene(sceneId)
     setSceneNonce(n=>n+1)
@@ -106,7 +111,7 @@ function App() {
           instead of restarting the session. */}
       {gauntletStarted && (
         <div style={{display: screen==='gauntlet' ? 'block' : 'none'}}>
-          <GridBattlerGame onStateSync={setLiveState} />
+          <GridBattlerGame onStateSync={setLiveState} onQuit={handleGauntletQuit} />
           <FloatingMenuButton onNavigate={goTo} />
         </div>
       )}
@@ -125,7 +130,7 @@ function App() {
           is a fresh instance (key forces remount even on replaying the same
           scene), since these are repeatable lessons, not sessions to resume. */}
       {screen==='trainingScene' && (
-        <GridBattlerGame key={`${activeScene}-${sceneNonce}`} scene={activeScene} onSceneComplete={handleSceneComplete} />
+        <GridBattlerGame key={`${activeScene}-${sceneNonce}`} scene={activeScene} onSceneComplete={handleSceneComplete} onQuit={()=>setScreen('training')} />
       )}
 
       {screen!=='gauntlet' && screen!=='campaign' && screen!=='trainingScene' && (

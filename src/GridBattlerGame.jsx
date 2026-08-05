@@ -2119,7 +2119,7 @@ const CampaignBattleCompleteModal = ({show, isFinale, battle, nextBattle, equipm
 };
 // ─── MAIN GAME COMPONENT ───────────────────────────────────────────────────────
 
-export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, campaign, onCampaignComplete } = {}) {
+export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, campaign, onCampaignComplete, onQuit } = {}) {
   // Training Mode scene config. `scene` is undefined for normal Gauntlet play
   // (every flag below defaults to current behavior). Each scene isolates one
   // new mechanic on top of core movement/melee rather than accumulating —
@@ -2982,6 +2982,10 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   },[player,enemy,summons,round,addLog,runEnemyTurn]);
 
   const handleSurrender = useCallback(()=>{
+    // Quitting leaves the mode entirely — hand off to the parent (returns to
+    // the main screen and unmounts this session) rather than just resetting
+    // in place to a fresh instance of the same mode.
+    if(onQuit){ onQuit(); return; }
     addLog('=== You surrendered. Restarting... ===');
     const p=initPlayer();
     const e=initEnemy(p);
@@ -2995,7 +2999,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setSummonPhaseActive(false); setSelectedSummonId(null);
     setLogs(['=== Battle Initiated ===','Move adjacent to attack. Position for bonuses.']);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[addLog]);
+  },[addLog,onQuit]);
   // ── SKILL / DICE FLOW ──
   const resetDiceModal = useCallback(()=>{
     setShowDice(false); setDiceRolls([]); setAbilities([]); setDicePhase('roll');
