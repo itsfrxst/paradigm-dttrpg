@@ -962,6 +962,12 @@ export const BATTLE_SKILLS = [
     blurb:'Moves and attacks in an L-pattern, like a chess knight — striking any of 8 offset tiles, bypassing adjacent defenders entirely. 70 base damage, 2 Energy, once per turn. A finishing blow claims the target\'s tile, same as any melee kill.',
   },
 ];
+// A skill is available once it's either not gated at all, or has been
+// learned through Crafting (see CraftingScreen.jsx / App's craftedSkillIds).
+// `locked` on the BATTLE_SKILLS entry itself never changes — it just marks
+// "this one needs Crafting" — so unlock status is always derived here rather
+// than mutated in place.
+export const isSkillUnlocked = (skill, craftedSkillIds=[]) => !skill.locked || craftedSkillIds.includes(skill.id);
 // ─── UI COMPONENTS ─────────────────────────────────────────────────────────────
 
 const StatLine = ({label,value,accent}) => (
@@ -1024,11 +1030,12 @@ const PanelTitle = ({children,icon}) => (
 // the caller so the same component works for Gauntlet's post-boss unlock,
 // Training's free-swap scene, and (as a picker for Campaign's own intro
 // modal) skill selection.
-const LoadoutModal = ({show, loadout, onToggle, onConfirm, onClose, freeSelect}) => {
+const LoadoutModal = ({show, loadout, onToggle, onConfirm, onClose, freeSelect, craftedSkillIds=[]}) => {
   if(!show) return null;
   const core = BATTLE_SKILLS.filter(s=>s.category==='core');
   const tactical = BATTLE_SKILLS.filter(s=>s.category==='tactical');
   const tacticalCount = loadout.filter(id=>tactical.some(s=>s.id===id)).length;
+  const coreCount = loadout.filter(id=>core.some(s=>s.id===id)).length;
   return (
     <div onClick={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.85)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:4000}}>
       <div onClick={e=>e.stopPropagation()} style={{background:'#080e14',border:'2px solid #9b6cff',borderRadius:12,padding:'1.6rem',maxWidth:460,width:'92%',maxHeight:'85vh',overflowY:'auto',color:'#b0dff4',boxShadow:'0 0 50px rgba(155,108,255,0.4)'}}>
@@ -1039,22 +1046,45 @@ const LoadoutModal = ({show, loadout, onToggle, onConfirm, onClose, freeSelect})
         </div>
 
         <div style={{fontSize:'10px',color:'#3a5a6a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:8}}>Core Skills (max {CORE_SKILL_CAP})</div>
-        {core.map(s=>(
-          <div key={s.id}
-            style={{background:'#0a1218',border:`1px solid ${s.color}44`,borderRadius:8,padding:'12px 14px',marginBottom:8,opacity:s.locked?0.6:1}}>
-            <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:4}}>
-              <span style={{fontSize:'18px'}}>{s.icon}</span>
-              <div style={{flex:1}}>
-                <div style={{fontSize:'13px',fontWeight:'bold',color:s.color}}>{s.name}</div>
-                <div style={{fontSize:'10px',color:'#7a9db5'}}>{s.tagline}</div>
+        {core.map(s=>{
+          // Baseline (Melee) is always-on and not part of the pick; a locked
+          // Core skill is informational until Crafting unlocks it; once
+          // unlocked it toggles just like a Tactical skill.
+          if(s.baseline || !isSkillUnlocked(s, craftedSkillIds)){
+            return (
+              <div key={s.id}
+                style={{background:'#0a1218',border:`1px solid ${s.color}44`,borderRadius:8,padding:'12px 14px',marginBottom:8,opacity:s.locked?0.6:1}}>
+                <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:4}}>
+                  <span style={{fontSize:'18px'}}>{s.icon}</span>
+                  <div style={{flex:1}}>
+                    <div style={{fontSize:'13px',fontWeight:'bold',color:s.color}}>{s.name}</div>
+                    <div style={{fontSize:'10px',color:'#7a9db5'}}>{s.tagline}</div>
+                  </div>
+                  <span style={{fontSize:'10px',color:s.locked?'#ff8866':'#66dd88',fontWeight:'bold',letterSpacing:'0.05em'}}>
+                    {s.locked ? `🔒 ${s.unlockHint}` : 'EQUIPPED'}
+                  </span>
+                </div>
+                <div style={{fontSize:'10px',color:'#8ab5cc',lineHeight:1.5}}>{s.blurb}</div>
               </div>
-              <span style={{fontSize:'10px',color:s.locked?'#ff8866':'#66dd88',fontWeight:'bold',letterSpacing:'0.05em'}}>
-                {s.locked ? `🔒 ${s.unlockHint}` : 'EQUIPPED'}
-              </span>
+            );
+          }
+          const picked = loadout.includes(s.id);
+          const disabled = !picked && coreCount>=CORE_SKILL_CAP;
+          return (
+            <div key={s.id} onClick={()=>!disabled&&onToggle(s.id)}
+              style={{background:'#0a1218',border:`1px solid ${picked?s.color:disabled?'#1e3a4a':`${s.color}66`}`,borderRadius:8,padding:'12px 14px',marginBottom:8,cursor:disabled?'not-allowed':'pointer',opacity:disabled?0.5:1,boxShadow:picked?`0 0 12px ${s.color}55`:'none',transition:'border-color 0.15s'}}>
+              <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:4}}>
+                <span style={{fontSize:'18px'}}>{s.icon}</span>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:'13px',fontWeight:'bold',color:s.color}}>{s.name}</div>
+                  <div style={{fontSize:'10px',color:'#7a9db5'}}>{s.tagline}</div>
+                </div>
+                {picked&&<span style={{fontSize:'14px',color:s.color}}>✓</span>}
+              </div>
+              <div style={{fontSize:'10px',color:'#8ab5cc',lineHeight:1.5}}>{s.blurb}</div>
             </div>
-            <div style={{fontSize:'10px',color:'#8ab5cc',lineHeight:1.5}}>{s.blurb}</div>
-          </div>
-        ))}
+          );
+        })}
 
         <div style={{fontSize:'10px',color:'#3a5a6a',textTransform:'uppercase',letterSpacing:'0.1em',margin:'14px 0 8px'}}>Tactical Skills — pick up to {TACTICAL_SKILL_CAP}</div>
         {tactical.map(s=>{
@@ -1095,7 +1125,7 @@ const LoadoutModal = ({show, loadout, onToggle, onConfirm, onClose, freeSelect})
 // (loadout unlocks after a boss kill) and Training's Battle Skills scene
 // (free swapping), Campaign locks these choices in up front, like loading
 // into a real run.
-const CampaignIntroModal = ({show, onSubmit}) => {
+const CampaignIntroModal = ({show, onSubmit, craftedSkillIds=[]}) => {
   const [name, setName] = useState('');
   const [loadout, setLoadout] = useState([]);
   const [element, setElement] = useState(null);
@@ -1103,8 +1133,21 @@ const CampaignIntroModal = ({show, onSubmit}) => {
   const canSubmit = name.trim().length>0 && loadout.length>0 && element;
   const elMeta = element ? ELEMENTS.base[element] : null;
   const tactical = BATTLE_SKILLS.filter(s=>s.category==='tactical');
-  const toggleSkill = (id) => setLoadout(prev=>prev.includes(id) ? prev.filter(x=>x!==id)
-    : prev.length<TACTICAL_SKILL_CAP ? [...prev,id] : prev);
+  // Crafted Core skills (Circuit Sigil once learned) are selectable here too
+  // — baseline Melee is excluded since it's always equipped, not a pick.
+  const availableCore = BATTLE_SKILLS.filter(s=>s.category==='core' && !s.baseline && isSkillUnlocked(s, craftedSkillIds));
+  const tacticalCount = loadout.filter(id=>tactical.some(s=>s.id===id)).length;
+  const coreCount = loadout.filter(id=>availableCore.some(s=>s.id===id)).length;
+  const toggleSkill = (id) => {
+    const skill = BATTLE_SKILLS.find(s=>s.id===id);
+    if(!skill) return;
+    setLoadout(prev=>{
+      if(prev.includes(id)) return prev.filter(x=>x!==id);
+      const cap = skill.category==='core' ? CORE_SKILL_CAP : TACTICAL_SKILL_CAP;
+      const count = skill.category==='core' ? coreCount : tacticalCount;
+      return count<cap ? [...prev,id] : prev;
+    });
+  };
   return (
     <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.9)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:5000,padding:'2rem'}}>
       <div style={{background:'#080e14',border:'2px solid #cc4422',borderRadius:12,padding:'1.6rem',maxWidth:520,width:'100%',maxHeight:'90vh',overflowY:'auto',color:'#b0dff4',boxShadow:'0 0 50px rgba(204,68,34,0.4)'}}>
@@ -1124,11 +1167,32 @@ const CampaignIntroModal = ({show, onSubmit}) => {
             style={{width:'100%',padding:'9px 12px',background:'#0a1218',border:'1px solid #1e3a4a',borderRadius:6,color:'#b0dff4',fontSize:14,fontFamily:"'Rajdhani',sans-serif"}} />
         </div>
 
+        {availableCore.length>0&&(
+          <div style={{marginBottom:16}}>
+            <div style={{fontSize:'10px',color:'#3a5a6a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:6}}>Loadout — Core Skills (pick up to {CORE_SKILL_CAP})</div>
+            {availableCore.map(s=>{
+              const picked = loadout.includes(s.id);
+              const disabled = !picked && coreCount>=CORE_SKILL_CAP;
+              return (
+                <div key={s.id} onClick={()=>!disabled&&toggleSkill(s.id)}
+                  style={{background:'#0a1218',border:`1px solid ${picked?s.color:s.color+'44'}`,borderRadius:8,padding:'10px 12px',marginBottom:8,cursor:disabled?'not-allowed':'pointer',opacity:disabled?0.5:1,boxShadow:picked?`0 0 12px ${s.color}55`:'none'}}>
+                  <div style={{display:'flex',alignItems:'center',gap:8}}>
+                    <span style={{fontSize:18}}>{s.icon}</span>
+                    <span style={{fontSize:13,fontWeight:'bold',color:s.color}}>{s.name}</span>
+                    <span style={{fontSize:10,color:'#7a9db5',marginLeft:'auto'}}>{s.tagline}</span>
+                    {picked&&<span style={{fontSize:14,color:s.color}}>✓</span>}
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
         <div style={{marginBottom:16}}>
           <div style={{fontSize:'10px',color:'#3a5a6a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:6}}>Loadout — Tactical Skills (pick up to {TACTICAL_SKILL_CAP})</div>
           {tactical.map(s=>{
             const picked = loadout.includes(s.id);
-            const disabled = !picked && loadout.length>=TACTICAL_SKILL_CAP;
+            const disabled = !picked && tacticalCount>=TACTICAL_SKILL_CAP;
             return (
               <div key={s.id} onClick={()=>!disabled&&toggleSkill(s.id)}
                 style={{background:'#0a1218',border:`1px solid ${picked?s.color:s.color+'44'}`,borderRadius:8,padding:'10px 12px',marginBottom:8,cursor:disabled?'not-allowed':'pointer',opacity:disabled?0.5:1,boxShadow:picked?`0 0 12px ${s.color}55`:'none'}}>
@@ -2119,7 +2183,7 @@ const CampaignBattleCompleteModal = ({show, isFinale, battle, nextBattle, equipm
 };
 // ─── MAIN GAME COMPONENT ───────────────────────────────────────────────────────
 
-export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, campaign, onCampaignComplete, onQuit } = {}) {
+export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, campaign, onCampaignComplete, onQuit, craftedSkillIds = [] } = {}) {
   // Training Mode scene config. `scene` is undefined for normal Gauntlet play
   // (every flag below defaults to current behavior). Each scene isolates one
   // new mechanic on top of core movement/melee rather than accumulating —
@@ -3302,14 +3366,17 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setShowDeploy(false); setAwaitingPlacement(false); setDeployRoll(null); setDeployTier(null);
   },[]);
 
-  // Toggles one Tactical Skill in the loadout (up to TACTICAL_SKILL_CAP);
-  // Core Skills aren't toggled here since Melee is baseline and Circuit
-  // Sigil stays locked until Crafting exists.
+  // Toggles one skill in the loadout, capped per-category (Tactical vs the
+  // now-craftable Core skills beyond baseline Melee — Melee itself is never
+  // toggled here since it's always equipped).
   const handleToggleLoadoutSkill = useCallback((skillId)=>{
     setLoadout(prev=>{
       if(prev.includes(skillId)) return prev.filter(id=>id!==skillId);
-      const tacticalCount = prev.filter(id=>BATTLE_SKILLS.find(s=>s.id===id)?.category==='tactical').length;
-      if(tacticalCount>=TACTICAL_SKILL_CAP) return prev;
+      const skill = BATTLE_SKILLS.find(s=>s.id===skillId);
+      if(!skill) return prev;
+      const cap = skill.category==='core' ? CORE_SKILL_CAP : TACTICAL_SKILL_CAP;
+      const count = prev.filter(id=>BATTLE_SKILLS.find(s=>s.id===id)?.category===skill.category).length;
+      if(count>=cap) return prev;
       return [...prev,skillId];
     });
   },[]);
@@ -4542,7 +4609,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         waterAnchorInBounds={waterAnchorInBounds} waterEnemyInFootprint={waterEnemyInFootprint}
         playerFacing={player.facing} enemyDistance={enemyDistanceForAir}
       />
-      <LoadoutModal show={showLoadoutModal} loadout={loadout} onToggle={handleToggleLoadoutSkill} onConfirm={handleConfirmLoadout} onClose={()=>setShowLoadoutModal(false)} freeSelect={scene==='skills'} />
+      <LoadoutModal show={showLoadoutModal} loadout={loadout} onToggle={handleToggleLoadoutSkill} onConfirm={handleConfirmLoadout} onClose={()=>setShowLoadoutModal(false)} freeSelect={scene==='skills'} craftedSkillIds={craftedSkillIds} />
       <DeployRollModal
         show={showDeploy} rolling={deployRolling} roll={deployRoll} tier={deployTier}
         awaitingPlacement={awaitingPlacement} onRoll={handleDeployRoll} onClose={handleCloseDeploy}
@@ -4566,7 +4633,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         onContinue={()=>{ setShowBattleComplete(false); startNextCampaignBattle(player, campaignBattle+1); }}
         onFinish={()=>{ setShowBattleComplete(false); onCampaignComplete?.(); }}
       />
-      <CampaignIntroModal show={isCampaign&&showCampaignIntro} onSubmit={handleCampaignIntroSubmit} />
+      <CampaignIntroModal show={isCampaign&&showCampaignIntro} onSubmit={handleCampaignIntroSubmit} craftedSkillIds={craftedSkillIds} />
 
       {/* Change Loadout — Training Mode's Battle Skills scene only, lets the
           player reopen the picker and swap freely instead of a one-time

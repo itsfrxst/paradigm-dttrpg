@@ -5,7 +5,14 @@ import TutorialHub from './TutorialHub.jsx'
 import NavBar from './NavBar.jsx'
 import FloatingMenuButton from './FloatingMenuButton.jsx'
 import CharacterScreen from './CharacterScreen.jsx'
+import CraftingScreen from './CraftingScreen.jsx'
 import PlaceholderScreen from './PlaceholderScreen.jsx'
+
+// Crafting normally unlocks by beating the Campaign finale (see
+// liveState.craftingUnlocked below). Forced on here so it can be built and
+// tested without replaying the whole Campaign each time — flip this back to
+// false once the real unlock flow should be enforced again.
+const CRAFTING_DEV_UNLOCKED = true
 
 const PLACEHOLDER_CONTENT = {
   profile: {
@@ -20,13 +27,6 @@ const PLACEHOLDER_CONTENT = {
     lines:[
       'Cyberworld cache offline.',
       'Loot, gear, and consumables come online in a future build.',
-    ],
-  },
-  crafting: {
-    icon:'🔧', title:'Crafting', color:'#ff8844',
-    lines:[
-      'Synthesis protocol not yet compiled.',
-      'Complete the Campaign to bring it online.',
     ],
   },
   social: {
@@ -50,6 +50,10 @@ function App() {
   const [activeScene, setActiveScene] = useState(null)
   const [sceneNonce, setSceneNonce] = useState(0)
   const [completedScenes, setCompletedScenes] = useState([])
+  // Skills learned via Crafting — persists at the app level (not tied to any
+  // one Gauntlet/Campaign session) since a crafted skill should carry into
+  // every mode once learned, the same way real progression would.
+  const [craftedSkillIds, setCraftedSkillIds] = useState([])
 
   const goTo = useCallback((s)=>{
     if(s==='gauntlet') setGauntletStarted(true)
@@ -78,23 +82,11 @@ function App() {
     setScreen('training')
   },[activeScene])
 
-  // Crafting stays a placeholder until the real system exists, but reflects
-  // the Campaign-completion unlock: current Hexas balance and whatever
-  // equipment the run granted, so the reward from finishing Campaign is
-  // visible somewhere even before spending is actually wired up.
-  const craftingContent = liveState?.craftingUnlocked
-    ? {
-        icon:'🔧', title:'Crafting', color:'#ff8844',
-        lines:[
-          'Synthesis protocol online — Campaign reward unlocked.',
-          `Hexas on hand: ${liveState.hexas ?? 0}.`,
-          liveState.player?.equipment?.length
-            ? `Equipped: ${liveState.player.equipment.map(e=>e.name).join(', ')}.`
-            : 'No equipment yet.',
-          'Spending Hexas on recipes comes online in a future build.',
-        ],
-      }
-    : PLACEHOLDER_CONTENT.crafting
+  const handleLearnSkill = useCallback((skillId)=>{
+    setCraftedSkillIds(prev => prev.includes(skillId) ? prev : [...prev, skillId])
+  },[])
+
+  const craftingUnlocked = CRAFTING_DEV_UNLOCKED || !!liveState?.craftingUnlocked
 
   if(screen==='start'){
     return <StartScreen onSelectMode={goTo} onNavigate={goTo} hasActiveSession={gauntletStarted} hasActiveCampaignSession={campaignStarted} />
@@ -111,7 +103,7 @@ function App() {
           instead of restarting the session. */}
       {gauntletStarted && (
         <div style={{display: screen==='gauntlet' ? 'block' : 'none'}}>
-          <GridBattlerGame onStateSync={setLiveState} onQuit={handleGauntletQuit} />
+          <GridBattlerGame onStateSync={setLiveState} onQuit={handleGauntletQuit} craftedSkillIds={craftedSkillIds} />
           <FloatingMenuButton onNavigate={goTo} />
         </div>
       )}
@@ -121,7 +113,7 @@ function App() {
           multi-battle run whose player HP/level carries across battles. */}
       {campaignStarted && (
         <div style={{display: screen==='campaign' ? 'block' : 'none'}}>
-          <GridBattlerGame campaign onCampaignComplete={handleCampaignComplete} onStateSync={setLiveState} />
+          <GridBattlerGame campaign onCampaignComplete={handleCampaignComplete} onStateSync={setLiveState} craftedSkillIds={craftedSkillIds} />
           <FloatingMenuButton onNavigate={goTo} />
         </div>
       )}
@@ -130,7 +122,7 @@ function App() {
           is a fresh instance (key forces remount even on replaying the same
           scene), since these are repeatable lessons, not sessions to resume. */}
       {screen==='trainingScene' && (
-        <GridBattlerGame key={`${activeScene}-${sceneNonce}`} scene={activeScene} onSceneComplete={handleSceneComplete} onQuit={()=>setScreen('training')} />
+        <GridBattlerGame key={`${activeScene}-${sceneNonce}`} scene={activeScene} onSceneComplete={handleSceneComplete} onQuit={()=>setScreen('training')} craftedSkillIds={craftedSkillIds} />
       )}
 
       {screen!=='gauntlet' && screen!=='campaign' && screen!=='trainingScene' && (
@@ -138,7 +130,9 @@ function App() {
           <NavBar current={screen} onNavigate={goTo} onMenu={()=>setScreen('start')} />
           {screen==='character'
             ? <CharacterScreen liveState={liveState} hasActiveSession={gauntletStarted} onLaunch={()=>goTo('gauntlet')} />
-            : <PlaceholderScreen {...(screen==='crafting' ? craftingContent : PLACEHOLDER_CONTENT[screen])} />}
+            : screen==='crafting'
+            ? <CraftingScreen unlocked={craftingUnlocked} hexas={liveState?.hexas ?? 0} craftedSkillIds={craftedSkillIds} onLearnSkill={handleLearnSkill} />
+            : <PlaceholderScreen {...PLACEHOLDER_CONTENT[screen]} />}
         </div>
       )}
     </>
