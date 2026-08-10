@@ -8,12 +8,6 @@ import CharacterScreen from './CharacterScreen.jsx'
 import CraftingScreen from './CraftingScreen.jsx'
 import PlaceholderScreen from './PlaceholderScreen.jsx'
 
-// Crafting normally unlocks by beating the Campaign finale (see
-// liveState.craftingUnlocked below). Forced on here so it can be built and
-// tested without replaying the whole Campaign each time — flip this back to
-// false once the real unlock flow should be enforced again.
-const CRAFTING_DEV_UNLOCKED = true
-
 const PLACEHOLDER_CONTENT = {
   profile: {
     icon:'👤', title:'Profile', color:'#5aa9c9',
@@ -86,7 +80,9 @@ function App() {
     setCraftedSkillIds(prev => prev.includes(skillId) ? prev : [...prev, skillId])
   },[])
 
-  const craftingUnlocked = CRAFTING_DEV_UNLOCKED || !!liveState?.craftingUnlocked
+  // Unlocks after winning Campaign Battle 1 (see GridBattlerGame's
+  // craftingUnlocked state, synced up via onStateSync).
+  const craftingUnlocked = !!liveState?.craftingUnlocked
 
   if(screen==='start'){
     return <StartScreen onSelectMode={goTo} onNavigate={goTo} hasActiveSession={gauntletStarted} hasActiveCampaignSession={campaignStarted} />

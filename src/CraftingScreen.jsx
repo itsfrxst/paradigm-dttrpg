@@ -70,7 +70,7 @@ const CraftingScreen = ({ unlocked, hexas, craftedSkillIds, onLearnSkill }) => {
         <h1 style={{fontFamily:"'Advent Pro',sans-serif",fontSize:'1.7rem',letterSpacing:'0.18em',textTransform:'uppercase',color:'#ff8844',margin:0,textShadow:'0 0 18px #ff884466'}}>Crafting</h1>
         <div style={{maxWidth:440,color:'#7a9db5',fontSize:14,lineHeight:1.8}}>
           <p style={{margin:'6px 0'}}>Synthesis protocol not yet compiled.</p>
-          <p style={{margin:'6px 0'}}>Complete the Campaign to bring it online.</p>
+          <p style={{margin:'6px 0'}}>Win Campaign Battle 1 to bring it online.</p>
         </div>
       </div>
     );

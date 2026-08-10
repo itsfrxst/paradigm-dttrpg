@@ -166,6 +166,18 @@ const getMoveToward = (fx,fy,tx,ty) => {
   return moves;
 };
 
+// Preferred moves toward `to` first (getMoveToward's dominant-axis pick),
+// then the remaining orthogonal directions as a reroute fallback — so a
+// directed move (flee-to-heal, etc.) whose direct path is blocked by a
+// player/summon sidesteps around it instead of standing still burning
+// Energy every remaining step of the turn declaring itself blocked.
+const getMoveCandidatesWithReroute = (from, to) => {
+  const primary = getMoveToward(from.x, from.y, to.x, to.y);
+  const allDirs = [{x:from.x+1,y:from.y},{x:from.x-1,y:from.y},{x:from.x,y:from.y+1},{x:from.x,y:from.y-1}];
+  const detour = allDirs.filter(m=>!primary.some(p=>p.x===m.x&&p.y===m.y));
+  return [...primary, ...detour];
+};
+
 const isAdjacent = (a,b) => { const dx=Math.abs(a.x-b.x),dy=Math.abs(a.y-b.y); return (dx===1&&dy===0)||(dx===0&&dy===1); };
 // 8-directional adjacency (orthogonal + diagonal) — used by Compass Slash.
 const isAdjacent8 = (a,b) => { const dx=Math.abs(a.x-b.x),dy=Math.abs(a.y-b.y); return dx<=1&&dy<=1&&(dx+dy)>0; };
@@ -621,45 +633,38 @@ const newGoblin = (level, _playerPos) => {
 };
 
 // ─── CAMPAIGN MODE (multi-enemy squads) ────────────────────────────────────────
-// Rank determines which of {melee, element, class} an enemy Proxie carries.
-// Rank 1 = Full Proxie (all three). Rank 2 = element+class, no melee. Rank 3 =
-// melee + one of {element,class} (randomized). Rank 4 = exactly one of the
-// three (randomized). Independent of `enemyTier`, which still scales HP/melee
-// base off `level` as it always has.
-const rollEnemyCapabilities = (rank) => {
-  if(rank===1) return { melee:true,  element:true,  class:true };
-  if(rank===2) return { melee:false, element:true,  class:true };
-  if(rank===3){
-    const pick = Math.random()<0.5 ? 'element' : 'class';
-    return { melee:true, element:pick==='element', class:pick==='class' };
-  }
-  // rank 4 — exactly one skill
-  const pick = ['melee','element','class'][Math.floor(Math.random()*3)];
-  return { melee:pick==='melee', element:pick==='element', class:pick==='class' };
+// Every Campaign Proxie now carries the same shape of build a player does:
+// baseline Melee (always), exactly 1 element, and a loadout of Tactical
+// skills — randomized from BATTLE_SKILLS' tactical pool for regular grunts.
+// Core skills (Circuit Sigil) are boss-exclusive; see spawnCampaignRoster's
+// mirror path for how the finale boss's loadout+element is actually filled.
+// `rank` is now purely a display/sort label (badge, turn-order tiebreak) —
+// it no longer drives capability rolls.
+const randomEnemyLoadout = () => {
+  const pool = BATTLE_SKILLS.filter(s=>s.category==='tactical').map(s=>s.id);
+  const shuffled = [...pool].sort(()=>Math.random()-0.5);
+  const count = 1 + Math.floor(Math.random()*Math.min(TACTICAL_SKILL_CAP, pool.length));
+  return shuffled.slice(0, count);
 };
 
+// Still used by the player's own promoted-summon Agents (see
+// promoteSummonToEnemy is NOT this — that's an opposing Proxie now; this
+// pool remains for computeAgentStep's ally-side Agents only).
 const ENEMY_CLASS_POOL = ['Summoner','Rogue'];
 
 let ENEMY_SEQ = 0;
-const makeEnemyProxie = (rank, level, pos) => {
-  const caps = rollEnemyCapabilities(rank);
-  const element = caps.element ? BOSS_ELEMENTS[Math.floor(Math.random()*BOSS_ELEMENTS.length)] : null;
-  const enemyClass = caps.class ? ENEMY_CLASS_POOL[Math.floor(Math.random()*ENEMY_CLASS_POOL.length)] : null;
+const makeEnemyProxie = (rank, level, pos, { element=null, loadout=[], isBoss=false } = {}) => {
   const hp = ENEMY_HP_W1+(level-1)*ENEMY_HP_SCALE;
   const agi = Math.min(1+Math.floor(level/3),3);
-  const name = element && enemyClass ? `${element} ${enemyClass} Proxie`
-    : enemyClass ? `${enemyClass} Adept`
-    : element ? `${element} Warden`
-    : 'Grunt Proxie';
+  const name = isBoss ? 'Command Proxie' : element ? `${element} Warden` : 'Grunt Proxie';
   return {
     ...makeCharacter(name, hp, level, agi, 0, pos, element, element?'base':null),
     energyRollover:0,
     id: `E${++ENEMY_SEQ}`,
     rank,
-    enemyClass,
-    canMelee: caps.melee,
-    canElement: caps.element,
-    canClass: caps.class,
+    loadout,
+    isBoss,
+    canMelee: true,
   };
 };
 
@@ -677,8 +682,8 @@ export const CAMPAIGN_BATTLES = [
   { stage:2, name:'Strike Squad',   roster:[{rank:3},{rank:3}], level:8,
     narrative:'The breach widens. A coordinated strike squad has moved in to reinforce the perimeter — better instantiated than the scouts that came before.' },
   { stage:3, name:'Command Proxie', roster:[{rank:1}],          level:10, isFinale:true,
-    narrative:'At the heart of the breach: a Command Proxie, fully instantiated, every subsystem online. This is what has been holding the line.',
-    victoryNarrative:'The Command Proxie\'s core destabilizes and goes dark. The breach is yours. Synthesis protocols detected in the wreckage — Crafting is online, and your Hexas are finally spendable.' },
+    narrative:'At the heart of the breach: a Command Proxie, fully instantiated, every subsystem online — mirroring your own build back at you, shadowboxing against exactly what you brought in. This is what has been holding the line.',
+    victoryNarrative:'The Command Proxie\'s core destabilizes and goes dark. The breach is yours.' },
 ];
 
 // Campaign's completion reward — the player's first piece of equipment.
@@ -687,8 +692,13 @@ export const CAMPAIGN_BATTLES = [
 export const FIRST_EQUIPMENT = { name:'Salvaged Core Chip', statBonus:'+100 Max HP', maxHealthBonus:100 };
 
 // Places each roster slot on the enemy back row (row 0), retrying on
-// collision with player/previously-placed enemies.
-const spawnCampaignRoster = (stage, playerPos) => {
+// collision with player/previously-placed enemies. Regular battles (1-2)
+// get a randomized element + tactical loadout per grunt. The finale boss
+// instead mirrors whatever `mirror` carries — the player's own actual
+// loadout and element, "shadowboxing" a build identical to theirs, which is
+// also how a boss legitimately gets a Core skill (Circuit Sigil) despite
+// grunts never rolling one.
+const spawnCampaignRoster = (stage, playerPos, mirror=null) => {
   const battle = CAMPAIGN_BATTLES[stage-1];
   const placed = [];
   battle.roster.forEach(({rank})=>{
@@ -697,7 +707,10 @@ const spawnCampaignRoster = (stage, playerPos) => {
       pos = rollBackRowPosition(0);
       guard++;
     } while((pos.x===playerPos.x&&pos.y===playerPos.y || placed.some(p=>p.boardPosition.x===pos.x&&p.boardPosition.y===pos.y)) && guard<50);
-    placed.push(makeEnemyProxie(rank, battle.level, {x:pos.x,y:pos.y}));
+    const isBoss = !!battle.isFinale;
+    const element = isBoss && mirror ? mirror.element : BOSS_ELEMENTS[Math.floor(Math.random()*BOSS_ELEMENTS.length)];
+    const loadout = isBoss && mirror ? mirror.loadout : randomEnemyLoadout();
+    placed.push(makeEnemyProxie(rank, battle.level, {x:pos.x,y:pos.y}, {element, loadout, isBoss}));
   });
   return placed;
 };
@@ -707,7 +720,7 @@ const spawnCampaignRoster = (stage, playerPos) => {
 // Mirrors the Fire/Earth/Air/Water math already used by Gauntlet's
 // single-enemy `runEnemyTurn` (dice, accuracy, tile boosts, ranged min-damage
 // floors, Water AoE, Air knockback), extracted here so every Campaign enemy
-// with `canElement` gets the identical mechanics rather than a stand-in.
+// with an element gets the identical mechanics rather than a stand-in.
 // Returns null if the attacker has no element.
 const computeElementalStrike = (attacker, target, tiles) => {
   const elData = attacker.element ? ELEMENTS[attacker.elementCategory]?.[attacker.element] : null;
@@ -789,6 +802,37 @@ const computeElementalStrike = (attacker, target, tiles) => {
   return { dmg, eCost, castFacing, knockbackPos, log };
 };
 
+// Whether `attacker`'s equipped element could plausibly land on `target`
+// this turn, checked BEFORE committing to cast — without this, an enemy
+// would fire a ranged element at whatever the geometry couldn't actually
+// reach (e.g. an Earth Tremor at a target off its cast line, a Water
+// Torrent anchored nowhere near anyone) and just burn Energy on a guaranteed
+// miss. Mirrors each element's real hit-check from computeElementalStrike,
+// using the attacker's current facing-toward-target line/anchor and the
+// element's max possible reach (its highest die face, or the richest AoE
+// tier current Energy could afford) since the actual die hasn't been rolled
+// yet at decision time.
+const canElementReachTarget = (attacker, target, actionpts) => {
+  const elData = attacker.element ? ELEMENTS[attacker.elementCategory]?.[attacker.element] : null;
+  if(!elData) return false;
+  if(elData.isFire) return isAdjacent(attacker.boardPosition, target.boardPosition);
+  const castFacing = facingToward(attacker.boardPosition, target.boardPosition);
+  if(elData.isEarth){
+    const maxRange = Math.min(3, actionpts-1); // d6 max halved, capped by affordable tiles
+    if(maxRange<1) return false;
+    return getForwardTiles(attacker.boardPosition, castFacing, maxRange).some(t=>t.x===target.boardPosition.x&&t.y===target.boardPosition.y);
+  }
+  if(elData.isAir){
+    return getForwardTiles(attacker.boardPosition, castFacing, 8).some(t=>t.x===target.boardPosition.x&&t.y===target.boardPosition.y); // d8 max
+  }
+  if(elData.isWater){
+    const anchor = getTorrentAnchor(attacker.boardPosition, castFacing);
+    const maxAoe = actionpts>=TORRENT_AOE_COST.spread ? 'spread' : actionpts>=TORRENT_AOE_COST.cross ? 'cross' : 'single';
+    return getTorrentFootprint(anchor, maxAoe).some(t=>t.x===target.boardPosition.x&&t.y===target.boardPosition.y);
+  }
+  return true;
+};
+
 // Auto-resolves every un-acted-this-round summon owned by `thisEnemy` in one
 // batch, 1 AP each: strike the player if it's on one of the 3 tiles ahead
 // (pawn geometry, see summonAttackTiles), else march the single tile
@@ -841,31 +885,38 @@ const commandEnemySummons = (thisEnemy, allSummons, otherEnemies, player, curren
   return { nextSummons, apSpent: thisEnemy.actionpts-apLeft, playerHP, logs, promoted };
 };
 
-// Decides whether `thisEnemy` uses its class skill this pass, and how.
-// Summoner: Compass-Slash-equivalent (60 dmg) if the player is in the 8
-// surrounding tiles, else Deploy a Novice onto ENEMY_SUMMON_ROW if bandwidth
-// allows — a fixed row, not wherever the caster currently stands, so a
-// mobile Summoner can't scatter summons anywhere it's walked to. Rogue: Dark
-// Web if the player is a knight-move away. Pure decision — no state writes,
-// no dice rolled here (that happens where the result is applied, same
+// Decides which class-like loadout skill `thisEnemy` uses this pass, and
+// how — checked against its actual equipped loadout (BATTLE_SKILLS ids)
+// instead of the old single enemyClass string, since a Campaign enemy can
+// now carry any combination the same way a player's loadout can. Priority:
+// Dark Web (only usable from an exact knight-move — narrowest window, so it
+// takes priority when it's actually available) > Compass Slash (any of the
+// 8 surrounding tiles) > Circuit Sigil deploy onto ENEMY_SUMMON_ROW (a
+// fixed row, not wherever the caster currently stands, so a mobile caster
+// can't scatter summons anywhere it's walked to) as a fallback build-up
+// action when nothing's in range yet. Pure decision — no state writes, no
+// dice rolled here (that happens where the result is applied, same
 // separation `computeElementalStrike` uses).
 const resolveEnemyClassSkill = (thisEnemy, currentPlayer, currentSummons, tiles, enemyPositions) => {
-  if(thisEnemy.enemyClass==='Rogue'){
-    if(isKnightMove(thisEnemy.boardPosition, currentPlayer.boardPosition)) return { kind:'darkweb' };
-    return null;
+  const loadout = thisEnemy.loadout || [];
+  const used = thisEnemy.usedSkillIds || [];
+  const has = (id) => loadout.includes(id) && !used.includes(id);
+  if(has('darkWeb') && isKnightMove(thisEnemy.boardPosition, currentPlayer.boardPosition)){
+    return { kind:'darkweb', skillId:'darkWeb' };
   }
-  if(thisEnemy.enemyClass==='Summoner'){
-    if(isAdjacent8(thisEnemy.boardPosition, currentPlayer.boardPosition)) return { kind:'direct' };
+  if(has('compassSlash') && isAdjacent8(thisEnemy.boardPosition, currentPlayer.boardPosition)){
+    return { kind:'direct', skillId:'compassSlash' };
+  }
+  if(has('circuitSigil')){
     const ownCount = currentSummons.filter(s=>s.side==='enemy'&&s.ownerId===thisEnemy.id).length;
     if(ownCount<BANDWIDTH){
       const legal = getDeployTilesOnRow(ENEMY_SUMMON_ROW, tiles, currentPlayer.boardPosition, enemyPositions, currentSummons);
       if(legal.length>0){
         const tile = legal.reduce((best,t)=>
           Math.abs(t.x-thisEnemy.boardPosition.x)<Math.abs(best.x-thisEnemy.boardPosition.x)?t:best, legal[0]);
-        return { kind:'deploy', tile };
+        return { kind:'deploy', tile, skillId:'circuitSigil' };
       }
     }
-    return null;
   }
   return null;
 };
@@ -873,19 +924,17 @@ const resolveEnemyClassSkill = (thisEnemy, currentPlayer, currentSummons, tiles,
 // Converts a promoted enemy-side summon into a full roster entry — from
 // here on it's just another enemy with its own roll and AI turn, rank-
 // sorted and player-attackable like any other, rather than a special case
-// that needs its own parallel machinery. Rank 4 (melee + class only, no
-// element) — a converted grunt, not a rebalanced boss.
-const promoteSummonToEnemy = (summon, level) => {
-  const agentClass = ENEMY_CLASS_POOL[Math.floor(Math.random()*ENEMY_CLASS_POOL.length)];
-  return {
-    ...makeCharacter(`${agentClass} Agent`, summon.maxHealth, level, 1, 0, summon.boardPosition, null, null),
-    id: `E${++ENEMY_SEQ}`,
-    rank: 4,
-    enemyClass: agentClass,
-    canMelee: true, canElement: false, canClass: true,
-    health: summon.health,
-  };
-};
+// that needs its own parallel machinery. A converted grunt (random tactical
+// loadout, no element — it never had one as a summon), not a rebalanced boss.
+const promoteSummonToEnemy = (summon, level) => ({
+  ...makeCharacter(`${summon.name} Agent`, summon.maxHealth, level, 1, 0, summon.boardPosition, null, null),
+  id: `E${++ENEMY_SEQ}`,
+  rank: 4,
+  loadout: randomEnemyLoadout(),
+  isBoss: false,
+  canMelee: true,
+  health: summon.health,
+});
 
 // One action-point's worth of an autonomous Agent's turn (a promoted
 // player-side summon acting independently, "similar logic to the
@@ -2203,12 +2252,19 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const isCampaign = !!campaign;
 
   const initPlayer = () => newHero();
-  // Battle Skills scene: a random Rank 1 Full Proxie (melee+element+class)
-  // instead of a plain goblin — "an even match" now that a promoted Agent
-  // can fight alongside the player, and the only scene where loadout play
-  // (and thus Agents) is actually reachable.
+  // Battle Skills scene: a full-kit practice Proxie (melee + element + both
+  // Tactical skills + Circuit Sigil) instead of a plain goblin — "an even
+  // match" now that a promoted Agent can fight alongside the player, and the
+  // only scene where loadout play (and thus Agents) is actually reachable.
+  // `isBoss` only affects makeEnemyProxie's naming/spawnCampaignRoster's
+  // mirror path, not AI capability — Circuit Sigil in the loadout is what
+  // actually enables it here, so this stays a regular (isBoss:false) grunt
+  // in spite of carrying a Core skill for practice purposes.
   const initEnemy  = (p) => scene==='skills'
-    ? makeEnemyProxie(1, 1, rollBackRowPosition(0))
+    ? makeEnemyProxie(1, 1, rollBackRowPosition(0), {
+        element: BOSS_ELEMENTS[Math.floor(Math.random()*BOSS_ELEMENTS.length)],
+        loadout: ['compassSlash','darkWeb','circuitSigil'],
+      })
     : newGoblin(1, p.boardPosition);
 
   const [player,         setPlayer]         = useState(()=>{ const p=initPlayer(); return p; });
@@ -2561,7 +2617,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setAccuracyRoll(null); setPendingAbility(null); setAirRange(null); setEarthRange(null); setWaterAoe(null);
     addLog(`=== Round ${nextRound} ===`);
     const rP = { ...latestPlayer, actionpts:0, frozen:latestPlayer.frozen||0, skillUsed:false, rotateUsed:false, classSkillUsed:false, usedSkillIds:[] };
-    const rE = { ...latestEnemy,  actionpts:0, frozen:latestEnemy.frozen||0, skillUsed:false,
+    const rE = { ...latestEnemy,  actionpts:0, frozen:latestEnemy.frozen||0, skillUsed:false, usedSkillIds:[],
       energyRollover: (latestEnemy.energyRollover||0) + (latestEnemy.actionpts||0) };
     setPlayer(rP);
     setEnemy(rE);
@@ -2602,15 +2658,15 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       const adjacent=isAdjacent(currentEnemy.boardPosition,currentPlayer.boardPosition);
       const eElData=currentEnemy.element?ELEMENTS[currentEnemy.elementCategory]&&ELEMENTS[currentEnemy.elementCategory][currentEnemy.element]:null;
       const eMinCost=eElData?getSkillCost(currentEnemy.elementCategory,currentEnemy.element):1;
-      const eRanged = eElData?.isEarth||eElData?.isAir||eElData?.isWater;
-      const canUseSkill=(eRanged?true:adjacent)&&currentEnemy.element&&!currentEnemy.skillUsed&&currentEnemy.actionpts>=eMinCost&&Math.random()<0.6;
-      // Class skill (only meaningful for Training's Rank-1 enemy, which is
-      // the only single-enemy context with `enemyClass`/`canClass` set —
-      // Gauntlet goblins/wardens never have a class). Reuses the exact
-      // Campaign decision logic; Deploy is skipped here rather than adding
-      // enemy-side summon-commanding to the single-enemy engine — Direct
-      // (Compass Slash) and Dark Web both still work.
-      const canUseClassSkill = currentEnemy.canClass && currentEnemy.enemyClass && !currentEnemy.classSkillUsed && currentEnemy.actionpts>=2 && Math.random()<0.6;
+      const canUseSkill=currentEnemy.element&&canElementReachTarget(currentEnemy,currentPlayer,currentEnemy.actionpts)&&!currentEnemy.skillUsed&&currentEnemy.actionpts>=eMinCost&&Math.random()<0.6;
+      // Class-like loadout skill (only meaningful for Training's Rank-1
+      // enemy, which is the only single-enemy context with a `loadout` set —
+      // Gauntlet goblins/wardens never carry one). Reuses the exact Campaign
+      // decision logic; Deploy is skipped here rather than adding enemy-side
+      // summon-commanding to the single-enemy engine — Direct (Compass
+      // Slash) and Dark Web both still work.
+      const hasUnusedClassLikeSkill = (currentEnemy.loadout||[]).some(id=>['compassSlash','darkWeb','circuitSigil'].includes(id) && !(currentEnemy.usedSkillIds||[]).includes(id));
+      const canUseClassSkill = hasUnusedClassLikeSkill && currentEnemy.actionpts>=2 && Math.random()<0.6;
 
       const lowHP = currentEnemy.health <= currentEnemy.maxHealth * 0.3;
       const healTile = findHealingTile(tiles);
@@ -2618,7 +2674,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       const willFlee = lowHP && healTile && currentEnemy.fleeCommit;
 
       if(willFlee && !onHealTile){
-        const moves=getMoveToward(currentEnemy.boardPosition.x,currentEnemy.boardPosition.y,healTile.x,healTile.y);
+        const moves=getMoveCandidatesWithReroute(currentEnemy.boardPosition,healTile);
         let moved=false;
         for(const m of moves){
           const onSummon=updatedSummons.some(s=>s.boardPosition.x===m.x&&s.boardPosition.y===m.y);
@@ -2672,7 +2728,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           addLog(`${currentEnemy.name} Compass Slash -> ${dmg} dmg`);
           triggerCastFx(currentPlayer.boardPosition,'#9b6cff');
           updatedPlayer={...currentPlayer,health:newHP};
-          updatedEnemy={...currentEnemy,actionpts:currentEnemy.actionpts-2,classSkillUsed:true,facing};
+          updatedEnemy=markSkillUsed({...currentEnemy,actionpts:currentEnemy.actionpts-2,facing},'compassSlash');
           setPlayer(updatedPlayer); setEnemy(updatedEnemy);
           if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
           setTimeout(()=>{
@@ -2689,8 +2745,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           addLog(`${currentEnemy.name} Dark Web -> ${dmg} dmg (${acc}% ${accuracyTierLabel(acc)})`);
           triggerCastFx(currentPlayer.boardPosition,'#a0a0a0');
           updatedPlayer={...currentPlayer,health:newHP};
-          updatedEnemy={...currentEnemy,actionpts:currentEnemy.actionpts-2,classSkillUsed:true,facing,
-            boardPosition: newHP<=0 ? currentPlayer.boardPosition : currentEnemy.boardPosition};
+          updatedEnemy=markSkillUsed({...currentEnemy,actionpts:currentEnemy.actionpts-2,facing,
+            boardPosition: newHP<=0 ? currentPlayer.boardPosition : currentEnemy.boardPosition},'darkWeb');
           setPlayer(updatedPlayer); setEnemy(updatedEnemy);
           if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
           setTimeout(()=>{
@@ -3416,7 +3472,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setAccuracyRoll(null); setPendingAbility(null); setAirRange(null); setEarthRange(null); setWaterAoe(null);
     addLog(`=== Round ${nextRound} ===`);
     const rP = { ...latestPlayer, actionpts:0, frozen:latestPlayer.frozen||0, skillUsed:false, rotateUsed:false, classSkillUsed:false, usedSkillIds:[] };
-    const rEnemies = latestEnemies.map(e=>({ ...e, actionpts:0, frozen:e.frozen||0, skillUsed:false, classSkillUsed:false,
+    const rEnemies = latestEnemies.map(e=>({ ...e, actionpts:0, frozen:e.frozen||0, skillUsed:false, classSkillUsed:false, usedSkillIds:[],
       energyRollover:(e.energyRollover||0)+(e.actionpts||0) }));
     setPlayer(rP);
     setEnemies(rEnemies);
@@ -3486,9 +3542,10 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       const others = allEnemies.filter(e=>e.id!==thisEnemy.id && e.health>0);
       let updatedPlayer=currentPlayer, updatedEnemy=thisEnemy, updatedSummons=currentSummons;
 
-      // Own-summon command (Summoner enemies only) — batched once at the top
-      // of this enemy's AP-spend pass.
-      if(thisEnemy.canClass && thisEnemy.enemyClass==='Summoner' && updatedSummons.some(s=>s.side==='enemy'&&s.ownerId===thisEnemy.id) && updatedEnemy.actionpts>0){
+      // Own-summon command (only meaningful for a Circuit-Sigil-carrying
+      // enemy, i.e. the boss) — batched once at the top of this enemy's
+      // AP-spend pass.
+      if((thisEnemy.loadout||[]).includes('circuitSigil') && updatedSummons.some(s=>s.side==='enemy'&&s.ownerId===thisEnemy.id) && updatedEnemy.actionpts>0){
         const res = commandEnemySummons(updatedEnemy, updatedSummons, others, updatedPlayer, currentRound);
         if(res.apSpent>0){
           res.logs.forEach(addLog);
@@ -3508,9 +3565,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       const adjacent=isAdjacent(updatedEnemy.boardPosition,updatedPlayer.boardPosition);
       const eElData=updatedEnemy.element?ELEMENTS[updatedEnemy.elementCategory]?.[updatedEnemy.element]:null;
       const eMinCost=eElData?getSkillCost(updatedEnemy.elementCategory,updatedEnemy.element):1;
-      const eRanged=eElData?.isEarth||eElData?.isAir||eElData?.isWater;
-      const canUseElement = updatedEnemy.canElement && (eRanged?true:adjacent) && updatedEnemy.element && !updatedEnemy.skillUsed && updatedEnemy.actionpts>=eMinCost && Math.random()<0.6;
-      const canUseClass = updatedEnemy.canClass && updatedEnemy.enemyClass && !updatedEnemy.classSkillUsed && updatedEnemy.actionpts>=2 && Math.random()<0.6;
+      const canUseElement = updatedEnemy.element && canElementReachTarget(updatedEnemy,updatedPlayer,updatedEnemy.actionpts) && !updatedEnemy.skillUsed && updatedEnemy.actionpts>=eMinCost && Math.random()<0.6;
+      const hasUnusedClassLikeSkill = (updatedEnemy.loadout||[]).some(id=>['compassSlash','darkWeb','circuitSigil'].includes(id) && !(updatedEnemy.usedSkillIds||[]).includes(id));
+      const canUseClass = hasUnusedClassLikeSkill && updatedEnemy.actionpts>=2 && Math.random()<0.6;
 
       const lowHP = updatedEnemy.health <= updatedEnemy.maxHealth*0.3;
       const healTile = findHealingTile(tiles);
@@ -3526,7 +3583,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       };
 
       if(willFlee && !onHealTile){
-        const moves=getMoveToward(updatedEnemy.boardPosition.x,updatedEnemy.boardPosition.y,healTile.x,healTile.y);
+        const moves=getMoveCandidatesWithReroute(updatedEnemy.boardPosition,healTile);
         let moved=false;
         for(const m of moves){
           const blocked=moveBlockers.some(b=>b.x===m.x&&b.y===m.y);
@@ -3570,7 +3627,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           addLog(`${updatedEnemy.name} Compass Slash -> ${dmg} dmg`);
           triggerCastFx(updatedPlayer.boardPosition,'#9b6cff');
           updatedPlayer={...updatedPlayer,health:newHP};
-          updatedEnemy={...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-2),classSkillUsed:true,facing};
+          updatedEnemy=markSkillUsed({...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-2),facing},'compassSlash');
           setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
           if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
           finishStep();
@@ -3583,7 +3640,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           setSummons(updatedSummons);
           addLog(`◈ ${updatedEnemy.name} deploys ${s.name} at (${decision.tile.x},${decision.tile.y})`);
           triggerCastFx(decision.tile,'#9b6cff');
-          updatedEnemy={...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-2),classSkillUsed:true};
+          updatedEnemy=markSkillUsed({...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-2)},'circuitSigil');
           setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
           finishStep();
           return;
@@ -3596,8 +3653,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           addLog(`${updatedEnemy.name} Dark Web -> ${dmg} dmg (${acc}% ${accuracyTierLabel(acc)})`);
           triggerCastFx(updatedPlayer.boardPosition,'#a0a0a0');
           updatedPlayer={...updatedPlayer,health:newHP};
-          updatedEnemy={...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-2),classSkillUsed:true,facing,
-            boardPosition: newHP<=0 ? updatedPlayer.boardPosition : updatedEnemy.boardPosition};
+          updatedEnemy=markSkillUsed({...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-2),facing,
+            boardPosition: newHP<=0 ? updatedPlayer.boardPosition : updatedEnemy.boardPosition},'darkWeb');
           setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
           if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
           finishStep();
@@ -3644,8 +3701,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
 
       // A player-side summon blocking this enemy's path is a real target,
       // not just an inert obstacle — destroying it clears the way instead of
-      // the enemy standing there forever. Only fires when no-melee ranks
-      // can't take it (they still can't attack at all) and the enemy isn't
+      // the enemy standing there forever. Only fires when the enemy isn't
       // already adjacent to the player.
       const adjacentOwnSummon = updatedEnemy.canMelee && updatedSummons.find(s=>s.side==='player'&&isAdjacent(updatedEnemy.boardPosition,s.boardPosition));
       if(adjacentOwnSummon){
@@ -3785,12 +3841,17 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(remaining.length>0) return; // battle continues with the survivors
     const battle = CAMPAIGN_BATTLES[campaignBattle-1];
     addLog(battle.isFinale ? '=== CAMPAIGN COMPLETE — the army falls. ===' : `=== Battle ${campaignBattle}/3 cleared! ===`);
+    // Crafting unlocks after the first Campaign win, not the whole run —
+    // the finale still grants the equipment reward on top of that.
+    if(campaignBattle===1){
+      setCraftingUnlocked(true);
+      addLog('◈ Synthesis protocol online — Crafting unlocked.');
+    }
     if(battle.isFinale){
       setCampaignComplete(true);
-      setCraftingUnlocked(true);
       setPlayer(p=>({...p, equipment:[...(p.equipment||[]), FIRST_EQUIPMENT],
         maxHealth:p.maxHealth+FIRST_EQUIPMENT.maxHealthBonus, health:p.health+FIRST_EQUIPMENT.maxHealthBonus}));
-      addLog(`◈ ${FIRST_EQUIPMENT.name} acquired — ${FIRST_EQUIPMENT.statBonus}. Crafting unlocked.`);
+      addLog(`◈ ${FIRST_EQUIPMENT.name} acquired — ${FIRST_EQUIPMENT.statBonus}.`);
     }
     setShowBattleComplete(true);
   },[campaignBattle,addLog,applyLevelUp]);
@@ -3799,7 +3860,10 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const battle = CAMPAIGN_BATTLES[nextStage-1];
     const resetPlayer = { ...curPlayer, actionpts:0, frozen:0, skillUsed:false, rotateUsed:false, classSkillUsed:false, usedSkillIds:[], energyRollover:0,
       boardPosition: rollBackRowPosition(8) };
-    const freshEnemies = spawnCampaignRoster(nextStage, resetPlayer.boardPosition);
+    // The finale boss mirrors the player's own actual loadout+element
+    // ("shadowboxing") — spawnCampaignRoster only uses this for isFinale
+    // stages, so it's harmless to always pass through.
+    const freshEnemies = spawnCampaignRoster(nextStage, resetPlayer.boardPosition, {loadout, element:selElement});
     const newTiles = makeTiles(resetPlayer.boardPosition, {x:-1,y:-1}, freshEnemies.map(e=>e.boardPosition));
     setCampaignBattle(nextStage);
     setEnemies(freshEnemies);
@@ -3817,7 +3881,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setHealingConsumed(false);
     setIsPlayerTurn(true);
     addLog(`=== Battle ${nextStage}/3 — ${battle.name} ===`);
-  },[addLog]);
+  },[addLog,loadout,selElement]);
 
   const handleCampaignIntroSubmit = useCallback((name, pickedLoadout, element)=>{
     setPlayer(p=>({...p, name}));
