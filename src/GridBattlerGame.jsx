@@ -191,6 +191,34 @@ const getKnightTiles = (pos) => KNIGHT_OFFSETS
   .filter(t=>t.x>=0&&t.x<SIZE&&t.y>=0&&t.y<SIZE);
 const isKnightMove = (a,b) => KNIGHT_OFFSETS.some(o=>a.x+o.dx===b.x&&a.y+o.dy===b.y);
 const facingFromMove = (o,n) => { const dx=n.x-o.x,dy=n.y-o.y; if(dx>0)return'right';if(dx<0)return'left';if(dy>0)return'down';if(dy<0)return'up';return'down'; };
+
+// The 4 diagonal directions — Longshot Protocol's line of sight. Pulse
+// Wave's own 8-direction axis is derived per-click via findAxisDirection
+// instead of enumerated up front.
+const DIAGONAL_DIRS = [{dx:1,dy:1},{dx:1,dy:-1},{dx:-1,dy:1},{dx:-1,dy:-1}];
+// Straight line of tiles from `pos` along an arbitrary {dx,dy} unit vector,
+// clipped to the board — same shape as getForwardTiles but not limited to
+// the 4 cardinal facings, since Pulse Wave/Longshot Protocol also need the
+// diagonals.
+const getAxisLine = (pos, dir, count) => {
+  const tiles=[];
+  for(let i=1;i<=count;i++){
+    const x=pos.x+dir.dx*i, y=pos.y+dir.dy*i;
+    if(x<0||x>=SIZE||y<0||y>=SIZE) break;
+    tiles.push({x,y});
+  }
+  return tiles;
+};
+// Which of the 8 axis directions `to` lies on from `from`, or null if it's
+// off-axis entirely (not a straight line or exact diagonal).
+const findAxisDirection = (from, to) => {
+  const dx=to.x-from.x, dy=to.y-from.y;
+  if(dx===0&&dy===0) return null;
+  if(dx===0) return {dx:0,dy:dy>0?1:-1};
+  if(dy===0) return {dx:dx>0?1:-1,dy:0};
+  if(Math.abs(dx)===Math.abs(dy)) return {dx:dx>0?1:-1,dy:dy>0?1:-1};
+  return null;
+};
 // Facing from one tile toward another (used to rotate a unit to face its melee
 // target). Picks the dominant axis when the target isn't orthogonally aligned.
 const facingToward = (from,to) => {
@@ -567,6 +595,36 @@ const MELEE_PER_LEVEL=5; // player gains +5 melee damage per level
 // (Enemies use the tier system's meleeBase instead — left untouched.)
 const playerMeleeBase = (level) => MELEE_BASE + (level-1)*MELEE_PER_LEVEL;
 
+// Piercing Light — a 2-tile-forward thrust melee. Base cost hits both tiles
+// for PIERCING_LIGHT_BASE_DMG; every Energy point committed beyond the base
+// cost buffs that same damage on both tiles, the same shape as Melee's own
+// burst-multiplier scaling (see meleeBurstMultiplier) but framed as a flat
+// per-point damage add rather than a hit-count multiplier.
+const PIERCING_LIGHT_BASE_COST = 3;
+const PIERCING_LIGHT_BASE_DMG = 30;
+const PIERCING_LIGHT_PER_EXTRA = 15;
+const piercingLightDamage = (energySpent) => PIERCING_LIGHT_BASE_DMG + Math.max(0,energySpent-PIERCING_LIGHT_BASE_COST)*PIERCING_LIGHT_PER_EXTRA;
+// Which cardinal facing would put `to` on the 2-tile-forward thrust line
+// from `from`, or null if it isn't reachable that way at all (used by the
+// enemy AI to decide whether — and which way to face — to use Piercing
+// Light, since enemies don't pick a direction by hand the way a player
+// clicks a target tile).
+const piercingLightFacing = (from, to) => {
+  const dx=to.x-from.x, dy=to.y-from.y;
+  if(dx===0 && dy!==0 && Math.abs(dy)<=2) return dy>0?'down':'up';
+  if(dy===0 && dx!==0 && Math.abs(dx)<=2) return dx>0?'right':'left';
+  return null;
+};
+// Same "spend just enough to kill, else spend everything available" shape
+// as meleeBurstMultiplier, but for Piercing Light's flat per-point damage
+// buff instead of a hit-count multiplier.
+const piercingLightAutoSpend = (actionpts, targetHealth) => {
+  for(let e=PIERCING_LIGHT_BASE_COST; e<actionpts; e++){
+    if(piercingLightDamage(e) >= targetHealth) return e;
+  }
+  return actionpts;
+};
+
 // How many melee "hits" worth of AP an enemy auto-spends in one burst: enough
 // to defeat the target if it has the energy for it, capped at whatever AP it
 // actually has left. Replaces resolving N separate 1-AP melee actions (and N
@@ -833,6 +891,48 @@ const canElementReachTarget = (attacker, target, actionpts) => {
   return true;
 };
 
+// Pulse Wave — "your elemental skill a second time, at a different range."
+// Reuses each element's own dice, but flattened to a single damage number
+// with no range/AoE scaling: Fire keeps its pulses×dmg-each product, Water
+// takes resolveTorrent's damage tier for the roll (ignoring which AoE size
+// it would have unlocked), and everything else just sums its dice. Pure —
+// rolls dice and returns the result, no state writes, no targeting (that's
+// resolved separately via findAxisDirection/getAxisLine).
+const computePulseWaveDamage = (attacker) => {
+  const elData = attacker.element ? ELEMENTS[attacker.elementCategory]?.[attacker.element] : null;
+  if(!elData) return null;
+  const rolls = elData.dice.map(d=>rollDie(parseInt(d.slice(1))));
+  let base;
+  if(elData.isFire) base = rolls[0]*rolls[1]*SKILL_DICE_MULT;
+  else if(elData.isWater) base = resolveTorrent(rolls[0]).damage;
+  else base = rolls.reduce((a,b)=>a+b,0)*SKILL_DICE_MULT;
+  const acc = rollD100Accuracy();
+  const dmg = applyAccuracy(base,acc);
+  return { dmg, acc, rollsLabel: rolls.join('+') };
+};
+
+// Longshot Protocol — a passive diagonal snipe. Walks each of the 4
+// diagonals out from `moverPos` up to LONGSHOT_RANGE tiles; the first thing
+// found along a line wins that line — a target there gets sniped, anything
+// else there blocks the rest of that line's line of sight. Checked once
+// right after a genuine repositioning move (see handleSquareClick /
+// runEnemyTurn's approach-move branch) — melee and other skills that happen
+// to also change boardPosition don't re-trigger it. Pure — returns the unit
+// hit (or null), no state writes.
+const LONGSHOT_RANGE = 3;
+const LONGSHOT_DMG = 10;
+const checkLongshotProtocol = (moverPos, targets, blockers) => {
+  for(const dir of DIAGONAL_DIRS){
+    const line = getAxisLine(moverPos, dir, LONGSHOT_RANGE);
+    for(const tile of line){
+      const hit = targets.find(t=>t.health>0&&t.boardPosition.x===tile.x&&t.boardPosition.y===tile.y);
+      if(hit) return hit;
+      if(blockers.some(b=>b.x===tile.x&&b.y===tile.y)) break;
+    }
+  }
+  return null;
+};
+
 // Auto-resolves every un-acted-this-round summon owned by `thisEnemy` in one
 // batch, 1 AP each: strike the player if it's on one of the 3 tiles ahead
 // (pawn geometry, see summonAttackTiles), else march the single tile
@@ -891,23 +991,38 @@ const commandEnemySummons = (thisEnemy, allSummons, otherEnemies, player, curren
 // now carry any combination the same way a player's loadout can. Priority:
 // Dark Web (only usable from an exact knight-move — narrowest window, so it
 // takes priority when it's actually available) > Compass Slash (any of the
-// 8 surrounding tiles) > Circuit Sigil deploy onto ENEMY_SUMMON_ROW (a
-// fixed row, not wherever the caster currently stands, so a mobile caster
-// can't scatter summons anywhere it's walked to) as a fallback build-up
-// action when nothing's in range yet. Pure decision — no state writes, no
-// dice rolled here (that happens where the result is applied, same
-// separation `computeElementalStrike` uses).
+// 8 surrounding tiles) > Piercing Light (2 tiles dead ahead, any cardinal
+// facing) > Pulse Wave (own element, any of the 8 axis directions, range 3)
+// > Circuit Sigil deploy onto ENEMY_SUMMON_ROW (a fixed row, not wherever
+// the caster currently stands, so a mobile caster can't scatter summons
+// anywhere it's walked to) as a fallback build-up action when nothing's in
+// range yet. (Longshot Protocol isn't decided here — it's a passive that
+// procs off movement itself, see checkLongshotProtocol.) Pure decision — no
+// state writes, no dice rolled here (that happens where the result is
+// applied, same separation `computeElementalStrike` uses).
 const resolveEnemyClassSkill = (thisEnemy, currentPlayer, currentSummons, tiles, enemyPositions) => {
   const loadout = thisEnemy.loadout || [];
   const used = thisEnemy.usedSkillIds || [];
-  const has = (id) => loadout.includes(id) && !used.includes(id);
-  if(has('darkWeb') && isKnightMove(thisEnemy.boardPosition, currentPlayer.boardPosition)){
+  const ap = thisEnemy.actionpts;
+  const has = (id, cost) => loadout.includes(id) && !used.includes(id) && ap>=cost;
+  if(has('darkWeb',2) && isKnightMove(thisEnemy.boardPosition, currentPlayer.boardPosition)){
     return { kind:'darkweb', skillId:'darkWeb' };
   }
-  if(has('compassSlash') && isAdjacent8(thisEnemy.boardPosition, currentPlayer.boardPosition)){
+  if(has('compassSlash',2) && isAdjacent8(thisEnemy.boardPosition, currentPlayer.boardPosition)){
     return { kind:'direct', skillId:'compassSlash' };
   }
-  if(has('circuitSigil')){
+  if(has('piercingLight',PIERCING_LIGHT_BASE_COST)){
+    const facing = piercingLightFacing(thisEnemy.boardPosition, currentPlayer.boardPosition);
+    if(facing) return { kind:'piercingLight', skillId:'piercingLight', facing };
+  }
+  if(has('pulseWave',4) && thisEnemy.element){
+    const dir = findAxisDirection(thisEnemy.boardPosition, currentPlayer.boardPosition);
+    if(dir){
+      const dist = Math.max(Math.abs(currentPlayer.boardPosition.x-thisEnemy.boardPosition.x),Math.abs(currentPlayer.boardPosition.y-thisEnemy.boardPosition.y));
+      if(dist<=3) return { kind:'pulseWave', skillId:'pulseWave', dir };
+    }
+  }
+  if(has('circuitSigil',2)){
     const ownCount = currentSummons.filter(s=>s.side==='enemy'&&s.ownerId===thisEnemy.id).length;
     if(ownCount<BANDWIDTH){
       const legal = getDeployTilesOnRow(ENEMY_SUMMON_ROW, tiles, currentPlayer.boardPosition, enemyPositions, currentSummons);
@@ -1008,7 +1123,25 @@ export const BATTLE_SKILLS = [
     id:'darkWeb', category:'tactical',
     name:'Dark Web', icon:'✕', color:'#a0a0a0',
     tagline:'Strike from angles no defender expects.',
-    blurb:'Moves and attacks in an L-pattern, like a chess knight — striking any of 8 offset tiles, bypassing adjacent defenders entirely. 70 base damage, 2 Energy, once per turn. A finishing blow claims the target\'s tile, same as any melee kill.',
+    blurb:'Moves and attacks in an L-pattern, like a chess knight — striking any of 8 offset tiles, bypassing adjacent defenders entirely. 70 base damage, 2 Energy, once per turn. Always leaps to the target tile — a finishing blow, a miss, or an empty tile used purely to reposition all land you there, unless something\'s already standing on it.',
+  },
+  {
+    id:'pulseWave', category:'tactical',
+    name:'Pulse Wave', icon:'♛', color:'#c9a7f7',
+    tagline:'A second cast of your own element, at a different range.',
+    blurb:'Fires a line of your equipped element 3 tiles out, in any of the 8 directions — hitting everyone caught along it. Uses your element\'s own dice, with no range or AoE scaling applied. 4 Energy, once per turn.',
+  },
+  {
+    id:'longshotProtocol', category:'tactical',
+    name:'Longshot Protocol', icon:'♗', color:'#88e0c0',
+    tagline:'A passive diagonal snipe.',
+    blurb:'Passive — no button, no cost. Whenever you reposition and end up within 3 tiles of an enemy along a clear diagonal, it automatically takes 10 damage. Blocked by anything standing in the line of sight. Doesn\'t trigger off melee, and doesn\'t cause any movement of its own.',
+  },
+  {
+    id:'piercingLight', category:'tactical',
+    name:'Piercing Light', icon:'♜', color:'#ffdd77',
+    tagline:'A thrust that runs clean through the front line.',
+    blurb:'A forward melee that hits both the adjacent tile and the one behind it in a single thrust. 3 Energy base — each additional Energy committed adds more damage, the same way a Melee burst scales.',
   },
 ];
 // A skill is available once it's either not gated at all, or has been
@@ -1372,6 +1505,52 @@ const MeleeMultiplierModal = ({show, perHitDamage, maxMultiplier, targetLabel, o
     </div>
   );
 };
+// Piercing Light's energy-investment modal — same shape as Melee Burst, but
+// starts at the skill's own base cost (3, not 1) and shows a flat per-point
+// damage buff rather than a hit-count multiplier, since it always hits
+// exactly the 2 tiles ahead of current facing regardless of Energy spent.
+const PiercingLightModal = ({show, maxEnergy, onConfirm, onClose}) => {
+  const [energy, setEnergy] = useState(PIERCING_LIGHT_BASE_COST);
+  useEffect(()=>{ if(show) setEnergy(PIERCING_LIGHT_BASE_COST); },[show]);
+  if(!show) return null;
+  const gold='#ffdd77';
+  const dmg = piercingLightDamage(energy);
+  return (
+    <div onClick={onClose} style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.82)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:2500}}>
+      <div onClick={e=>e.stopPropagation()} style={{background:'#080e14',border:`2px solid ${gold}`,borderRadius:10,padding:'1.4rem',maxWidth:380,width:'92%',color:'#b0dff4',boxShadow:`0 0 40px ${gold}44`}}>
+        <div style={{textAlign:'center',marginBottom:16}}>
+          <span style={{fontSize:24}}>♜</span>
+          <h2 style={{fontSize:'1.05rem',letterSpacing:'0.12em',textTransform:'uppercase',color:gold,marginTop:4}}>Piercing Light</h2>
+          <div style={{fontSize:'11px',color:'#5a7a8a',marginTop:2}}>Hits both tiles straight ahead — {PIERCING_LIGHT_BASE_COST} Energy minimum.</div>
+        </div>
+        <div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:14,marginBottom:14}}>
+          <button onClick={()=>setEnergy(e=>Math.max(PIERCING_LIGHT_BASE_COST,e-1))} disabled={energy<=PIERCING_LIGHT_BASE_COST}
+            style={{width:38,height:38,borderRadius:6,background:`${gold}18`,border:`1px solid ${gold}`,color:gold,fontSize:18,fontWeight:'bold',cursor:energy<=PIERCING_LIGHT_BASE_COST?'not-allowed':'pointer',opacity:energy<=PIERCING_LIGHT_BASE_COST?0.4:1}}>-</button>
+          <div style={{minWidth:70,textAlign:'center'}}>
+            <div style={{fontSize:28,fontWeight:'bold',color:gold}}>{energy}</div>
+            <div style={{fontSize:10,color:'#5a7a8a'}}>energy</div>
+          </div>
+          <button onClick={()=>setEnergy(e=>Math.min(maxEnergy,e+1))} disabled={energy>=maxEnergy}
+            style={{width:38,height:38,borderRadius:6,background:`${gold}18`,border:`1px solid ${gold}`,color:gold,fontSize:18,fontWeight:'bold',cursor:energy>=maxEnergy?'not-allowed':'pointer',opacity:energy>=maxEnergy?0.4:1}}>+</button>
+        </div>
+        <input type="range" min={PIERCING_LIGHT_BASE_COST} max={maxEnergy} value={energy} onChange={e=>setEnergy(Number(e.target.value))}
+          style={{width:'100%',marginBottom:14,accentColor:gold}} />
+        <div style={{background:'#0a1218',border:`1px solid ${gold}55`,borderRadius:8,padding:'10px 14px',marginBottom:14,textAlign:'center'}}>
+          <div style={{fontSize:11,color:'#7a9db5'}}>{dmg} dmg to each of the 2 tiles ahead</div>
+          <div style={{fontSize:22,fontWeight:'bold',color:gold,marginTop:2}}>{dmg} damage</div>
+        </div>
+        <button onClick={()=>onConfirm(energy)}
+          style={{width:'100%',padding:14,background:`${gold}22`,color:gold,border:`1px solid ${gold}`,borderRadius:6,fontSize:16,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.1em'}}>
+          Piercing Light ({energy}E)
+        </button>
+        <button onClick={onClose}
+          style={{width:'100%',marginTop:10,padding:8,background:'transparent',color:'#3a5a6a',border:'1px solid #1e3a4a',borderRadius:5,cursor:'pointer',fontSize:12}}>
+          Cancel
+        </button>
+      </div>
+    </div>
+  );
+};
 const ElementPickerModal = ({selectedCategory,selectedElement,onSelect,onClose,restrictToBase}) => {
   const allEl={...ELEMENTS.base,...ELEMENTS.minor,...ELEMENTS.major};
   const elData=allEl[selectedElement];
@@ -1409,7 +1588,7 @@ const ElementPickerModal = ({selectedCategory,selectedElement,onSelect,onClose,r
   );
 };
 
-const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedElement,onElementSelect,canAttack,canSkill,onMelee,onSkill,onEndTurn,onRollEnergy,energyPhase,onSurrender,enemy,enemyRolledEnergy,enemies,enemyRolledEnergyById,selectedEnemyId,onSelectEnemy,isPlayerTurn,loadout,summons,canCompassSlash,onCompassSlash,canCircuitSigil,onCircuitSigil,circuitSigilReason,canRotate,onRotate,canDarkWeb,onDarkWeb,hideElementalSkill,restrictElementsToBase,lockElementPicker}) => {
+const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedElement,onElementSelect,canAttack,canSkill,onMelee,onSkill,onEndTurn,onRollEnergy,energyPhase,onSurrender,enemy,enemyRolledEnergy,enemies,enemyRolledEnergyById,selectedEnemyId,onSelectEnemy,isPlayerTurn,loadout,summons,canCompassSlash,onCompassSlash,canCircuitSigil,onCircuitSigil,circuitSigilReason,canRotate,onRotate,canDarkWeb,onDarkWeb,canPulseWave,onPulseWave,canPiercingLight,onPiercingLight,hideElementalSkill,restrictElementsToBase,lockElementPicker}) => {
   const [showPicker,setShowPicker]=useState(false);
   const allEl={...ELEMENTS.base,...ELEMENTS.minor,...ELEMENTS.major};
   const elData=allEl[selectedElement];
@@ -1422,7 +1601,9 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
   const hasCompassSlash = loadout.includes('compassSlash');
   const hasCircuitSigil = loadout.includes('circuitSigil');
   const hasDarkWeb = loadout.includes('darkWeb');
-  const hasTacticalAction = hasCompassSlash || hasCircuitSigil || hasDarkWeb;
+  const hasPulseWave = loadout.includes('pulseWave');
+  const hasPiercingLight = loadout.includes('piercingLight');
+  const hasTacticalAction = hasCompassSlash || hasCircuitSigil || hasDarkWeb || hasPulseWave || hasPiercingLight;
   return (
     <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden',minHeight:0,height:'100%'}}>
         {/* Scrollable body — stats columns live here so they can never push the
@@ -1563,6 +1744,18 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
                 <button onClick={onDarkWeb} disabled={!canDarkWeb}
                   style={{flex:1.2,padding:'7px 4px',background:canDarkWeb?'rgba(160,160,160,0.18)':'rgba(20,30,40,0.6)',border:`1px solid ${canDarkWeb?'#a0a0a0':'#1e3a4a'}`,borderRadius:'4px',color:canDarkWeb?'#c8c8c8':'#2a4a5e',fontSize:'11px',fontWeight:600,cursor:canDarkWeb?'pointer':'not-allowed',letterSpacing:'.03em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
                   DARK WEB<div style={{fontSize:'8px',opacity:0.7}}>{player.usedSkillIds.includes('darkWeb')?'used':'2E'}</div>
+                </button>
+              )}
+              {hasPulseWave&&(
+                <button onClick={onPulseWave} disabled={!canPulseWave}
+                  style={{flex:1.2,padding:'7px 4px',background:canPulseWave?'rgba(201,167,247,0.18)':'rgba(20,30,40,0.6)',border:`1px solid ${canPulseWave?'#c9a7f7':'#1e3a4a'}`,borderRadius:'4px',color:canPulseWave?'#c9a7f7':'#2a4a5e',fontSize:'11px',fontWeight:600,cursor:canPulseWave?'pointer':'not-allowed',letterSpacing:'.03em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
+                  PULSE WAVE<div style={{fontSize:'8px',opacity:0.7}}>{player.usedSkillIds.includes('pulseWave')?'used':'4E'}</div>
+                </button>
+              )}
+              {hasPiercingLight&&(
+                <button onClick={onPiercingLight} disabled={!canPiercingLight}
+                  style={{flex:1.2,padding:'7px 4px',background:canPiercingLight?'rgba(255,221,119,0.18)':'rgba(20,30,40,0.6)',border:`1px solid ${canPiercingLight?'#ffdd77':'#1e3a4a'}`,borderRadius:'4px',color:canPiercingLight?'#ffdd77':'#2a4a5e',fontSize:'11px',fontWeight:600,cursor:canPiercingLight?'pointer':'not-allowed',letterSpacing:'.03em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
+                  PIERCING LIGHT<div style={{fontSize:'8px',opacity:0.7}}>{player.usedSkillIds.includes('piercingLight')?'used':`${PIERCING_LIGHT_BASE_COST}E+`}</div>
                 </button>
               )}
               <button onClick={onEndTurn}
@@ -2263,7 +2456,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const initEnemy  = (p) => scene==='skills'
     ? makeEnemyProxie(1, 1, rollBackRowPosition(0), {
         element: BOSS_ELEMENTS[Math.floor(Math.random()*BOSS_ELEMENTS.length)],
-        loadout: ['compassSlash','darkWeb','circuitSigil'],
+        loadout: ['compassSlash','darkWeb','pulseWave','longshotProtocol','piercingLight','circuitSigil'],
       })
     : newGoblin(1, p.boardPosition);
 
@@ -2339,6 +2532,13 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // Rogue's Dark Web targeting state: when true, grid clicks pick one of the
   // 8 knight-move tiles.
   const [darkWebTargeting, setDarkWebTargeting] = useState(false);
+  // Pulse Wave targeting state: when true, grid clicks pick which of the 8
+  // axis directions (any tile up to 3 out along it) to fire down.
+  const [pulseWaveTargeting, setPulseWaveTargeting] = useState(false);
+  // Piercing Light's energy-investment modal context — set when armed,
+  // null when closed. No grid targeting phase; it always hits the 2 tiles
+  // straight ahead of current facing, same as ordinary Melee.
+  const [piercingLightCtx, setPiercingLightCtx] = useState(null);
   // Rotate: once-per-turn, 0-cost facing change. True while the direction
   // picker banner is open.
   const [rotateTargeting, setRotateTargeting] = useState(false);
@@ -2387,6 +2587,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const canCompassSlash = loadout.includes('compassSlash') && isPlayerTurn && energyPhase==='act' && !player.usedSkillIds.includes('compassSlash') && player.actionpts >= 2;
   const canCircuitSigil = loadout.includes('circuitSigil') && isPlayerTurn && energyPhase==='act' && !player.usedSkillIds.includes('circuitSigil') && player.actionpts >= 2;
   const canDarkWeb = loadout.includes('darkWeb') && isPlayerTurn && energyPhase==='act' && !player.usedSkillIds.includes('darkWeb') && player.actionpts >= 2;
+  const canPulseWave = loadout.includes('pulseWave') && isPlayerTurn && energyPhase==='act' && !player.usedSkillIds.includes('pulseWave') && player.actionpts >= 4;
+  const canPiercingLight = loadout.includes('piercingLight') && isPlayerTurn && energyPhase==='act' && !player.usedSkillIds.includes('piercingLight') && player.actionpts >= PIERCING_LIGHT_BASE_COST;
   // Rotate: 0 Energy, once per turn — a free facing change for tactical
   // repositioning (evade a flank, line up a ranged skill) without spending AP.
   const canRotate = isPlayerTurn && energyPhase==='act' && !player.rotateUsed;
@@ -2665,7 +2867,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       // decision logic; Deploy is skipped here rather than adding enemy-side
       // summon-commanding to the single-enemy engine — Direct (Compass
       // Slash) and Dark Web both still work.
-      const hasUnusedClassLikeSkill = (currentEnemy.loadout||[]).some(id=>['compassSlash','darkWeb','circuitSigil'].includes(id) && !(currentEnemy.usedSkillIds||[]).includes(id));
+      const hasUnusedClassLikeSkill = (currentEnemy.loadout||[]).some(id=>['compassSlash','darkWeb','pulseWave','piercingLight','circuitSigil'].includes(id) && !(currentEnemy.usedSkillIds||[]).includes(id));
       const canUseClassSkill = hasUnusedClassLikeSkill && currentEnemy.actionpts>=2 && Math.random()<0.6;
 
       const lowHP = currentEnemy.health <= currentEnemy.maxHealth * 0.3;
@@ -2747,6 +2949,38 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           updatedPlayer={...currentPlayer,health:newHP};
           updatedEnemy=markSkillUsed({...currentEnemy,actionpts:currentEnemy.actionpts-2,facing,
             boardPosition: newHP<=0 ? currentPlayer.boardPosition : currentEnemy.boardPosition},'darkWeb');
+          setPlayer(updatedPlayer); setEnemy(updatedEnemy);
+          if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
+          setTimeout(()=>{
+            if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound);
+            else finishEnemyToPlayer(updatedPlayer,updatedEnemy,currentRound);
+          },600);
+          return;
+        }
+        if(decision?.kind==='piercingLight'){
+          const energySpent=piercingLightAutoSpend(currentEnemy.actionpts,currentPlayer.health);
+          const dmg=piercingLightDamage(energySpent);
+          const newHP=Math.max(0,currentPlayer.health-dmg);
+          addLog(`${currentEnemy.name} Piercing Light${energySpent>PIERCING_LIGHT_BASE_COST?` (${energySpent}E)`:''} -> ${dmg} dmg`);
+          triggerCastFx(currentPlayer.boardPosition,'#ffdd77');
+          updatedPlayer={...currentPlayer,health:newHP};
+          updatedEnemy=markSkillUsed({...currentEnemy,actionpts:currentEnemy.actionpts-energySpent,facing:decision.facing},'piercingLight');
+          setPlayer(updatedPlayer); setEnemy(updatedEnemy);
+          if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
+          setTimeout(()=>{
+            if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound);
+            else finishEnemyToPlayer(updatedPlayer,updatedEnemy,currentRound);
+          },600);
+          return;
+        }
+        if(decision?.kind==='pulseWave'){
+          const strike=computePulseWaveDamage(currentEnemy);
+          const newFacing=facingToward(currentEnemy.boardPosition,currentPlayer.boardPosition);
+          const newHP=Math.max(0,currentPlayer.health-strike.dmg);
+          addLog(`${currentEnemy.name} Pulse Wave [${strike.rollsLabel}, ${strike.acc}% (${accuracyTierLabel(strike.acc)})] -> ${strike.dmg} dmg`);
+          triggerCastFx(currentPlayer.boardPosition, ELEMENTS[currentEnemy.elementCategory]?.[currentEnemy.element]?.color||'#c9a7f7');
+          updatedPlayer={...currentPlayer,health:newHP};
+          updatedEnemy=markSkillUsed({...currentEnemy,actionpts:currentEnemy.actionpts-4,facing:newFacing},'pulseWave');
           setPlayer(updatedPlayer); setEnemy(updatedEnemy);
           if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
           setTimeout(()=>{
@@ -2920,6 +3154,19 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           setEnemy(restedEnemy);
           finishEnemyToPlayer(updatedPlayer,restedEnemy,currentRound);
           return;
+        }
+        // Longshot Protocol — a repositioning move, so it checks right here.
+        if((currentEnemy.loadout||[]).includes('longshotProtocol')){
+          const blockers=updatedSummons.map(s=>s.boardPosition);
+          const hit=checkLongshotProtocol(updatedEnemy.boardPosition,[currentPlayer],blockers);
+          if(hit){
+            const newHP=Math.max(0,currentPlayer.health-LONGSHOT_DMG);
+            addLog(`◎ ${updatedEnemy.name} Longshot Protocol -> ${LONGSHOT_DMG} dmg (${newHP}/${currentPlayer.maxHealth})`);
+            triggerCastFx(currentPlayer.boardPosition,'#88e0c0');
+            updatedPlayer={...currentPlayer,health:newHP};
+            setPlayer(updatedPlayer);
+            if(newHP<=0){ setEnemy(updatedEnemy); addLog('=== DEFEAT ==='); return; }
+          }
         }
         setEnemy(updatedEnemy);
       }
@@ -3358,8 +3605,15 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const hitsEnemy = enemy.boardPosition.x===targetTile.x && enemy.boardPosition.y===targetTile.y;
     setDarkWebTargeting(false);
     if(!hitsEnemy){
-      addLog('// Dark Web strikes empty tile — 2 Energy spent');
-      const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2)},'darkWeb');
+      // No target on the tile — Dark Web now doubles as a repositioning
+      // tool (leap to any knight-move tile), not just a wasted swing. Still
+      // blocked if a summon already occupies the landing tile.
+      const occupied = summons.some(s=>s.boardPosition.x===targetTile.x&&s.boardPosition.y===targetTile.y);
+      const leapFacing=facingFromMove(player.boardPosition,targetTile);
+      const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),
+        ...(occupied?{}:{boardPosition:targetTile,facing:leapFacing})},'darkWeb');
+      addLog(occupied ? '// Dark Web strikes an occupied tile — 2 Energy spent, no leap'
+        : `Dark Web leaps to (${targetTile.x},${targetTile.y}) — 2 Energy spent`);
       routeAfterPlayerAction(updatedPlayer, enemy);
       return;
     }
@@ -3381,6 +3635,67 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),facing:strikeFacing},'darkWeb');
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[player,enemy,summons,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx]);
+
+  // ── PULSE WAVE (Tactical Skill) ──
+  // Your own equipped element, cast a second time down a chosen axis (any
+  // of the 8 directions) at a fixed 3-tile range instead of the base SKILL
+  // button's normal range/AoE rules — see computePulseWaveDamage.
+  const handlePulseWave = useCallback(()=>{
+    if(!canPulseWave) return;
+    setPulseWaveTargeting(true);
+    addLog('// Pulse Wave armed — click a tile up to 3 out on any straight or diagonal axis');
+  },[canPulseWave,addLog]);
+
+  const resolvePulseWave = useCallback((targetTile)=>{
+    const dir = findAxisDirection(player.boardPosition, targetTile);
+    const dist = dir ? Math.max(Math.abs(targetTile.x-player.boardPosition.x),Math.abs(targetTile.y-player.boardPosition.y)) : 0;
+    setPulseWaveTargeting(false);
+    if(!dir || dist>3){ addLog('// Target not on a straight or diagonal line within 3 tiles'); return; }
+    const strike = computePulseWaveDamage({element:selElement,elementCategory:selCategory});
+    if(!strike){ addLog('// No element equipped'); return; }
+    const line = getAxisLine(player.boardPosition, dir, 3);
+    const hitsEnemy = line.some(t=>t.x===enemy.boardPosition.x&&t.y===enemy.boardPosition.y);
+    const newFacing=facingToward(player.boardPosition,targetTile);
+    const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-4),facing:newFacing},'pulseWave');
+    if(!hitsEnemy){
+      addLog(`Pulse Wave [${strike.rollsLabel}, ${strike.acc}% (${accuracyTierLabel(strike.acc)})] -> no targets on the line`);
+      routeAfterPlayerAction(updatedPlayer, enemy);
+      return;
+    }
+    const newHP=Math.max(0,enemy.health-strike.dmg);
+    addLog(`Pulse Wave [${strike.rollsLabel}, ${strike.acc}% (${accuracyTierLabel(strike.acc)})] -> ${strike.dmg} dmg`);
+    triggerCastFx(enemy.boardPosition, ELEMENTS[selCategory]?.[selElement]?.color||'#c9a7f7');
+    const updatedEnemy={...enemy,health:newHP};
+    if(newHP<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
+    routeAfterPlayerAction(updatedPlayer, updatedEnemy);
+  },[player,enemy,wave,selCategory,selElement,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx]);
+
+  // ── PIERCING LIGHT (Tactical Skill) ──
+  // A 2-tile-forward thrust, using current facing — no grid targeting
+  // phase, same as ordinary Melee. Opens the energy-investment modal instead.
+  const handlePiercingLight = useCallback(()=>{
+    if(!canPiercingLight) return;
+    setPiercingLightCtx({maxEnergy:player.actionpts});
+  },[canPiercingLight,player]);
+
+  const resolvePiercingLight = useCallback((energySpent)=>{
+    setPiercingLightCtx(null);
+    const dmg = piercingLightDamage(energySpent);
+    const line = getForwardTiles(player.boardPosition, player.facing, 2);
+    const hitsEnemy = line.some(t=>t.x===enemy.boardPosition.x&&t.y===enemy.boardPosition.y);
+    const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-energySpent)},'piercingLight');
+    if(!hitsEnemy){
+      addLog(`Piercing Light thrust -> no targets in the 2 tiles ahead — ${energySpent} Energy spent`);
+      routeAfterPlayerAction(updatedPlayer, enemy);
+      return;
+    }
+    const newHP=Math.max(0,enemy.health-dmg);
+    addLog(`Piercing Light -> ${dmg} dmg (${newHP}/${enemy.maxHealth})`);
+    triggerCastFx(enemy.boardPosition,'#ffdd77');
+    const updatedEnemy={...enemy,health:newHP};
+    if(newHP<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
+    routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   },[player,enemy,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx]);
 
   // ── CIRCUIT SIGIL (Core Skill, crafting-locked — dormant until BATTLE_SKILLS
@@ -3566,7 +3881,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       const eElData=updatedEnemy.element?ELEMENTS[updatedEnemy.elementCategory]?.[updatedEnemy.element]:null;
       const eMinCost=eElData?getSkillCost(updatedEnemy.elementCategory,updatedEnemy.element):1;
       const canUseElement = updatedEnemy.element && canElementReachTarget(updatedEnemy,updatedPlayer,updatedEnemy.actionpts) && !updatedEnemy.skillUsed && updatedEnemy.actionpts>=eMinCost && Math.random()<0.6;
-      const hasUnusedClassLikeSkill = (updatedEnemy.loadout||[]).some(id=>['compassSlash','darkWeb','circuitSigil'].includes(id) && !(updatedEnemy.usedSkillIds||[]).includes(id));
+      const hasUnusedClassLikeSkill = (updatedEnemy.loadout||[]).some(id=>['compassSlash','darkWeb','pulseWave','piercingLight','circuitSigil'].includes(id) && !(updatedEnemy.usedSkillIds||[]).includes(id));
       const canUseClass = hasUnusedClassLikeSkill && updatedEnemy.actionpts>=2 && Math.random()<0.6;
 
       const lowHP = updatedEnemy.health <= updatedEnemy.maxHealth*0.3;
@@ -3655,6 +3970,32 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           updatedPlayer={...updatedPlayer,health:newHP};
           updatedEnemy=markSkillUsed({...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-2),facing,
             boardPosition: newHP<=0 ? updatedPlayer.boardPosition : updatedEnemy.boardPosition},'darkWeb');
+          setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
+          if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
+          finishStep();
+          return;
+        }
+        if(decision?.kind==='piercingLight'){
+          const energySpent=piercingLightAutoSpend(updatedEnemy.actionpts,updatedPlayer.health);
+          const dmg=piercingLightDamage(energySpent);
+          const newHP=Math.max(0,updatedPlayer.health-dmg);
+          addLog(`${updatedEnemy.name} Piercing Light${energySpent>PIERCING_LIGHT_BASE_COST?` (${energySpent}E)`:''} -> ${dmg} dmg`);
+          triggerCastFx(updatedPlayer.boardPosition,'#ffdd77');
+          updatedPlayer={...updatedPlayer,health:newHP};
+          updatedEnemy=markSkillUsed({...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-energySpent),facing:decision.facing},'piercingLight');
+          setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
+          if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
+          finishStep();
+          return;
+        }
+        if(decision?.kind==='pulseWave'){
+          const strike=computePulseWaveDamage(updatedEnemy);
+          const newFacing=facingToward(updatedEnemy.boardPosition,updatedPlayer.boardPosition);
+          const newHP=Math.max(0,updatedPlayer.health-strike.dmg);
+          addLog(`${updatedEnemy.name} Pulse Wave [${strike.rollsLabel}, ${strike.acc}% (${accuracyTierLabel(strike.acc)})] -> ${strike.dmg} dmg`);
+          triggerCastFx(updatedPlayer.boardPosition, ELEMENTS[updatedEnemy.elementCategory]?.[updatedEnemy.element]?.color||'#c9a7f7');
+          updatedPlayer={...updatedPlayer,health:newHP};
+          updatedEnemy=markSkillUsed({...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-4),facing:newFacing},'pulseWave');
           setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
           if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
           finishStep();
@@ -3752,6 +4093,18 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
         onDone(updatedPlayer,allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e),updatedSummons);
         return;
+      }
+      // Longshot Protocol — a repositioning move, so it checks right here.
+      if((updatedEnemy.loadout||[]).includes('longshotProtocol')){
+        const hit=checkLongshotProtocol(updatedEnemy.boardPosition,[updatedPlayer],moveBlockers);
+        if(hit){
+          const newHP=Math.max(0,updatedPlayer.health-LONGSHOT_DMG);
+          addLog(`◎ ${updatedEnemy.name} Longshot Protocol -> ${LONGSHOT_DMG} dmg (${newHP}/${updatedPlayer.maxHealth})`);
+          triggerCastFx(updatedPlayer.boardPosition,'#88e0c0');
+          updatedPlayer={...updatedPlayer,health:newHP};
+          setPlayer(updatedPlayer);
+          if(newHP<=0){ setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e)); addLog('=== DEFEAT ==='); return; }
+        }
       }
       setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
       finishStep();
@@ -4144,8 +4497,16 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const target = enemies.find(e=>e.boardPosition.x===targetTile.x&&e.boardPosition.y===targetTile.y);
     setDarkWebTargeting(false);
     if(!target){
-      addLog('// Dark Web strikes empty tile — 2 Energy spent');
-      routeAfterPlayerActionMulti(markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2)},'darkWeb'), enemies);
+      // No target on the tile — Dark Web now doubles as a repositioning
+      // tool (leap to any knight-move tile), not just a wasted swing. Still
+      // blocked if a summon already occupies the landing tile.
+      const occupied = summons.some(s=>s.boardPosition.x===targetTile.x&&s.boardPosition.y===targetTile.y);
+      const leapFacing=facingFromMove(player.boardPosition,targetTile);
+      const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),
+        ...(occupied?{}:{boardPosition:targetTile,facing:leapFacing})},'darkWeb');
+      addLog(occupied ? '// Dark Web strikes an occupied tile — 2 Energy spent, no leap'
+        : `Dark Web leaps to (${targetTile.x},${targetTile.y}) — 2 Energy spent`);
+      routeAfterPlayerActionMulti(updatedPlayer, enemies);
       return;
     }
     const acc=rollD100Accuracy();
@@ -4156,7 +4517,71 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(newHP<=0) updatedPlayer={...updatedPlayer,boardPosition:targetTile};
     addLog(`Dark Web -> ${dmg} dmg (${acc}% ${accuracyTierLabel(acc)})${newHP<=0?' — finishing blow, claims tile':''}`);
     applySkillResultMulti(target, dmg, updatedPlayer, {}, '#a0a0a0');
-  },[player,enemies,addLog,applySkillResultMulti,routeAfterPlayerActionMulti]);
+  },[player,enemies,summons,addLog,applySkillResultMulti,routeAfterPlayerActionMulti]);
+
+  // Shared tail for a multi-hit skill (Pulse Wave, Piercing Light) once
+  // damage has already been applied to every hit enemy in `damaged`: routes
+  // a no-kill result normally, a single kill through the real defeat
+  // pipeline (XP/Hexas/battle-clear), and any *additional* simultaneous
+  // kills by granting their XP/Hexas directly and folding them out of the
+  // roster before that one pipeline call, so nothing double-counts and the
+  // "battle cleared" check still sees the true final roster.
+  const resolveMultiHitKills = useCallback((hitIds, damaged, updatedPlayer, skillLabel)=>{
+    const firstKillId = damaged.find(e=>hitIds.has(e.id)&&e.health<=0)?.id;
+    if(!firstKillId){ setPlayer(updatedPlayer); setEnemies(damaged); return; }
+    const otherDeadIds = damaged.filter(e=>hitIds.has(e.id)&&e.id!==firstKillId&&e.health<=0).map(e=>e.id);
+    const rosterForDefeat = otherDeadIds.length===0 ? damaged : damaged.filter(e=>!otherDeadIds.includes(e.id));
+    if(otherDeadIds.length>0){
+      const extraXp=(150+campaignBattle*150)*otherDeadIds.length;
+      const extraHex=(40+campaignBattle*30)*otherDeadIds.length;
+      addLog(`+${extraXp} XP, +${extraHex} Hexas from ${otherDeadIds.length} more ${skillLabel} kill${otherDeadIds.length>1?'s':''}`);
+      setHexas(h=>h+extraHex);
+      handleEnemyDefeatedMulti(firstKillId, {...updatedPlayer, playerXp:(updatedPlayer.playerXp||0)+extraXp}, rosterForDefeat);
+    } else {
+      handleEnemyDefeatedMulti(firstKillId, updatedPlayer, rosterForDefeat);
+    }
+  },[campaignBattle,addLog,handleEnemyDefeatedMulti]);
+
+  // ── PULSE WAVE (Tactical Skill) — Campaign ──
+  const resolvePulseWaveMulti = useCallback((targetTile)=>{
+    const dir = findAxisDirection(player.boardPosition, targetTile);
+    const dist = dir ? Math.max(Math.abs(targetTile.x-player.boardPosition.x),Math.abs(targetTile.y-player.boardPosition.y)) : 0;
+    setPulseWaveTargeting(false);
+    if(!dir || dist>3){ addLog('// Target not on a straight or diagonal line within 3 tiles'); return; }
+    const strike = computePulseWaveDamage({element:selElement,elementCategory:selCategory});
+    if(!strike){ addLog('// No element equipped'); return; }
+    const line = getAxisLine(player.boardPosition, dir, 3);
+    const hitIds = new Set(enemies.filter(e=>line.some(t=>t.x===e.boardPosition.x&&t.y===e.boardPosition.y)).map(e=>e.id));
+    const newFacing=facingToward(player.boardPosition,targetTile);
+    const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-4),facing:newFacing},'pulseWave');
+    if(hitIds.size===0){
+      addLog(`Pulse Wave [${strike.rollsLabel}, ${strike.acc}% (${accuracyTierLabel(strike.acc)})] -> no targets on the line`);
+      routeAfterPlayerActionMulti(updatedPlayer, enemies);
+      return;
+    }
+    addLog(`Pulse Wave [${strike.rollsLabel}, ${strike.acc}% (${accuracyTierLabel(strike.acc)})] -> ${strike.dmg} dmg to ${hitIds.size} target${hitIds.size>1?'s':''}`);
+    enemies.forEach(e=>{ if(hitIds.has(e.id)) triggerCastFx(e.boardPosition, ELEMENTS[selCategory]?.[selElement]?.color||'#c9a7f7'); });
+    const damaged = enemies.map(e=>hitIds.has(e.id)?{...e,health:Math.max(0,e.health-strike.dmg)}:e);
+    resolveMultiHitKills(hitIds, damaged, updatedPlayer, 'Pulse Wave');
+  },[player,enemies,selCategory,selElement,addLog,resolveMultiHitKills,routeAfterPlayerActionMulti,triggerCastFx]);
+
+  // ── PIERCING LIGHT (Tactical Skill) — Campaign ──
+  const resolvePiercingLightMulti = useCallback((energySpent)=>{
+    setPiercingLightCtx(null);
+    const dmg = piercingLightDamage(energySpent);
+    const line = getForwardTiles(player.boardPosition, player.facing, 2);
+    const hitIds = new Set(enemies.filter(e=>line.some(t=>t.x===e.boardPosition.x&&t.y===e.boardPosition.y)).map(e=>e.id));
+    const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-energySpent)},'piercingLight');
+    if(hitIds.size===0){
+      addLog(`Piercing Light thrust -> no targets in the 2 tiles ahead — ${energySpent} Energy spent`);
+      routeAfterPlayerActionMulti(updatedPlayer, enemies);
+      return;
+    }
+    addLog(`Piercing Light -> ${dmg} dmg to ${hitIds.size} target${hitIds.size>1?'s':''}`);
+    enemies.forEach(e=>{ if(hitIds.has(e.id)) triggerCastFx(e.boardPosition,'#ffdd77'); });
+    const damaged = enemies.map(e=>hitIds.has(e.id)?{...e,health:Math.max(0,e.health-dmg)}:e);
+    resolveMultiHitKills(hitIds, damaged, updatedPlayer, 'Piercing Light');
+  },[player,enemies,addLog,resolveMultiHitKills,routeAfterPlayerActionMulti,triggerCastFx]);
 
   const resolveDeployPlacementMulti = useCallback((tile)=>{
     const legal=deployTilesMulti.some(t=>t.x===tile.x&&t.y===tile.y);
@@ -4314,6 +4739,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(compassTargeting){ (isCampaign?resolveCompassSlashMulti:resolveCompassSlash)({x,y}); return; }
     // Dark Web targeting mode
     if(darkWebTargeting){ (isCampaign?resolveDarkWebMulti:resolveDarkWeb)({x,y}); return; }
+    // Pulse Wave targeting mode
+    if(pulseWaveTargeting){ (isCampaign?resolvePulseWaveMulti:resolvePulseWave)({x,y}); return; }
     // Summon command sub-phase — only the player's own summons are
     // selectable here; any enemy-deployed summons on the board (Campaign)
     // are commanded automatically by their owner's own AI turn.
@@ -4380,10 +4807,31 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     addLog(`You move to (${x},${y})${target.distance>1?` [-${target.distance}E]`:''}`);
     if(healMsg) addLog(healMsg);
     setPlayer(updatedPlayer);
+    // Longshot Protocol — a repositioning move only (not melee, not another
+    // skill's own tile-claim), so it hooks in right here rather than at
+    // every action that happens to change boardPosition.
+    if(loadout.includes('longshotProtocol')){
+      const targets = isCampaign ? enemies : [enemy];
+      const blockers = [...summons.map(s=>s.boardPosition), ...(isCampaign?enemies.map(e=>e.boardPosition):[])];
+      const hit = checkLongshotProtocol(updatedPlayer.boardPosition, targets, blockers);
+      if(hit){
+        const newHP=Math.max(0,hit.health-LONGSHOT_DMG);
+        addLog(`◎ Longshot Protocol -> ${hit.name} takes ${LONGSHOT_DMG} dmg (${newHP}/${hit.maxHealth})`);
+        triggerCastFx(hit.boardPosition,'#88e0c0');
+        if(isCampaign){
+          const updatedEnemies=enemies.map(e=>e.id===hit.id?{...e,health:newHP}:e);
+          setEnemies(updatedEnemies);
+          if(newHP<=0) setTimeout(()=>handleEnemyDefeatedMulti(hit.id,updatedPlayer,updatedEnemies),300);
+        } else {
+          setEnemy({...enemy,health:newHP});
+          if(newHP<=0) setTimeout(()=>handleEnemyDefeated(updatedPlayer,wave),300);
+        }
+      }
+    }
     setPlayerSel(false);
     setValidSquares([]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[isCampaign,showDeploy,awaitingPlacement,compassTargeting,darkWebTargeting,summonPhaseActive,energyPhase,summons,actedSummonIds,selectedSummonId,isPlayerTurn,player,enemy,enemies,playerSel,validSquares,tiles,addLog,resolveDeployPlacement,resolveDeployPlacementMulti,resolveCompassSlash,resolveCompassSlashMulti,resolveDarkWeb,resolveDarkWebMulti,summonActionAt,summonActionAtMulti,resolveSummonAction,resolveSummonActionMulti]);
+  },[isCampaign,showDeploy,awaitingPlacement,compassTargeting,darkWebTargeting,pulseWaveTargeting,summonPhaseActive,energyPhase,summons,actedSummonIds,selectedSummonId,isPlayerTurn,player,enemy,enemies,playerSel,validSquares,tiles,loadout,wave,addLog,triggerCastFx,handleEnemyDefeated,handleEnemyDefeatedMulti,resolveDeployPlacement,resolveDeployPlacementMulti,resolveCompassSlash,resolveCompassSlashMulti,resolveDarkWeb,resolveDarkWebMulti,resolvePulseWave,resolvePulseWaveMulti,summonActionAt,summonActionAtMulti,resolveSummonAction,resolveSummonActionMulti]);
 
   // Auto-end the summon command phase once all of the PLAYER's own summons
   // have acted (or pool is empty) — enemy-deployed summons in Campaign act
@@ -4566,6 +5014,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
                 circuitSigilReason={isCampaign?deployBlockedReasonMulti:deployBlockedReason}
                 canRotate={canRotate} onRotate={handleRotateOpen}
                 canDarkWeb={canDarkWeb} onDarkWeb={handleDarkWeb}
+                canPulseWave={canPulseWave} onPulseWave={handlePulseWave}
+                canPiercingLight={canPiercingLight} onPiercingLight={handlePiercingLight}
                 hideElementalSkill={!sceneAllowSkill} restrictElementsToBase={sceneRestrictBaseElements}
                 lockElementPicker={isCampaign}
               />
@@ -4685,6 +5135,12 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         targetLabel={meleeModalCtx?.targetLabel}
         onConfirm={isCampaign?resolveMeleeMulti:resolveMelee}
         onClose={()=>setMeleeModalCtx(null)}
+      />
+      <PiercingLightModal
+        show={!!piercingLightCtx}
+        maxEnergy={piercingLightCtx?.maxEnergy||PIERCING_LIGHT_BASE_COST}
+        onConfirm={isCampaign?resolvePiercingLightMulti:resolvePiercingLight}
+        onClose={()=>setPiercingLightCtx(null)}
       />
       <RewardModal show={reward.show} html={reward.html} />
       <SceneCompleteModal show={sceneComplete} sceneMeta={sceneMeta} onReturn={()=>onSceneComplete?.()} />
