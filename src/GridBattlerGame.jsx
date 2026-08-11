@@ -711,12 +711,12 @@ const randomEnemyLoadout = () => {
 const ENEMY_CLASS_POOL = ['Summoner','Rogue'];
 
 let ENEMY_SEQ = 0;
-const makeEnemyProxie = (rank, level, pos, { element=null, loadout=[], isBoss=false } = {}) => {
-  const hp = ENEMY_HP_W1+(level-1)*ENEMY_HP_SCALE;
+const makeEnemyProxie = (rank, level, pos, { element=null, loadout=[], isBoss=false, hp=null } = {}) => {
+  const hpValue = hp ?? (ENEMY_HP_W1+(level-1)*ENEMY_HP_SCALE);
   const agi = Math.min(1+Math.floor(level/3),3);
   const name = isBoss ? 'Command Proxie' : element ? `${element} Warden` : 'Grunt Proxie';
   return {
-    ...makeCharacter(name, hp, level, agi, 0, pos, element, element?'base':null),
+    ...makeCharacter(name, hpValue, level, agi, 0, pos, element, element?'base':null),
     energyRollover:0,
     id: `E${++ENEMY_SEQ}`,
     rank,
@@ -727,19 +727,20 @@ const makeEnemyProxie = (rank, level, pos, { element=null, loadout=[], isBoss=fa
 };
 
 // The 3-battle Campaign arc: escalating from a pair of single-skill Rank 4
-// grunts to a lone Rank 1 "Full Proxie" finale. `level` drives HP/melee-base
-// scaling via the existing enemyTier system, independent of rank.
-// `narrative` is the lead-in shown before that battle starts (intro modal
-// for stage 1, battle-complete "Continue" modal for 2/3). `victoryNarrative`
-// is finale-only, shown on Campaign completion alongside the reward grant.
-// Placeholder prose — first pass, meant to be rewritten once the wider story
-// is nailed down.
+// grunts to a lone Rank 1 "Full Proxie" finale. `level` still drives
+// agility/melee-base scaling via the existing enemyTier system, but HP is
+// now an explicit per-battle `hp` tuning knob instead of being derived from
+// `level` (which Gauntlet also depends on) — first-pass balance numbers,
+// meant to be adjusted from here as playtesting continues. `narrative` is
+// the lead-in shown before that battle starts (intro modal for stage 1,
+// battle-complete "Continue" modal for 2/3). `victoryNarrative` is
+// finale-only, shown on Campaign completion alongside the reward grant.
 export const CAMPAIGN_BATTLES = [
-  { stage:1, name:'Skirmish Line',  roster:[{rank:4},{rank:4}], level:2,
+  { stage:1, name:'Skirmish Line',  roster:[{rank:4},{rank:4}], level:2,  hp:250,
     narrative:'Grid intercepts flag a fractured patrol at the outer perimeter — two rogue processes running on minimal instruction sets. Clear them before they regroup.' },
-  { stage:2, name:'Strike Squad',   roster:[{rank:3},{rank:3}], level:8,
+  { stage:2, name:'Strike Squad',   roster:[{rank:3},{rank:3}], level:8,  hp:400,
     narrative:'The breach widens. A coordinated strike squad has moved in to reinforce the perimeter — better instantiated than the scouts that came before.' },
-  { stage:3, name:'Command Proxie', roster:[{rank:1}],          level:10, isFinale:true,
+  { stage:3, name:'Command Proxie', roster:[{rank:1}],          level:10, hp:650, isFinale:true,
     narrative:'At the heart of the breach: a Command Proxie, fully instantiated, every subsystem online — mirroring your own build back at you, shadowboxing against exactly what you brought in. This is what has been holding the line.',
     victoryNarrative:'The Command Proxie\'s core destabilizes and goes dark. The breach is yours.' },
 ];
@@ -768,7 +769,7 @@ const spawnCampaignRoster = (stage, playerPos, mirror=null) => {
     const isBoss = !!battle.isFinale;
     const element = isBoss && mirror ? mirror.element : BOSS_ELEMENTS[Math.floor(Math.random()*BOSS_ELEMENTS.length)];
     const loadout = isBoss && mirror ? mirror.loadout : randomEnemyLoadout();
-    placed.push(makeEnemyProxie(rank, battle.level, {x:pos.x,y:pos.y}, {element, loadout, isBoss}));
+    placed.push(makeEnemyProxie(rank, battle.level, {x:pos.x,y:pos.y}, {element, loadout, isBoss, hp:battle.hp}));
   });
   return placed;
 };
@@ -3600,6 +3601,20 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     addLog('// Dark Web armed — click a knight-move tile where the enemy stands');
   },[canDarkWeb,addLog]);
 
+  // Checks whether landing on `tile` (from any movement-granting action —
+  // ordinary movement, Dark Web's leap or finishing-blow claim) hits the
+  // healing node, applying the heal and consuming the tile the same way
+  // ordinary movement already does. Returns the post-heal HP (unchanged if
+  // the tile wasn't the healing node).
+  const applyHealingIfLanded = useCallback((tile, currentHealth, maxHealth)=>{
+    if(tiles[tile.y][tile.x] !== TILE_TYPES.HEALING) return currentHealth;
+    const healedHP = Math.min(maxHealth, currentHealth+100);
+    setHealingConsumed(true);
+    setTiles(prev=>{const g=prev.map(r=>r.slice()); if(g[tile.y][tile.x]===TILE_TYPES.HEALING) g[tile.y][tile.x]=TILE_TYPES.NORMAL; return g;});
+    addLog(`Healing node -> +100 HP (${healedHP}/${maxHealth})`);
+    return healedHP;
+  },[tiles,addLog]);
+
   const resolveDarkWeb = useCallback((targetTile)=>{
     if(!isKnightMove(player.boardPosition,targetTile)){ addLog('// Target not a knight-move tile'); return; }
     const hitsEnemy = enemy.boardPosition.x===targetTile.x && enemy.boardPosition.y===targetTile.y;
@@ -3610,7 +3625,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       // blocked if a summon already occupies the landing tile.
       const occupied = summons.some(s=>s.boardPosition.x===targetTile.x&&s.boardPosition.y===targetTile.y);
       const leapFacing=facingFromMove(player.boardPosition,targetTile);
-      const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),
+      const healedHP = occupied ? player.health : applyHealingIfLanded(targetTile,player.health,player.maxHealth);
+      const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),health:healedHP,
         ...(occupied?{}:{boardPosition:targetTile,facing:leapFacing})},'darkWeb');
       addLog(occupied ? '// Dark Web strikes an occupied tile — 2 Energy spent, no leap'
         : `Dark Web leaps to (${targetTile.x},${targetTile.y}) — 2 Energy spent`);
@@ -3625,7 +3641,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     triggerCastFx(enemy.boardPosition,'#a0a0a0');
     if(newHP<=0){
       // Finishing blow — Dark Web claims the target's tile, same as a melee kill.
-      const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),facing:strikeFacing,boardPosition:targetTile},'darkWeb');
+      const healedHP = applyHealingIfLanded(targetTile,player.health,player.maxHealth);
+      const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),facing:strikeFacing,boardPosition:targetTile,health:healedHP},'darkWeb');
       addLog(`Dark Web -> ${dmg} dmg (${acc}% ${accuracyTierLabel(acc)}) — finishing blow, claims (${targetTile.x},${targetTile.y})`);
       setPlayer(updatedPlayer); setEnemy(updatedEnemy);
       handleEnemyDefeated(updatedPlayer,wave);
@@ -3635,7 +3652,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),facing:strikeFacing},'darkWeb');
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[player,enemy,summons,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx]);
+  },[player,enemy,summons,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx,applyHealingIfLanded]);
 
   // ── PULSE WAVE (Tactical Skill) ──
   // Your own equipped element, cast a second time down a chosen axis (any
@@ -4502,7 +4519,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       // blocked if a summon already occupies the landing tile.
       const occupied = summons.some(s=>s.boardPosition.x===targetTile.x&&s.boardPosition.y===targetTile.y);
       const leapFacing=facingFromMove(player.boardPosition,targetTile);
-      const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),
+      const healedHP = occupied ? player.health : applyHealingIfLanded(targetTile,player.health,player.maxHealth);
+      const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),health:healedHP,
         ...(occupied?{}:{boardPosition:targetTile,facing:leapFacing})},'darkWeb');
       addLog(occupied ? '// Dark Web strikes an occupied tile — 2 Energy spent, no leap'
         : `Dark Web leaps to (${targetTile.x},${targetTile.y}) — 2 Energy spent`);
@@ -4514,10 +4532,13 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const strikeFacing=facingToward(player.boardPosition,targetTile);
     const newHP=Math.max(0,target.health-dmg);
     let updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),facing:strikeFacing},'darkWeb');
-    if(newHP<=0) updatedPlayer={...updatedPlayer,boardPosition:targetTile};
+    if(newHP<=0){
+      const healedHP = applyHealingIfLanded(targetTile,player.health,player.maxHealth);
+      updatedPlayer={...updatedPlayer,boardPosition:targetTile,health:healedHP};
+    }
     addLog(`Dark Web -> ${dmg} dmg (${acc}% ${accuracyTierLabel(acc)})${newHP<=0?' — finishing blow, claims tile':''}`);
     applySkillResultMulti(target, dmg, updatedPlayer, {}, '#a0a0a0');
-  },[player,enemies,summons,addLog,applySkillResultMulti,routeAfterPlayerActionMulti]);
+  },[player,enemies,summons,addLog,applySkillResultMulti,routeAfterPlayerActionMulti,applyHealingIfLanded]);
 
   // Shared tail for a multi-hit skill (Pulse Wave, Piercing Light) once
   // damage has already been applied to every hit enemy in `damaged`: routes
