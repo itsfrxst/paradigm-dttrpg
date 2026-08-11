@@ -54,9 +54,9 @@ export const ELEMENTS = {
       dice:['d8'],
       color:'#80d4f8',
       icon:'💨',
-      description:'Pick range 1–8 first, then roll d8. Damage = (roll − range) × 20. Knocks back on hit. Cost: 2 Energy flat.',
+      description:'Roll d8 — that\'s both your reach and your power. Hits anything up to that many tiles ahead; damage scales 40 (roll 1) to 200 (roll 8) regardless of range. Whatever roll you don\'t spend reaching the target becomes knockback (minimum 1 tile), until they hit a wall. Cost: 2 Energy flat.',
       isAir: true,
-      base:{name:'Gale Force',desc:'(roll − range) × 20 dmg, knockback',damage:0},
+      base:{name:'Gale Force',desc:'40–200 dmg by roll, range = roll, leftover = knockback',damage:0},
       thresholds:[],
       tierFormula:()=>0,
       accuracyApplies:true,
@@ -240,15 +240,30 @@ const getForwardTiles = (pos, facing, count) => {
   return tiles;
 };
 
-// Returns the tile directly behind `targetPos` away from `attackerFacing`,
-// or null if out of bounds. Used for Air Gale Force knockback.
-const getKnockbackPos = (targetPos, attackerFacing) => {
-  const dir = {up:{dx:0,dy:-1},down:{dx:0,dy:1},left:{dx:-1,dy:0},right:{dx:1,dy:0}}[attackerFacing]||{dx:0,dy:1};
-  const x = targetPos.x + dir.dx;
-  const y = targetPos.y + dir.dy;
-  if(x<0||x>=SIZE||y<0||y>=SIZE) return null;
+// Knocks `targetPos` back `distance` tiles along `castFacing`, going as far
+// as it can and stopping at the board edge ("hits a wall") or if it would
+// land on `blockerPos` (the caster's own tile). Always returns a valid tile
+// — the original position if it can't move at all. Used for Air Gale Force
+// knockback, whose distance is now roll-minus-range (see airGaleForceDamage
+// for the matching roll-based damage table).
+const getKnockbackTile = (targetPos, castFacing, distance, blockerPos) => {
+  const dir = {up:{dx:0,dy:-1},down:{dx:0,dy:1},left:{dx:-1,dy:0},right:{dx:1,dy:0}}[castFacing]||{dx:0,dy:1};
+  const blockers = blockerPos ? (Array.isArray(blockerPos)?blockerPos:[blockerPos]) : [];
+  let x=targetPos.x, y=targetPos.y;
+  for(let i=0;i<distance;i++){
+    const nx=x+dir.dx, ny=y+dir.dy;
+    if(nx<0||nx>=SIZE||ny<0||ny>=SIZE) break;
+    if(blockers.some(b=>nx===b.x&&ny===b.y)) break;
+    x=nx; y=ny;
+  }
   return {x,y};
 };
+// Air Gale Force's damage table — a roll of 1 deals 40, scaling linearly to
+// 200 at a roll of 8 (before accuracy). Independent of range now: the same
+// roll also sets max reach (hit if actual distance <= roll) and leftover
+// roll becomes knockback distance (see getKnockbackTile), so a high roll no
+// longer costs damage the way it used to.
+const airGaleForceDamage = (roll) => Math.round(40 + (roll-1)*160/7);
 // ─── WATER TORRENT ─────────────────────────────────────────────────────────────
 // Torrent is Water (and Water-fusion) specific: a single d20 controls BOTH the
 // damage tier and the AoE tier via this locked matrix.
@@ -816,24 +831,23 @@ const computeElementalStrike = (attacker, target, tiles) => {
     const maxLine=getForwardTiles(attacker.boardPosition,castFacing,SIZE);
     const targetStep=maxLine.findIndex(t=>t.x===target.boardPosition.x&&t.y===target.boardPosition.y);
     const targetDist=targetStep>=0?targetStep+1:-1;
-    // Distance can equal the roll (a roll of 1 at range 1 is a legal shot —
-    // it just won't clear the bonus-damage threshold, so it floors to
-    // RANGED_SKILL_MIN_DMG instead of missing outright).
-    const canReach=targetDist>0&&targetDist<=dieRoll;
-    const chosenRange=canReach?targetDist:Math.max(1,dieRoll-1);
-    const base=Math.max(0,(dieRoll-chosenRange)*SKILL_DICE_MULT);
-    const line=getForwardTiles(attacker.boardPosition,castFacing,chosenRange);
-    const hit=line.some(t=>t.x===target.boardPosition.x&&t.y===target.boardPosition.y);
+    // Range and damage are synergistic now, not subtractive: the roll IS
+    // the max reach (hit if the target is within that many tiles), and
+    // damage comes purely from airGaleForceDamage(roll) — a high roll no
+    // longer costs damage the way it used to.
+    const hit=targetDist>0&&targetDist<=dieRoll;
+    const base=airGaleForceDamage(dieRoll);
     const acc=rollD100Accuracy();
     const tileBoost=getTileBoost(tiles,attacker.boardPosition,'Air');
     dmg=hit?Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost:0;
     eCost=2;
     if(hit){
-      const kbPos=getKnockbackPos(target.boardPosition,castFacing);
-      const kbBlocked=!kbPos||(kbPos.x===attacker.boardPosition.x&&kbPos.y===attacker.boardPosition.y);
-      if(kbPos&&!kbBlocked) knockbackPos=kbPos;
+      // Whatever roll wasn't spent reaching the target becomes knockback
+      // distance, minimum 1 tile, traveling until it hits a wall.
+      const knockDist=Math.max(1,dieRoll-targetDist);
+      knockbackPos=getKnockbackTile(target.boardPosition,castFacing,knockDist,attacker.boardPosition);
     }
-    log=`${attacker.name} Gale Force [d8=${dieRoll}, range ${chosenRange}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg':'MISS'}`;
+    log=`${attacker.name} Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg':'MISS'}`;
   } else if(elData.isWater){
     const dieRoll=rolls[0].value;
     const res=resolveTorrent(dieRoll);
@@ -2030,87 +2044,67 @@ const EarthTremorSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRoll
   );
 };
 
-// Air Gale Force — pick range first, then roll d8, damage = (roll-range)×20, knockback on hit
-const AirGaleForceSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRollAccuracy, airRange, onSetAirRange, onConfirmAirRange, onApplyWithAccuracy, elColor, playerFacing, enemyDistance}) => {
+// Air Gale Force — roll d8: that's both your reach and your power. Damage
+// scales 40->200 by roll regardless of distance; whatever roll isn't spent
+// reaching the target becomes knockback (minimum 1 tile).
+const AirGaleForceSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRollAccuracy, onProceedToAccuracy, onApplyWithAccuracy, elColor, playerFacing, enemyDistance}) => {
   const dieRoll = rolls.length > 0 ? rolls[0].value : null;
-  const baseDmg = (dieRoll !== null && airRange !== null) ? Math.max(0, (dieRoll - airRange) * SKILL_DICE_MULT) : null;
-  const facingLabel = {up:'↑ up',down:'↓ down',left:'← left',right:'→ right'}[playerFacing]||playerFacing;
   const onLine = enemyDistance > 0;
+  const hit = dieRoll !== null && onLine && enemyDistance <= dieRoll;
+  const baseDmg = dieRoll !== null ? airGaleForceDamage(dieRoll) : null;
+  const knockDist = hit ? Math.max(1, dieRoll - enemyDistance) : null;
+  const facingLabel = {up:'↑ up',down:'↓ down',left:'← left',right:'→ right'}[playerFacing]||playerFacing;
 
   return (
     <>
-      {phase==='roll'&&rolls.length===0&&(
-        <div style={{marginBottom:16}}>
-          <div style={{textAlign:'center',fontSize:'11px',marginBottom:10,padding:'6px 8px',background:onLine?`${elColor}11`:'rgba(255,68,68,0.08)',border:`1px solid ${onLine?`${elColor}44`:'#5a2a2a'}`,borderRadius:4}}>
-            <span style={{color:'#7a9db5'}}>Facing </span><span style={{color:elColor,fontWeight:'bold'}}>{facingLabel}</span>
-            {onLine
-              ? <span style={{color:'#7a9db5'}}> — enemy is <span style={{color:elColor,fontWeight:'bold'}}>{enemyDistance} tile{enemyDistance>1?'s':''}</span> ahead. Pick range <span style={{color:elColor,fontWeight:'bold'}}>{enemyDistance}</span> to hit.</span>
-              : <span style={{color:'#ff6644'}}> — enemy is not directly ahead. Move to face it first.</span>}
-          </div>
-          <div style={{fontSize:'12px',color:'#7a9db5',marginBottom:10,textAlign:'center'}}>
-            Choose range <span style={{color:elColor,fontWeight:'bold'}}>first</span> — damage = (d8 − range) × 10
-          </div>
-          <div style={{display:'flex',gap:6,flexWrap:'wrap',justifyContent:'center',marginBottom:12}}>
-            {Array.from({length:8},(_,i)=>i+1).map(r=>{
-              const reaches = r===enemyDistance;
-              return (
-                <button key={r} onClick={()=>onSetAirRange(r)}
-                  style={{width:44,height:44,position:'relative',background:airRange===r?`${elColor}33`:'transparent',border:`1px solid ${airRange===r?elColor:(reaches?`${elColor}66`:'#1e3a4a')}`,borderRadius:4,color:airRange===r?elColor:(reaches?elColor:'#5a7a8a'),cursor:'pointer',fontSize:'13px',fontWeight:'bold',transition:'all 0.15s'}}>
-                  {r}
-                  {reaches&&<span style={{position:'absolute',top:-6,right:-6,fontSize:'9px',background:elColor,color:'#000',borderRadius:'50%',width:14,height:14,display:'flex',alignItems:'center',justifyContent:'center'}}>•</span>}
-                </button>
-              );
-            })}
-          </div>
-          {airRange&&(
-            <div style={{textAlign:'center',fontSize:'11px',color:'#5a7a8a',marginBottom:12}}>
-              Range <span style={{color:elColor,fontWeight:'bold'}}>{airRange}</span> selected — any hit deals at least {RANGED_SKILL_MIN_DMG} dmg; d8 &gt; {airRange} adds a bonus on top
-              {onLine && airRange!==enemyDistance && <span style={{color:'#ff6644'}}> · won't reach enemy at {enemyDistance}</span>}
+      <div style={{textAlign:'center',fontSize:'11px',marginBottom:12,padding:'6px 8px',background:onLine?`${elColor}11`:'rgba(255,68,68,0.08)',border:`1px solid ${onLine?`${elColor}44`:'#5a2a2a'}`,borderRadius:4}}>
+        <span style={{color:'#7a9db5'}}>Facing </span><span style={{color:elColor,fontWeight:'bold'}}>{facingLabel}</span>
+        {onLine
+          ? <span style={{color:'#7a9db5'}}> — enemy is <span style={{color:elColor,fontWeight:'bold'}}>{enemyDistance} tile{enemyDistance>1?'s':''}</span> ahead. Roll {enemyDistance}+ on the d8 to reach.</span>
+          : <span style={{color:'#ff6644'}}> — enemy is not directly ahead. Move to face it first.</span>}
+      </div>
+
+      <div style={{display:'flex',justifyContent:'center',marginBottom:16}}>
+        <DiceDisplay type="d8" value={dieRoll!==null?dieRoll:'--'} rolling={rolling} color={elColor} label="Gale Force" />
+      </div>
+
+      {phase==='roll'&&(
+        <>
+          <button onClick={onRoll} disabled={rolling||rolls.length>0}
+            style={{width:'100%',padding:14,background:rolls.length>0?'#0a1218':`${elColor}22`,color:rolls.length>0?'#3a5a6a':elColor,border:`1px solid ${rolls.length>0?'#1e3a4a':elColor}`,borderRadius:6,fontSize:16,fontWeight:'bold',cursor:rolling||rolls.length>0?'not-allowed':'pointer',letterSpacing:'0.1em'}}>
+            {rolling?'Rolling...':rolls.length>0?'Rolled':'Roll d8'}
+          </button>
+
+          {dieRoll!==null&&!rolling&&(
+            <div style={{marginTop:16,background:'#0a1218',border:`1px solid ${elColor}44`,borderRadius:8,padding:'14px 16px'}}>
+              <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:10}}>
+                <span style={{fontSize:'11px',color:'#5a7a8a',textTransform:'uppercase',letterSpacing:'0.1em'}}>Breakdown</span>
+                <span style={{fontSize:'11px',color:'#3a6a8a',fontFamily:'monospace'}}>Cost: <span style={{color:'#ffd700'}}>2 Energy</span></span>
+              </div>
+              <div style={{display:'flex',alignItems:'baseline',gap:8,fontSize:13,color:'#7a9db5',marginBottom:6}}>
+                <span style={{color:'#3a6a8a'}}>Reach</span>
+                <span style={{color:'#b0dff4',fontWeight:'bold'}}>{dieRoll}</span>
+                <span style={{color:'#3a6a8a'}}>tiles ·</span>
+                <span style={{fontSize:18,fontWeight:'bold',color:elColor}}>{baseDmg}</span>
+                <span style={{color:'#3a6a8a'}}>base dmg</span>
+              </div>
+              {hit ? (
+                <div style={{fontSize:'11px',color:'#5a7a8a',marginTop:4}}>
+                  Reaches the enemy at {enemyDistance} — knocks back <span style={{color:elColor,fontWeight:'bold'}}>{knockDist} tile{knockDist>1?'s':''}</span> (or until they hit a wall).
+                </div>
+              ) : onLine ? (
+                <div style={{fontSize:'11px',color:'#ffaa44',marginTop:4}}>
+                  Doesn't reach — enemy is {enemyDistance} tiles away, roll only carries {dieRoll}.
+                </div>
+              ) : (
+                <div style={{fontSize:'11px',color:'#ffaa44',marginTop:4}}>Enemy not on your facing line — this will miss.</div>
+              )}
+              <button onClick={onProceedToAccuracy}
+                style={{width:'100%',marginTop:12,padding:11,background:`${elColor}22`,color:elColor,border:`1px solid ${elColor}`,borderRadius:6,fontSize:14,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.08em'}}>
+                Roll Accuracy
+              </button>
             </div>
           )}
-          <div style={{display:'flex',justifyContent:'center',marginBottom:16}}>
-            <DiceDisplay type="d8" value="--" rolling={false} color={airRange?elColor:'#2a4a5e'} label="Gale Force" />
-          </div>
-          <button onClick={onRoll} disabled={!airRange||rolling}
-            style={{width:'100%',padding:14,background:airRange?`${elColor}22`:'#0a1218',color:airRange?elColor:'#2a4a5e',border:`1px solid ${airRange?elColor:'#1e3a4a'}`,borderRadius:6,fontSize:16,fontWeight:'bold',cursor:airRange&&!rolling?'pointer':'not-allowed',letterSpacing:'0.1em'}}>
-            {rolling?'Rolling...':(airRange?'Roll d8':'Select a range first')}
-          </button>
-        </div>
-      )}
-
-      {phase==='roll'&&rolls.length>0&&!rolling&&(
-        <>
-          <div style={{display:'flex',justifyContent:'center',marginBottom:14}}>
-            <DiceDisplay type="d8" value={dieRoll} rolling={false} color={elColor} label="Gale Force" />
-          </div>
-          <div style={{background:'#0a1218',border:`1px solid ${elColor}44`,borderRadius:8,padding:'14px 16px',marginBottom:14}}>
-            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:8}}>
-              <span style={{fontSize:'11px',color:'#5a7a8a',textTransform:'uppercase',letterSpacing:'0.1em'}}>Breakdown</span>
-              <span style={{fontSize:'11px',color:'#3a6a8a',fontFamily:'monospace'}}>Cost: <span style={{color:'#ffd700'}}>2 Energy</span></span>
-            </div>
-            <div style={{display:'flex',alignItems:'baseline',gap:8,fontSize:13,color:'#7a9db5',marginBottom:6}}>
-              <span style={{color:'#b0dff4',fontWeight:'bold'}}>{dieRoll}</span>
-              <span style={{color:'#3a6a8a'}}>roll −</span>
-              <span style={{color:'#b0dff4',fontWeight:'bold'}}>{airRange}</span>
-              <span style={{color:'#3a6a8a'}}>range × 10 =</span>
-              <span style={{fontSize:18,fontWeight:'bold',color:baseDmg>0?elColor:'#ff4444'}}>{baseDmg}</span>
-              <span style={{color:'#3a6a8a'}}>base dmg</span>
-            </div>
-            {baseDmg===0&&(
-              <div style={{fontSize:'11px',color:'#ffaa44',marginTop:4}}>
-                Roll didn't exceed range — floors to a guaranteed {RANGED_SKILL_MIN_DMG} dmg on hit, still knocks back.
-              </div>
-            )}
-            {baseDmg>0&&(
-              <div style={{fontSize:'11px',color:'#5a7a8a',marginTop:4}}>
-                Hit knocks enemy back 1 tile (if space is clear). Minimum {RANGED_SKILL_MIN_DMG} dmg guaranteed.
-              </div>
-            )}
-          </div>
-          <button onClick={onConfirmAirRange}
-            style={{width:'100%',padding:11,background:`${elColor}22`,color:elColor,border:`1px solid ${elColor}`,borderRadius:6,fontSize:14,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.08em'}}>
-            Roll Accuracy
-          </button>
         </>
       )}
 
@@ -2118,7 +2112,7 @@ const AirGaleForceSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRol
         <>
           <div style={{textAlign:'center',marginBottom:14}}>
             <div style={{fontSize:13,color:'#7a9db5',marginBottom:4}}>
-              Gale Force: range <span style={{color:elColor}}>{airRange}</span>, d8={dieRoll} — <span style={{color:baseDmg>0?elColor:'#ffaa44'}}>{baseDmg} base dmg</span>
+              Gale Force: d8={dieRoll} — <span style={{color:hit?elColor:'#ffaa44'}}>{baseDmg} base dmg</span>{hit&&<span style={{color:'#7a9db5'}}> · knockback {knockDist}</span>}
             </div>
             <div style={{fontSize:'11px',color:'#5a7a8a'}}>Roll d100. ≥79 full · 40–78 half · under 40 quarter · min {RANGED_SKILL_MIN_DMG} dmg on hit</div>
           </div>
@@ -2129,15 +2123,17 @@ const AirGaleForceSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRol
             <div style={{textAlign:'center',marginBottom:14}}>
               <div style={{fontSize:22,fontWeight:'bold',color:'#ffd700'}}>{accuracyRoll}%</div>
               <div style={{fontSize:13,color:'#b0dff4',marginTop:4}}>
-                {baseDmg} → <strong style={{color:elColor}}>{Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(baseDmg,accuracyRoll))} dmg</strong> ({accuracyTierLabel(accuracyRoll)})
-                <span style={{fontSize:'11px',color:'#5a7a8a',marginLeft:6}}> + knockback</span>
+                {hit
+                  ? <>{baseDmg} → <strong style={{color:elColor}}>{Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(baseDmg,accuracyRoll))} dmg</strong> ({accuracyTierLabel(accuracyRoll)})
+                      <span style={{fontSize:'11px',color:'#5a7a8a',marginLeft:6}}> + knockback {knockDist}</span></>
+                  : <span style={{color:'#ffaa44'}}>Out of reach — this will miss.</span>}
               </div>
             </div>
           )}
           {accuracyRoll===null
             ?<button onClick={onRollAccuracy} disabled={rolling} style={{width:'100%',padding:14,background:'#ffd70022',color:'#ffd700',border:'1px solid #ffd700',borderRadius:6,fontSize:16,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.1em'}}>Roll Accuracy (d100)</button>
             :<button onClick={()=>onApplyWithAccuracy(accuracyRoll)} style={{width:'100%',padding:14,background:`${elColor}22`,color:elColor,border:`1px solid ${elColor}`,borderRadius:6,fontSize:16,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.1em'}}>
-              Strike + Knockback
+              {hit?'Strike + Knockback':'Cast Gale Force'}
             </button>
           }
         </>
@@ -2250,7 +2246,7 @@ const WaterTorrentSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRol
   );
 };
 
-const DiceModal = ({show,category,elementName,rolls,abilities,rolling,onRoll,onUseAbility,onClose,phase,accuracyRoll,onRollAccuracy,selectedAbilityForAccuracy,airRange,onSetAirRange,onConfirmAirRange,onFireProceedToAccuracy,onFireApplyWithAccuracy,earthRange,onSetEarthRange,onConfirmEarthRange,onEarthApplyWithAccuracy,onAirApplyWithAccuracy,onWaterConfirm,onWaterApplyWithAccuracy,waterAoe,onSetWaterAoe,waterAvailableAP,waterAnchorInBounds,waterEnemyInFootprint,playerFacing,enemyDistance}) => {
+const DiceModal = ({show,category,elementName,rolls,abilities,rolling,onRoll,onUseAbility,onClose,phase,accuracyRoll,onRollAccuracy,selectedAbilityForAccuracy,onAirProceedToAccuracy,onFireProceedToAccuracy,onFireApplyWithAccuracy,earthRange,onSetEarthRange,onConfirmEarthRange,onEarthApplyWithAccuracy,onAirApplyWithAccuracy,onWaterConfirm,onWaterApplyWithAccuracy,waterAoe,onSetWaterAoe,waterAvailableAP,waterAnchorInBounds,waterEnemyInFootprint,playerFacing,enemyDistance}) => {
   if(!show) return null;
   const elementData=ELEMENTS[category]&&ELEMENTS[category][elementName];
   if(!elementData) return null;
@@ -2286,8 +2282,7 @@ const DiceModal = ({show,category,elementName,rolls,abilities,rolling,onRoll,onU
           <AirGaleForceSection
             rolls={rolls} rolling={rolling} onRoll={onRoll}
             phase={phase} accuracyRoll={accuracyRoll} onRollAccuracy={onRollAccuracy}
-            airRange={airRange} onSetAirRange={onSetAirRange}
-            onConfirmAirRange={onConfirmAirRange}
+            onProceedToAccuracy={onAirProceedToAccuracy}
             onApplyWithAccuracy={onAirApplyWithAccuracy}
             elColor={elColor} playerFacing={playerFacing} enemyDistance={enemyDistance}
           />
@@ -2500,7 +2495,6 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const [dicePhase,      setDicePhase]      = useState('roll');
   const [accuracyRoll,   setAccuracyRoll]   = useState(null);
   const [pendingAbility, setPendingAbility] = useState(null);
-  const [airRange,       setAirRange]       = useState(null);
   const [earthRange,     setEarthRange]     = useState(null);
   const [waterAoe,       setWaterAoe]       = useState(null); // player-chosen Torrent AoE tier
   // Per-round roll lock. Once dice are rolled for a skill, the result is locked
@@ -2817,7 +2811,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setEnemyRolledEnergy(0);
     setLockedRoll(null); // new round — roll lock released
     setDiceRolls([]); setAbilities([]); setDicePhase('roll');
-    setAccuracyRoll(null); setPendingAbility(null); setAirRange(null); setEarthRange(null); setWaterAoe(null);
+    setAccuracyRoll(null); setPendingAbility(null); setEarthRange(null); setWaterAoe(null);
     addLog(`=== Round ${nextRound} ===`);
     const rP = { ...latestPlayer, actionpts:0, frozen:latestPlayer.frozen||0, skillUsed:false, rotateUsed:false, classSkillUsed:false, usedSkillIds:[] };
     const rE = { ...latestEnemy,  actionpts:0, frozen:latestEnemy.frozen||0, skillUsed:false, usedSkillIds:[],
@@ -3030,28 +3024,24 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           const maxLine=getForwardTiles(currentEnemy.boardPosition,castFacing,SIZE);
           const playerStep=maxLine.findIndex(t=>t.x===currentPlayer.boardPosition.x&&t.y===currentPlayer.boardPosition.y);
           const playerDist=playerStep>=0?playerStep+1:-1;
-          // Distance can equal the roll — a roll of 1 at range 1 is a legal
-          // shot that floors to RANGED_SKILL_MIN_DMG rather than missing.
-          const canReach = playerDist>0 && playerDist<=dieRoll;
-          const chosenRange = canReach ? playerDist : Math.max(1,dieRoll-1);
-          const base=Math.max(0,(dieRoll-chosenRange)*SKILL_DICE_MULT);
-          const line=getForwardTiles(currentEnemy.boardPosition,castFacing,chosenRange);
-          const hit=line.some(t=>t.x===currentPlayer.boardPosition.x&&t.y===currentPlayer.boardPosition.y);
+          // Range and damage are synergistic now: the roll is the max reach
+          // (hit if the player's within that many tiles), and damage comes
+          // purely from airGaleForceDamage(roll) regardless of distance.
+          const hit = playerDist>0 && playerDist<=dieRoll;
+          const base=airGaleForceDamage(dieRoll);
           const acc=rollD100Accuracy();
           const tileBoost=getTileBoost(tiles,currentEnemy.boardPosition,'Air');
           dmg=hit?Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost:0;
           eCost=2;
           if(hit){
-            const kbPos=getKnockbackPos(currentPlayer.boardPosition,castFacing);
-            const kbBlocked=!kbPos||(kbPos.x===currentEnemy.boardPosition.x&&kbPos.y===currentEnemy.boardPosition.y);
-            if(kbPos&&!kbBlocked){
-              updatedPlayer={...currentPlayer,boardPosition:kbPos};
-              addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}, range ${chosenRange}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} + knockback`);
-            } else {
-              addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}, range ${chosenRange}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} (knockback blocked)`);
-            }
+            // Whatever roll wasn't spent reaching the player becomes
+            // knockback distance, minimum 1 tile, until it hits a wall.
+            const knockDist=Math.max(1,dieRoll-playerDist);
+            const kbPos=getKnockbackTile(currentPlayer.boardPosition,castFacing,knockDist,currentEnemy.boardPosition);
+            updatedPlayer={...currentPlayer,boardPosition:kbPos};
+            addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} + knockback ${knockDist} tile${knockDist>1?'s':''}`);
           } else {
-            addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}, range ${chosenRange}] -> MISS`);
+            addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}] -> MISS`);
           }
         } else if(elData.isWater){
           const dieRoll=rolls[0].value;
@@ -3372,7 +3362,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const resetDiceModal = useCallback(()=>{
     setShowDice(false); setDiceRolls([]); setAbilities([]); setDicePhase('roll');
     setAccuracyRoll(null); setPendingAbility(null); setRolling(false);
-    setAirRange(null); setEarthRange(null); setWaterAoe(null);
+    setEarthRange(null); setWaterAoe(null);
   },[]);
 
   const handleSkill = useCallback(()=>{
@@ -3382,12 +3372,11 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       setDiceRolls(lockedRoll.rolls);
       setAbilities(lockedRoll.abilities||[]);
       setDicePhase(lockedRoll.phase||'roll');
-      setAirRange(lockedRoll.airRange??null);
       setEarthRange(lockedRoll.earthRange??null);
       setWaterAoe(lockedRoll.waterAoe??null);
     } else {
       setDiceRolls([]); setAbilities([]); setDicePhase('roll');
-      setAirRange(null); setEarthRange(null); setWaterAoe(null);
+      setEarthRange(null); setWaterAoe(null);
     }
     setAccuracyRoll(null); setPendingAbility(null);
     setShowDice(true);
@@ -3491,33 +3480,31 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   },[diceRolls,player,enemy,tiles,earthRange,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction,triggerCastFx]);
 
   // Air handlers
-  const handleSetAirRange = useCallback((r)=>setAirRange(r),[]);
-  const handleConfirmAirRange = useCallback(()=>{ setDicePhase('accuracy'); setAccuracyRoll(null); },[]);
+  const handleAirProceedToAccuracy = useCallback(()=>{ setDicePhase('accuracy'); setAccuracyRoll(null); },[]);
   const handleAirApplyWithAccuracy = useCallback((acc)=>{
     const dieRoll=diceRolls[0].value;
-    const base=Math.max(0,(dieRoll-airRange)*SKILL_DICE_MULT);
-    const line=getForwardTiles(player.boardPosition,player.facing,airRange);
-    const hit=line.some(t=>t.x===enemy.boardPosition.x&&t.y===enemy.boardPosition.y);
+    const line=getForwardTiles(player.boardPosition,player.facing,SIZE);
+    const step=line.findIndex(t=>t.x===enemy.boardPosition.x&&t.y===enemy.boardPosition.y);
+    const dist=step>=0?step+1:-1;
+    const hit=dist>0&&dist<=dieRoll;
+    const base=airGaleForceDamage(dieRoll);
     const tileBoost=getTileBoost(tiles,player.boardPosition,'Air');
-    // Guaranteed floor on any landed hit — a gust that connects no longer
-    // "collapses" to 0 just because roll <= range.
     let dmg=hit?Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost:0;
     let updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),skillUsed:true};
     let updatedEnemy={...enemy,health:Math.max(0,enemy.health-dmg)};
     if(hit){
-      const kbPos=getKnockbackPos(enemy.boardPosition,player.facing);
-      const kbBlocked=!kbPos||(kbPos.x===player.boardPosition.x&&kbPos.y===player.boardPosition.y);
-      if(kbPos&&!kbBlocked){ updatedEnemy.boardPosition=kbPos; addLog(`Gale Force [d8=${dieRoll}, range ${airRange}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} + knockback`); }
-      else addLog(`Gale Force [d8=${dieRoll}, range ${airRange}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} (knockback blocked)`);
+      const knockDist=Math.max(1,dieRoll-dist);
+      const kbPos=getKnockbackTile(enemy.boardPosition,player.facing,knockDist,player.boardPosition);
+      updatedEnemy.boardPosition=kbPos;
+      addLog(`Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} + knockback ${knockDist} tile${knockDist>1?'s':''}`);
     } else {
-      addLog(`Gale Force [d8=${dieRoll}, range ${airRange}] -> MISS`);
+      addLog(`Gale Force [d8=${dieRoll}] -> MISS`);
     }
     if(hit) triggerCastFx(enemy.boardPosition, ELEMENTS.base.Air.color);
     resetDiceModal();
     if(updatedEnemy.health<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[diceRolls,player,enemy,tiles,airRange,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction,triggerCastFx]);
+  },[diceRolls,player,enemy,tiles,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction,triggerCastFx]);
 
   // Water handlers
   const handleSetWaterAoe = useCallback((aoe)=>setWaterAoe(aoe),[]);
@@ -3801,7 +3788,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setEnemyRolledEnergyById({});
     setLockedRoll(null);
     setDiceRolls([]); setAbilities([]); setDicePhase('roll');
-    setAccuracyRoll(null); setPendingAbility(null); setAirRange(null); setEarthRange(null); setWaterAoe(null);
+    setAccuracyRoll(null); setPendingAbility(null); setEarthRange(null); setWaterAoe(null);
     addLog(`=== Round ${nextRound} ===`);
     const rP = { ...latestPlayer, actionpts:0, frozen:latestPlayer.frozen||0, skillUsed:false, rotateUsed:false, classSkillUsed:false, usedSkillIds:[] };
     const rEnemies = latestEnemies.map(e=>({ ...e, actionpts:0, frozen:e.frozen||0, skillUsed:false, classSkillUsed:false, usedSkillIds:[],
@@ -4451,24 +4438,27 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
 
   const handleAirApplyWithAccuracyMulti = useCallback((acc)=>{
     const dieRoll=diceRolls[0].value;
-    const base=Math.max(0,(dieRoll-airRange)*SKILL_DICE_MULT);
-    const line=getForwardTiles(player.boardPosition,player.facing,airRange);
-    const target = enemies.find(e=>line.some(t=>t.x===e.boardPosition.x&&t.y===e.boardPosition.y));
+    const line=getForwardTiles(player.boardPosition,player.facing,SIZE);
+    const step=line.findIndex(t=>enemies.some(e=>e.boardPosition.x===t.x&&e.boardPosition.y===t.y));
+    const dist=step>=0?step+1:-1;
+    const hit=dist>0&&dist<=dieRoll;
+    const target = hit ? enemies.find(e=>e.boardPosition.x===line[step].x&&e.boardPosition.y===line[step].y) : null;
+    const base=airGaleForceDamage(dieRoll);
     const tileBoost=getTileBoost(tiles,player.boardPosition,'Air');
     const dmg=target?Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost:0;
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),skillUsed:true};
     let extra={};
     if(target){
-      const kbPos=getKnockbackPos(target.boardPosition,player.facing);
-      const kbBlocked=!kbPos||(kbPos.x===player.boardPosition.x&&kbPos.y===player.boardPosition.y)||enemies.some(e=>e.id!==target.id&&kbPos&&e.boardPosition.x===kbPos.x&&e.boardPosition.y===kbPos.y);
-      if(kbPos&&!kbBlocked){ extra.boardPosition=kbPos; addLog(`Gale Force [d8=${dieRoll}, range ${airRange}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} + knockback`); }
-      else addLog(`Gale Force [d8=${dieRoll}, range ${airRange}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} (knockback blocked)`);
+      const knockDist=Math.max(1,dieRoll-dist);
+      const blockers=[player.boardPosition,...enemies.filter(e=>e.id!==target.id).map(e=>e.boardPosition)];
+      extra.boardPosition=getKnockbackTile(target.boardPosition,player.facing,knockDist,blockers);
+      addLog(`Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} + knockback ${knockDist} tile${knockDist>1?'s':''}`);
     } else {
-      addLog(`Gale Force [d8=${dieRoll}, range ${airRange}] -> MISS`);
+      addLog(`Gale Force [d8=${dieRoll}] -> MISS`);
     }
     resetDiceModal();
     applySkillResultMulti(target, dmg, updatedPlayer, extra, ELEMENTS.base.Air.color);
-  },[diceRolls,player,tiles,airRange,enemies,addLog,resetDiceModal,applySkillResultMulti]);
+  },[diceRolls,player,tiles,enemies,addLog,resetDiceModal,applySkillResultMulti]);
 
   const handleWaterApplyWithAccuracyMulti = useCallback((acc)=>{
     const dieRoll=diceRolls[0].value;
@@ -5133,7 +5123,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         onRoll={handleRoll} onUseAbility={isCampaign?handleModalAbilityMulti:handleModalAbility} onClose={resetDiceModal}
         phase={dicePhase} accuracyRoll={accuracyRoll} onRollAccuracy={handleRollAccuracy}
         selectedAbilityForAccuracy={pendingAbility}
-        airRange={airRange} onSetAirRange={handleSetAirRange} onConfirmAirRange={handleConfirmAirRange}
+        onAirProceedToAccuracy={handleAirProceedToAccuracy}
         onFireProceedToAccuracy={handleFireProceedToAccuracy} onFireApplyWithAccuracy={isCampaign?handleFireApplyWithAccuracyMulti:handleFireApplyWithAccuracy}
         earthRange={earthRange} onSetEarthRange={handleSetEarthRange} onConfirmEarthRange={handleConfirmEarthRange}
         onEarthApplyWithAccuracy={isCampaign?handleEarthApplyWithAccuracyMulti:handleEarthApplyWithAccuracy}
