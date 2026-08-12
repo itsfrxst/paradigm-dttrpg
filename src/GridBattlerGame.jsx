@@ -42,9 +42,9 @@ export const ELEMENTS = {
       dice:['d6'],
       color:'#c49a52',
       icon:'🪨',
-      description:'Roll d6. Damage = roll×20. Range = floor(roll/2) tiles forward. Choose range 1–max. Cost: 1 (die) + chosen tiles.',
+      description:'Roll d6. Damage = roll×20. Max reach = floor(roll/2) tiles forward — commit exactly enough to reach and it\'s a cheap, clean hit; commit farther than needed and every other tile in that span cracks into rubble (an obstacle blocking movement and skills until destroyed). A pre-existing obstacle stops the shockwave cold. Cost: 1 + chosen tiles.',
       isEarth: true,
-      base:{name:'Tremor',desc:'roll×20 dmg, range floor(roll/2)',damage:0},
+      base:{name:'Tremor',desc:'roll×20 dmg; overreach turns spare tiles into rubble',damage:0},
       thresholds:[],
       tierFormula:()=>0,
       accuracyApplies:true,
@@ -525,6 +525,63 @@ const makeSummon = (tier, pos, side='player', ownerId=null) => ({
                           // actedSummonIds does for player-commanded summons
 });
 
+// ─── EARTH OBSTACLES ────────────────────────────────────────────────────────
+// Rubble raised by a Tremor. Stationary — never moves, never attacks, never
+// promotes. Lives in its own `obstacles` array (not `summons`) so none of the
+// summon-turn/bandwidth/promotion machinery has to know about it; it only
+// needs to occupy a tile (movement/deploy/knight-tile blocking) and absorb
+// damage (line-based skill hits) until destroyed. HP reuses the flat Novice
+// summon value — a wall built out of the same stuff a Novice is worth
+// fighting through.
+const OBSTACLE_HP = SUMMON_HP;
+const OBSTACLE_META = { color:'#a08860', icon:'🧱', name:'Rubble' };
+let OBSTACLE_SEQ = 0;
+const makeObstacle = (pos) => ({ id:`OBS${++OBSTACLE_SEQ}`, boardPosition:pos, health:OBSTACLE_HP, maxHealth:OBSTACLE_HP });
+
+// Resolves an Earth Tremor's line of effect: `chosenRange` sets how many
+// tiles the caster commits energy to (cost = 1 + chosenRange, same as
+// before) — reaching exactly as far as a target needs is cheap and tidy;
+// committing farther than that costs more but cracks every *other* tile in
+// that span into rubble, in front of AND behind the target. A tile a target
+// occupies never turns to rubble; a pre-existing obstacle instead stops the
+// shockwave cold (nothing beyond it is affected, and it takes the hit
+// itself) — rubble doesn't crack through rubble. `occupiedExtra` is every
+// other tile that should block a *new* obstacle from spawning there (other
+// targets not being hit this cast, summons, etc) without itself stopping
+// the shockwave.
+const resolveEarthTremor = (origin, chosenRange, targets, obstacles, occupiedExtra=[]) => {
+  const rawLine = getForwardTiles(origin.boardPosition, origin.facing, chosenRange);
+  let span = rawLine;
+  let hitObstacle = null;
+  for(let i=0;i<rawLine.length;i++){
+    const t=rawLine[i];
+    const existing = obstacles.find(o=>o.boardPosition.x===t.x&&o.boardPosition.y===t.y);
+    if(existing){ hitObstacle=existing; span=rawLine.slice(0,i+1); break; }
+  }
+  // `span` already excludes anything past the first obstacle, so a target
+  // beyond it simply won't be found here — a target *in front of* the
+  // obstacle still takes the hit (the obstacle only blocks what's behind
+  // it, not what's closer than itself).
+  const hitTarget = targets.find(e=>span.some(t=>t.x===e.boardPosition.x&&t.y===e.boardPosition.y));
+  const occupied = [...obstacles.map(o=>o.boardPosition), ...occupiedExtra];
+  const newObstacleTiles = span.filter(t=>!occupied.some(o=>o.x===t.x&&o.y===t.y));
+  return { span, hitObstacle: hitTarget?null:hitObstacle, hitTarget, newObstacleTiles };
+};
+
+// Nearest obstacle along a forward line within `maxDist` tiles, or null.
+// Air's Gale Force (and anything else that travels a line rather than just
+// checking a footprint) uses this to redirect a shot into whatever rubble
+// is in the way before it ever reaches its actual target.
+const findLineObstacle = (originPos, facing, maxDist, obstacles) => {
+  const line = getForwardTiles(originPos, facing, maxDist);
+  for(let i=0;i<line.length;i++){
+    const t=line[i];
+    const hit=obstacles.find(o=>o.boardPosition.x===t.x&&o.boardPosition.y===t.y);
+    if(hit) return {obstacle:hit, dist:i+1};
+  }
+  return null;
+};
+
 const TILE_LEGEND = [
   {type:'fire_boost', label:'Fire: +20 dmg',  border:'#ff6b00',bg:'linear-gradient(135deg,#4a0e0e,#1a0505)'},
   {type:'water_boost',label:'Water: +20 dmg', border:'#4aafee',bg:'linear-gradient(135deg,#0d2a3d,#051420)'},
@@ -797,13 +854,14 @@ const spawnCampaignRoster = (stage, playerPos, mirror=null) => {
 // floors, Water AoE, Air knockback), extracted here so every Campaign enemy
 // with an element gets the identical mechanics rather than a stand-in.
 // Returns null if the attacker has no element.
-const computeElementalStrike = (attacker, target, tiles) => {
+const computeElementalStrike = (attacker, target, tiles, obstacles=[]) => {
   const elData = attacker.element ? ELEMENTS[attacker.elementCategory]?.[attacker.element] : null;
   if(!elData) return null;
   const rolls = elData.dice.map(d=>({type:d,value:rollDie(parseInt(d.slice(1)))}));
   const ranged = elData.isEarth||elData.isAir||elData.isWater;
   const castFacing = ranged ? facingToward(attacker.boardPosition,target.boardPosition) : attacker.facing;
   let dmg=0, eCost=getSkillCost(attacker.elementCategory, attacker.element), knockbackPos=null, log='';
+  let obstacleHit=null, newObstacles=[];
 
   if(elData.isFire){
     const pulses=rolls[0].value, dmgEach=rolls[1].value;
@@ -819,14 +877,19 @@ const computeElementalStrike = (attacker, target, tiles) => {
     const dieRoll=rolls[0].value;
     const maxRange=Math.max(1,Math.floor(dieRoll/2));
     const chosenRange=Math.max(1,Math.min(maxRange, attacker.actionpts-1));
-    const line=getForwardTiles(attacker.boardPosition,castFacing,chosenRange);
-    const hit=line.some(t=>t.x===target.boardPosition.x&&t.y===target.boardPosition.y);
+    const {hitObstacle,hitTarget,newObstacleTiles}=resolveEarthTremor(
+      {boardPosition:attacker.boardPosition,facing:castFacing}, chosenRange, [target], obstacles, [target.boardPosition]
+    );
     const base=dieRoll*SKILL_DICE_MULT;
     const acc=rollD100Accuracy();
     const tileBoost=getTileBoost(tiles,attacker.boardPosition,'Earth');
-    dmg=hit?Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost:0;
+    const rawDmg=Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost;
+    dmg = hitTarget ? rawDmg : 0;
+    if(hitObstacle) obstacleHit={id:hitObstacle.id, dmg:rawDmg};
+    newObstacles = newObstacleTiles.map(t=>makeObstacle(t));
     eCost=1+chosenRange;
-    log=`${attacker.name} Tremor [d6=${dieRoll}, ${chosenRange} tile${chosenRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg':'MISS'}`;
+    const outcome = hitTarget ? `${dmg} dmg` : hitObstacle ? `struck rubble instead` : 'MISS';
+    log=`${attacker.name} Tremor [d6=${dieRoll}, ${chosenRange} tile${chosenRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${outcome}${newObstacles.length>0?` (+${newObstacles.length} rubble)`:''}`;
   } else if(elData.isAir){
     const dieRoll=rolls[0].value;
     const maxLine=getForwardTiles(attacker.boardPosition,castFacing,SIZE);
@@ -835,20 +898,26 @@ const computeElementalStrike = (attacker, target, tiles) => {
     // Range and damage are synergistic now, not subtractive: the roll IS
     // the max reach (hit if the target is within that many tiles), and
     // damage comes purely from airGaleForceDamage(roll) — a high roll no
-    // longer costs damage the way it used to.
-    const hit=targetDist>0&&targetDist<=dieRoll;
+    // longer costs damage the way it used to. A closer obstacle takes the
+    // gust instead of letting it through to the actual target.
+    const lineObstacle=findLineObstacle(attacker.boardPosition,castFacing,dieRoll,obstacles);
+    const blocked=lineObstacle && (targetDist<0||lineObstacle.dist<=targetDist);
+    const hit=!blocked&&targetDist>0&&targetDist<=dieRoll;
     const base=airGaleForceDamage(dieRoll);
     const acc=rollD100Accuracy();
     const tileBoost=getTileBoost(tiles,attacker.boardPosition,'Air');
-    dmg=hit?Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost:0;
+    const rawDmg=Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost;
+    dmg=hit?rawDmg:0;
     eCost=2;
     if(hit){
       // Whatever roll wasn't spent reaching the target becomes knockback
       // distance, minimum 1 tile, traveling until it hits a wall.
       const knockDist=Math.max(1,dieRoll-targetDist);
-      knockbackPos=getKnockbackTile(target.boardPosition,castFacing,knockDist,attacker.boardPosition);
+      knockbackPos=getKnockbackTile(target.boardPosition,castFacing,knockDist,[attacker.boardPosition,...obstacles.map(o=>o.boardPosition)]);
+    } else if(blocked){
+      obstacleHit={id:lineObstacle.obstacle.id, dmg:rawDmg};
     }
-    log=`${attacker.name} Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg':'MISS'}`;
+    log=`${attacker.name} Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg':blocked?'struck rubble instead':'MISS'}`;
   } else if(elData.isWater){
     const dieRoll=rolls[0].value;
     const res=resolveTorrent(dieRoll);
@@ -873,7 +942,7 @@ const computeElementalStrike = (attacker, target, tiles) => {
       log=`${attacker.name} Torrent [d20=${dieRoll}, ${AOE_LABEL[chosen.aoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg':'MISS'}`;
     }
   }
-  return { dmg, eCost, castFacing, knockbackPos, log };
+  return { dmg, eCost, castFacing, knockbackPos, log, obstacleHit, newObstacles };
 };
 
 // Whether `attacker`'s equipped element could plausibly land on `target`
@@ -1824,7 +1893,7 @@ const tileClassName = (t) => {
   }
 };
 
-const Grid = ({playerPos,enemyPos,enemies,selectedEnemyId,validSquares,onSquareClick,playerSelected,tiles,playerFacing,enemyFacing,aoeTiles,knightTiles,summons,deployTiles,castFx}) => {
+const Grid = ({playerPos,enemyPos,enemies,selectedEnemyId,validSquares,onSquareClick,playerSelected,tiles,playerFacing,enemyFacing,aoeTiles,knightTiles,summons,obstacles,deployTiles,castFx}) => {
   const cells=[];
   for(let y=0;y<SIZE;y++) for(let x=0;x<SIZE;x++){
     const isP=playerPos.x===x&&playerPos.y===y;
@@ -1833,6 +1902,7 @@ const Grid = ({playerPos,enemyPos,enemies,selectedEnemyId,validSquares,onSquareC
     const enemyHere = enemies && enemies.find(e=>e.boardPosition.x===x&&e.boardPosition.y===y);
     const isE = enemies ? !!enemyHere : (enemyPos.x===x&&enemyPos.y===y);
     const summon=summons&&summons.find(s=>s.boardPosition.x===x&&s.boardPosition.y===y);
+    const obstacle=obstacles&&obstacles.find(o=>o.boardPosition.x===x&&o.boardPosition.y===y);
     const isA=validSquares.some(s=>s.x===x&&s.y===y);
     const isAoe=aoeTiles&&aoeTiles.some(s=>s.x===x&&s.y===y);
     const isKnight=knightTiles&&knightTiles.some(s=>s.x===x&&s.y===y);
@@ -1849,6 +1919,10 @@ const Grid = ({playerPos,enemyPos,enemies,selectedEnemyId,validSquares,onSquareC
       cls+=' summon'+(summon.side==='enemy'?' enemySide':'')+(summon.promoted?' promoted':'');
       label=SUMMON_TIER_META[summon.tier].icon+(summon.promoted?'★':'');
     }
+    else if(obstacle){
+      cls+=' obstacle';
+      label=OBSTACLE_META.icon;
+    }
     else { if(isA) cls+=' available'; cls+=' '+tileClassName(tileType); }
     if(isAoe) cls+=' aoePreview';
     if(isKnight) cls+=' knightPreview';
@@ -1856,6 +1930,7 @@ const Grid = ({playerPos,enemyPos,enemies,selectedEnemyId,validSquares,onSquareC
     const fxHere = castFx && castFx.x===x && castFx.y===y;
     cells.push(
       <div key={`${x}-${y}`} className={cls} onClick={()=>onSquareClick(x,y)}
+        title={obstacle?`Rubble — ${obstacle.health}/${obstacle.maxHealth} HP`:undefined}
         onMouseEnter={e=>e.currentTarget.classList.add('hovered')}
         onMouseLeave={e=>e.currentTarget.classList.remove('hovered')}>
         {label}
@@ -1958,14 +2033,30 @@ const FireDiceSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRollAcc
   );
 };
 
-// Earth Tremor — roll d6, choose range 1–floor(roll/2), accuracy, apply
-const EarthTremorSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRollAccuracy, earthRange, onSetEarthRange, onConfirmEarthRange, onApplyWithAccuracy, elColor, playerFacing}) => {
+// Earth Tremor — roll d6, choose reach 1–floor(roll/2). Reach exactly as far
+// as the target and it's a cheap, clean hit; commit farther than needed and
+// every other tile in that span cracks into rubble (an obstacle) — in front
+// of AND behind the target, up to a pre-existing obstacle which stops the
+// shockwave cold and takes the hit itself.
+const EarthTremorSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRollAccuracy, earthRange, onSetEarthRange, onConfirmEarthRange, onApplyWithAccuracy, elColor, playerFacing, enemyDistance, obstacleDistance}) => {
   const dieRoll  = rolls.length > 0 ? rolls[0].value : null;
   // Always at least 1 tile of range, even on the worst roll (d6=1) — a Tremor
   // should never be an unusable wasted turn.
   const maxRange = dieRoll !== null ? Math.max(1, Math.floor(dieRoll / 2)) : 0;
   const baseDmg  = dieRoll !== null ? dieRoll * SKILL_DICE_MULT : null;
   const cost     = earthRange ? 1 + earthRange : null;
+
+  // Preview of what a given reach `r` actually does, mirroring
+  // resolveEarthTremor's truncate-at-obstacle / hit-target-in-front logic
+  // (minus any summons in the way, which only the real Apply knows about).
+  const previewFor = (r) => {
+    const blockedAt = obstacleDistance>0 && obstacleDistance<=r ? obstacleDistance : null;
+    const effRange = blockedAt ?? r;
+    const reachesEnemy = !blockedAt && enemyDistance>0 && enemyDistance<=r;
+    const rubble = Math.max(0, effRange - (reachesEnemy?1:0) - (blockedAt?1:0));
+    return { blockedAt, reachesEnemy, rubble };
+  };
+  const selPreview = earthRange ? previewFor(earthRange) : null;
 
   return (
     <>
@@ -1985,23 +2076,31 @@ const EarthTremorSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRoll
               <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:10}}>
                 <div>
                   <span style={{fontSize:'13px',color:'#b0dff4',fontWeight:'bold'}}>{baseDmg} dmg</span>
-                  <span style={{fontSize:'11px',color:'#5a7a8a',marginLeft:8}}>per tile hit</span>
+                  <span style={{fontSize:'11px',color:'#5a7a8a',marginLeft:8}}>on whatever it actually hits</span>
                 </div>
                 <span style={{fontSize:'11px',color:'#3a6a8a',fontFamily:'monospace'}}>
                   Facing: <span style={{color:elColor,textTransform:'uppercase'}}>{playerFacing}</span>
                 </span>
               </div>
               <div style={{fontSize:'11px',color:'#5a7a8a',marginBottom:8}}>
-                Max range: <span style={{color:elColor,fontWeight:'bold'}}>{maxRange} tile{maxRange>1?'s':''}</span> forward. Choose range (cost = 1 + tiles):
+                Max reach: <span style={{color:elColor,fontWeight:'bold'}}>{maxRange} tile{maxRange>1?'s':''}</span> forward.
+                {enemyDistance>0 && enemyDistance<=maxRange && <span> Enemy is <span style={{color:elColor,fontWeight:'bold'}}>{enemyDistance}</span> away — reach exactly that far to keep it cheap.</span>}
+                {obstacleDistance>0 && obstacleDistance<=maxRange && <span style={{color:'#ffaa44'}}> Existing rubble at {obstacleDistance} tiles will stop anything reaching that far.</span>}
               </div>
               <div style={{display:'flex',gap:6,flexWrap:'wrap',marginBottom:10}}>
-                {Array.from({length:maxRange},(_,i)=>i+1).map(r=>(
-                  <button key={r} onClick={()=>onSetEarthRange(r)}
-                    style={{flex:1,padding:'8px 6px',background:earthRange===r?`${elColor}33`:'transparent',border:`1px solid ${earthRange===r?elColor:'#1e3a4a'}`,borderRadius:4,color:earthRange===r?elColor:'#5a7a8a',cursor:'pointer',fontSize:'12px',textAlign:'center',transition:'all 0.15s'}}>
-                    {r} tile{r>1?'s':''}
-                    <div style={{fontSize:'10px',marginTop:2,color:earthRange===r?elColor:'#3a6a8a'}}>{1+r} Energy</div>
-                  </button>
-                ))}
+                {Array.from({length:maxRange},(_,i)=>i+1).map(r=>{
+                  const p=previewFor(r);
+                  return (
+                    <button key={r} onClick={()=>onSetEarthRange(r)}
+                      style={{flex:1,padding:'8px 6px',background:earthRange===r?`${elColor}33`:'transparent',border:`1px solid ${earthRange===r?elColor:'#1e3a4a'}`,borderRadius:4,color:earthRange===r?elColor:'#5a7a8a',cursor:'pointer',fontSize:'12px',textAlign:'center',transition:'all 0.15s'}}>
+                      {r} tile{r>1?'s':''}
+                      <div style={{fontSize:'10px',marginTop:2,color:earthRange===r?elColor:'#3a6a8a'}}>{1+r} Energy</div>
+                      <div style={{fontSize:'9px',marginTop:2,color:p.reachesEnemy?'#66dd88':p.blockedAt?'#ff6644':p.rubble>0?'#c49a52':'#3a6a8a'}}>
+                        {p.reachesEnemy?'hits enemy':p.blockedAt?'hits rubble':''}{p.rubble>0?`${p.reachesEnemy||p.blockedAt?' +':''}${p.rubble} rubble`:(p.reachesEnemy||p.blockedAt?'':'—')}
+                      </div>
+                    </button>
+                  );
+                })}
               </div>
               {earthRange&&(
                 <button onClick={onConfirmEarthRange}
@@ -2018,7 +2117,8 @@ const EarthTremorSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRoll
         <>
           <div style={{textAlign:'center',marginBottom:14}}>
             <div style={{fontSize:13,color:'#7a9db5',marginBottom:4}}>
-              Tremor: <span style={{color:elColor}}>{earthRange} tile{earthRange>1?'s':''} forward</span> — <span style={{color:elColor}}>{baseDmg} dmg</span> per hit
+              Tremor: <span style={{color:elColor}}>{earthRange} tile{earthRange>1?'s':''} forward</span> — <span style={{color:elColor}}>{baseDmg} dmg</span> on impact
+              {selPreview?.rubble>0 && <span style={{color:'#c49a52'}}> · +{selPreview.rubble} rubble</span>}
             </div>
             <div style={{fontSize:'11px',color:'#5a7a8a',marginBottom:2}}>Cost: <span style={{color:'#ffd700'}}>{cost} Energy</span></div>
             <div style={{fontSize:'11px',color:'#5a7a8a'}}>Roll d100. ≥79 full · 40–78 half · under 40 quarter · min {RANGED_SKILL_MIN_DMG} dmg on hit</div>
@@ -2031,7 +2131,7 @@ const EarthTremorSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRoll
               <div style={{fontSize:22,fontWeight:'bold',color:'#ffd700'}}>{accuracyRoll}%</div>
               <div style={{fontSize:13,color:'#b0dff4',marginTop:4}}>
                 {baseDmg} → <strong style={{color:elColor}}>{Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(baseDmg,accuracyRoll))} dmg</strong> ({accuracyTierLabel(accuracyRoll)})
-                <span style={{fontSize:'11px',color:'#5a7a8a',marginLeft:6}}>(if enemy in range)</span>
+                <span style={{fontSize:'11px',color:'#5a7a8a',marginLeft:6}}>(on whatever's in range)</span>
               </div>
             </div>
           )}
@@ -2247,7 +2347,7 @@ const WaterTorrentSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRol
   );
 };
 
-const DiceModal = ({show,category,elementName,rolls,abilities,rolling,onRoll,onUseAbility,onClose,phase,accuracyRoll,onRollAccuracy,selectedAbilityForAccuracy,onAirProceedToAccuracy,onFireProceedToAccuracy,onFireApplyWithAccuracy,earthRange,onSetEarthRange,onConfirmEarthRange,onEarthApplyWithAccuracy,onAirApplyWithAccuracy,onWaterConfirm,onWaterApplyWithAccuracy,waterAoe,onSetWaterAoe,waterAvailableAP,waterAnchorInBounds,waterEnemyInFootprint,playerFacing,enemyDistance}) => {
+const DiceModal = ({show,category,elementName,rolls,abilities,rolling,onRoll,onUseAbility,onClose,phase,accuracyRoll,onRollAccuracy,selectedAbilityForAccuracy,onAirProceedToAccuracy,onFireProceedToAccuracy,onFireApplyWithAccuracy,earthRange,onSetEarthRange,onConfirmEarthRange,onEarthApplyWithAccuracy,onAirApplyWithAccuracy,onWaterConfirm,onWaterApplyWithAccuracy,waterAoe,onSetWaterAoe,waterAvailableAP,waterAnchorInBounds,waterEnemyInFootprint,playerFacing,enemyDistance,obstacleDistance}) => {
   if(!show) return null;
   const elementData=ELEMENTS[category]&&ELEMENTS[category][elementName];
   if(!elementData) return null;
@@ -2278,6 +2378,7 @@ const DiceModal = ({show,category,elementName,rolls,abilities,rolling,onRoll,onU
             onConfirmEarthRange={onConfirmEarthRange}
             onApplyWithAccuracy={onEarthApplyWithAccuracy}
             elColor={elColor} playerFacing={playerFacing}
+            enemyDistance={enemyDistance} obstacleDistance={obstacleDistance}
           />
         ) : elementData.isAir ? (
           <AirGaleForceSection
@@ -2517,6 +2618,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     typeof window!=='undefined' ? window.innerHeight > window.innerWidth : false
   );
   const [summons,        setSummons]        = useState([]);     // active Novice summons
+  const [obstacles,      setObstacles]      = useState([]);     // Earth-raised rubble; persists round-to-round like terrain, clears only at battle/wave boundaries
   // Deploy sub-flow state
   const [showDeploy,     setShowDeploy]     = useState(false);
   const [deployRolling,  setDeployRolling]  = useState(false);
@@ -2875,7 +2977,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         const moves=getMoveCandidatesWithReroute(currentEnemy.boardPosition,healTile);
         let moved=false;
         for(const m of moves){
-          const onSummon=updatedSummons.some(s=>s.boardPosition.x===m.x&&s.boardPosition.y===m.y);
+          const onSummon=[...updatedSummons, ...obstacles].some(s=>s.boardPosition.x===m.x&&s.boardPosition.y===m.y);
           if(m.x>=0&&m.x<SIZE&&m.y>=0&&m.y<SIZE&&!(m.x===currentPlayer.boardPosition.x&&m.y===currentPlayer.boardPosition.y)&&!onSummon){
             const nf=facingFromMove(currentEnemy.boardPosition,m);
             let healed=false, newHP=currentEnemy.health;
@@ -3012,14 +3114,26 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           const maxRange=Math.max(1,Math.floor(dieRoll/2));
           const avail=Math.max(1,Math.min(maxRange, currentEnemy.actionpts-1));
           const chosenRange=avail;
-          const line=getForwardTiles(currentEnemy.boardPosition,castFacing,chosenRange);
-          const hit=line.some(t=>t.x===currentPlayer.boardPosition.x&&t.y===currentPlayer.boardPosition.y);
+          const {hitObstacle,hitTarget,newObstacleTiles}=resolveEarthTremor(
+            {boardPosition:currentEnemy.boardPosition,facing:castFacing}, chosenRange, [currentPlayer], obstacles, [currentPlayer.boardPosition]
+          );
           const base=dieRoll*SKILL_DICE_MULT;
           const acc=rollD100Accuracy();
           const tileBoost=getTileBoost(tiles,currentEnemy.boardPosition,'Earth');
-          dmg=hit?Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost:0;
+          const rawDmg=Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost;
+          dmg = hitTarget ? rawDmg : 0;
           eCost=1+chosenRange;
-          addLog(`${currentEnemy.name} Tremor [d6=${dieRoll}, ${chosenRange} tile${chosenRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg'+(tileBoost>0?' [Earth tile +20]':''):'MISS'}`);
+          if(newObstacleTiles.length>0) setObstacles(prev=>[...prev, ...newObstacleTiles.map(t=>makeObstacle(t))]);
+          if(hitObstacle){
+            setObstacles(prev=>{
+              const hitOne=prev.find(o=>o.id===hitObstacle.id);
+              const newHP=hitOne?Math.max(0,hitOne.health-rawDmg):0;
+              addLog(newHP<=0?'Rubble destroyed!':`Rubble takes ${rawDmg} dmg (${newHP}/${hitOne.maxHealth}).`);
+              return newHP<=0 ? prev.filter(o=>o.id!==hitObstacle.id) : prev.map(o=>o.id===hitObstacle.id?{...o,health:newHP}:o);
+            });
+          }
+          const outcome = hitTarget ? `${dmg} dmg${tileBoost>0?' [Earth tile +20]':''}` : hitObstacle ? 'struck rubble instead' : 'MISS';
+          addLog(`${currentEnemy.name} Tremor [d6=${dieRoll}, ${chosenRange} tile${chosenRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${outcome}${newObstacleTiles.length>0?` (+${newObstacleTiles.length} rubble)`:''}`);
         } else if(elData.isAir){
           const dieRoll=rolls[0].value;
           const maxLine=getForwardTiles(currentEnemy.boardPosition,castFacing,SIZE);
@@ -3027,20 +3141,31 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           const playerDist=playerStep>=0?playerStep+1:-1;
           // Range and damage are synergistic now: the roll is the max reach
           // (hit if the player's within that many tiles), and damage comes
-          // purely from airGaleForceDamage(roll) regardless of distance.
-          const hit = playerDist>0 && playerDist<=dieRoll;
+          // purely from airGaleForceDamage(roll) regardless of distance. A
+          // closer obstacle takes the gust instead of the player.
+          const lineObstacle=findLineObstacle(currentEnemy.boardPosition,castFacing,dieRoll,obstacles);
+          const blocked=lineObstacle && (playerDist<0||lineObstacle.dist<=playerDist);
+          const hit = !blocked && playerDist>0 && playerDist<=dieRoll;
           const base=airGaleForceDamage(dieRoll);
           const acc=rollD100Accuracy();
           const tileBoost=getTileBoost(tiles,currentEnemy.boardPosition,'Air');
-          dmg=hit?Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost:0;
+          const rawDmg=Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost;
+          dmg=hit?rawDmg:0;
           eCost=2;
           if(hit){
             // Whatever roll wasn't spent reaching the player becomes
             // knockback distance, minimum 1 tile, until it hits a wall.
             const knockDist=Math.max(1,dieRoll-playerDist);
-            const kbPos=getKnockbackTile(currentPlayer.boardPosition,castFacing,knockDist,currentEnemy.boardPosition);
+            const kbPos=getKnockbackTile(currentPlayer.boardPosition,castFacing,knockDist,[currentEnemy.boardPosition,...obstacles.map(o=>o.boardPosition)]);
             updatedPlayer={...currentPlayer,boardPosition:kbPos};
             addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} + knockback ${knockDist} tile${knockDist>1?'s':''}`);
+          } else if(blocked){
+            setObstacles(prev=>{
+              const hitOne=prev.find(o=>o.id===lineObstacle.obstacle.id);
+              const newHP=hitOne?Math.max(0,hitOne.health-rawDmg):0;
+              addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> struck rubble instead — ${newHP<=0?'destroyed!':`${rawDmg} dmg (${newHP}/${hitOne.maxHealth})`}`);
+              return newHP<=0 ? prev.filter(o=>o.id!==lineObstacle.obstacle.id) : prev.map(o=>o.id===lineObstacle.obstacle.id?{...o,health:newHP}:o);
+            });
           } else {
             addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}] -> MISS`);
           }
@@ -3122,14 +3247,14 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         setEnemy(updatedEnemy);
       } else {
         const tier=enemyTier(currentEnemy.level);
-        const summonBlockers=updatedSummons.map(s=>s.boardPosition);
+        const summonBlockers=[...updatedSummons, ...obstacles].map(s=>s.boardPosition);
         const target=pickApproachTile(currentEnemy.boardPosition,currentPlayer.boardPosition,currentPlayer.facing,tier,[currentPlayer.boardPosition,...summonBlockers]);
         const goal = target || currentPlayer.boardPosition;
         const curDist = manhattan(currentEnemy.boardPosition, goal);
         const moves=getMoveToward(currentEnemy.boardPosition.x,currentEnemy.boardPosition.y,goal.x,goal.y);
         let moved=false;
         for(const m of moves){
-          const onSummon=updatedSummons.some(s=>s.boardPosition.x===m.x&&s.boardPosition.y===m.y);
+          const onSummon=summonBlockers.some(s=>s.x===m.x&&s.y===m.y);
           if(m.x>=0&&m.x<SIZE&&m.y>=0&&m.y<SIZE&&!(m.x===currentPlayer.boardPosition.x&&m.y===currentPlayer.boardPosition.y)&&!onSummon){
             if(manhattan(m,goal) < curDist){
               const nf=facingFromMove(currentEnemy.boardPosition,m);
@@ -3168,7 +3293,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       },600);
     },900);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[addLog,tiles,wave,triggerCastFx]);
+  },[addLog,tiles,obstacles,wave,triggerCastFx]);
   // ── ROUND ORCHESTRATION ──
   const beginRound = useCallback((rP, rE, currentRound)=>{
     setIsPlayerTurn(true);
@@ -3268,6 +3393,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setPlayer(resetPlayer);
     setTiles(newTiles);
     setSummons([]);            // summons do not persist across waves
+    setObstacles([]);          // nor does rubble from a prior wave
     setSelectedSummonId(null);
     setSummonPhaseActive(false);
     setPlayerRolledEnergy(0);
@@ -3354,7 +3480,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setIsPlayerTurn(true); setPlayerSel(false); setValidSquares([]);
     setSelCategory('base'); setSelElement('Fire');
     setLockedRoll(null); setHealingConsumed(false);
-    setLoadout([]); setLoadoutUnlocked(false); setSummons([]);
+    setLoadout([]); setLoadoutUnlocked(false); setSummons([]); setObstacles([]);
     setSummonPhaseActive(false); setSelectedSummonId(null);
     setLogs(['=== Battle Initiated ===','Move adjacent to attack. Position for bonuses.']);
   // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -3471,21 +3597,31 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const origin=lockedRoll.origin;
     const dieRoll=diceRolls[0].value;
     const base=dieRoll*SKILL_DICE_MULT;
-    const line=getForwardTiles(origin.boardPosition,origin.facing,earthRange);
-    const hit=line.some(t=>t.x===enemy.boardPosition.x&&t.y===enemy.boardPosition.y);
+    const {hitObstacle,hitTarget,newObstacleTiles}=resolveEarthTremor(origin, earthRange, [enemy], obstacles, [enemy.boardPosition]);
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Earth');
     // Guaranteed floor on a landed hit — Earth should never tick for single digits.
-    const dmg=hit?Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost:0;
+    const rawDmg=Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost;
+    const dmg=hitTarget?rawDmg:0;
     const cost=1+earthRange;
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
     const updatedEnemy={...enemy,health:Math.max(0,enemy.health-dmg)};
-    addLog(`Tremor [d6=${dieRoll}, ${earthRange} tile${earthRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg'+(tileBoost>0?' [Earth tile +20]':''):'MISS (enemy not in line)'}`);
-    if(hit) triggerCastFx(enemy.boardPosition, ELEMENTS.base.Earth.color);
+    const outcome=hitTarget?`${dmg} dmg${tileBoost>0?' [Earth tile +20]':''}`:hitObstacle?'struck rubble instead':'MISS (nothing in line)';
+    addLog(`Tremor [d6=${dieRoll}, ${earthRange} tile${earthRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${outcome}${newObstacleTiles.length>0?` (+${newObstacleTiles.length} rubble)`:''}`);
+    if(newObstacleTiles.length>0) setObstacles(prev=>[...prev, ...newObstacleTiles.map(t=>makeObstacle(t))]);
+    if(hitObstacle){
+      setObstacles(prev=>{
+        const hitOne=prev.find(o=>o.id===hitObstacle.id);
+        const newHP=hitOne?Math.max(0,hitOne.health-rawDmg):0;
+        addLog(newHP<=0?'Rubble destroyed!':`Rubble takes ${rawDmg} dmg (${newHP}/${hitOne.maxHealth}).`);
+        return newHP<=0 ? prev.filter(o=>o.id!==hitObstacle.id) : prev.map(o=>o.id===hitObstacle.id?{...o,health:newHP}:o);
+      });
+    }
+    if(hitTarget) triggerCastFx(enemy.boardPosition, ELEMENTS.base.Earth.color);
     resetDiceModal();
     if(updatedEnemy.health<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[diceRolls,lockedRoll,player,enemy,tiles,earthRange,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction,triggerCastFx]);
+  },[diceRolls,lockedRoll,player,enemy,tiles,obstacles,earthRange,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction,triggerCastFx]);
 
   // Air handlers
   const handleAirProceedToAccuracy = useCallback(()=>{ setDicePhase('accuracy'); setAccuracyRoll(null); },[]);
@@ -3495,17 +3631,27 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const line=getForwardTiles(origin.boardPosition,origin.facing,SIZE);
     const step=line.findIndex(t=>t.x===enemy.boardPosition.x&&t.y===enemy.boardPosition.y);
     const dist=step>=0?step+1:-1;
-    const hit=dist>0&&dist<=dieRoll;
+    const lineObstacle=findLineObstacle(origin.boardPosition,origin.facing,dieRoll,obstacles);
+    const blocked=lineObstacle && (dist<0||lineObstacle.dist<=dist);
+    const hit=!blocked&&dist>0&&dist<=dieRoll;
     const base=airGaleForceDamage(dieRoll);
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Air');
-    let dmg=hit?Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost:0;
+    const rawDmg=Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost;
+    let dmg=hit?rawDmg:0;
     let updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),skillUsed:true};
     let updatedEnemy={...enemy,health:Math.max(0,enemy.health-dmg)};
     if(hit){
       const knockDist=Math.max(1,dieRoll-dist);
-      const kbPos=getKnockbackTile(enemy.boardPosition,origin.facing,knockDist,origin.boardPosition);
+      const kbPos=getKnockbackTile(enemy.boardPosition,origin.facing,knockDist,[origin.boardPosition,...obstacles.map(o=>o.boardPosition)]);
       updatedEnemy.boardPosition=kbPos;
       addLog(`Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} + knockback ${knockDist} tile${knockDist>1?'s':''}`);
+    } else if(blocked){
+      setObstacles(prev=>{
+        const hitOne=prev.find(o=>o.id===lineObstacle.obstacle.id);
+        const newHP=hitOne?Math.max(0,hitOne.health-rawDmg):0;
+        addLog(`Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> struck rubble instead — ${newHP<=0?'destroyed!':`${rawDmg} dmg (${newHP}/${hitOne.maxHealth})`}`);
+        return newHP<=0 ? prev.filter(o=>o.id!==lineObstacle.obstacle.id) : prev.map(o=>o.id===lineObstacle.obstacle.id?{...o,health:newHP}:o);
+      });
     } else {
       addLog(`Gale Force [d8=${dieRoll}] -> MISS`);
     }
@@ -3513,7 +3659,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     resetDiceModal();
     if(updatedEnemy.health<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
-  },[diceRolls,lockedRoll,player,enemy,tiles,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction,triggerCastFx]);
+  },[diceRolls,lockedRoll,player,enemy,tiles,obstacles,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction,triggerCastFx]);
 
   // Water handlers
   const handleSetWaterAoe = useCallback((aoe)=>setWaterAoe(aoe),[]);
@@ -3552,7 +3698,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   },[player,addLog]);
 
   // ── COMPASS SLASH (Tactical Skill) ──
-  const deployTiles = getDeployTiles(tiles, player.boardPosition, enemy.boardPosition, summons);
+  const deployTiles = getDeployTiles(tiles, player.boardPosition, enemy.boardPosition, [...summons, ...obstacles]);
   const activeSummonCount = summons.filter(s=>!s.promoted).length;
   const canDeploy = canCircuitSigil && activeSummonCount < BANDWIDTH && deployTiles.length > 0;
   const deployBlockedReason = activeSummonCount>=BANDWIDTH ? `bandwidth full (${BANDWIDTH}/${BANDWIDTH})`
@@ -3620,7 +3766,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       // No target on the tile — Dark Web now doubles as a repositioning
       // tool (leap to any knight-move tile), not just a wasted swing. Still
       // blocked if a summon already occupies the landing tile.
-      const occupied = summons.some(s=>s.boardPosition.x===targetTile.x&&s.boardPosition.y===targetTile.y);
+      const occupied = [...summons, ...obstacles].some(s=>s.boardPosition.x===targetTile.x&&s.boardPosition.y===targetTile.y);
       const leapFacing=facingFromMove(player.boardPosition,targetTile);
       const healedHP = occupied ? player.health : applyHealingIfLanded(targetTile,player.health,player.maxHealth);
       const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),health:healedHP,
@@ -3649,7 +3795,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),facing:strikeFacing},'darkWeb');
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[player,enemy,summons,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx,applyHealingIfLanded]);
+  },[player,enemy,summons,obstacles,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx,applyHealingIfLanded]);
 
   // ── PULSE WAVE (Tactical Skill) ──
   // Your own equipped element, cast a second time down a chosen axis (any
@@ -3774,6 +3920,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     // impact on Gauntlet, where this only ever fires once.
     setShowLoadoutModal(false);
     setSummons([]);
+    setObstacles([]);
     setSelectedSummonId(null);
     setPlayer(p=>({...p, usedSkillIds:[]}));
     const names = loadout.map(id=>BATTLE_SKILLS.find(s=>s.id===id)?.name).filter(Boolean).join(', ') || 'Melee only';
@@ -3902,7 +4049,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       const healTile = findHealingTile(tiles);
       const onHealTile = healTile && updatedEnemy.boardPosition.x===healTile.x && updatedEnemy.boardPosition.y===healTile.y;
       const willFlee = lowHP && healTile && updatedEnemy.fleeCommit;
-      const moveBlockers = [...others.map(e=>e.boardPosition), ...updatedSummons.map(s=>s.boardPosition)];
+      const moveBlockers = [...others.map(e=>e.boardPosition), ...updatedSummons.map(s=>s.boardPosition), ...obstacles.map(o=>o.boardPosition)];
 
       const finishStep = ()=>{
         setTimeout(()=>{
@@ -4018,10 +4165,20 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       }
 
       if(canUseElement){
-        const strike = computeElementalStrike(updatedEnemy, updatedPlayer, tiles);
+        const strike = computeElementalStrike(updatedEnemy, updatedPlayer, tiles, obstacles);
         if(strike){
           addLog(strike.log);
           updatedEnemy={...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-strike.eCost),skillUsed:true,facing:strike.castFacing};
+          if(strike.newObstacles?.length>0) setObstacles(prev=>[...prev, ...strike.newObstacles]);
+          if(strike.obstacleHit){
+            const {id,dmg:obsDmg}=strike.obstacleHit;
+            setObstacles(prev=>{
+              const hitOne=prev.find(o=>o.id===id);
+              const newHP=hitOne?Math.max(0,hitOne.health-obsDmg):0;
+              addLog(newHP<=0?`Rubble destroyed!`:`Rubble takes ${obsDmg} dmg (${newHP}/${hitOne.maxHealth}).`);
+              return newHP<=0 ? prev.filter(o=>o.id!==id) : prev.map(o=>o.id===id?{...o,health:newHP}:o);
+            });
+          }
           if(strike.dmg>0){
             const newHP=Math.max(0,updatedPlayer.health-strike.dmg);
             triggerCastFx(updatedPlayer.boardPosition, ELEMENTS.base[updatedEnemy.element]?.color||'#ff4422');
@@ -4124,7 +4281,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       finishStep();
     },700);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[addLog,tiles,triggerCastFx]);
+  },[addLog,tiles,obstacles,triggerCastFx]);
 
   // Sequences the roster: each living enemy takes its full independent turn
   // (own roll, own AP pool) before control returns to the player. Mirrors
@@ -4237,6 +4394,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setPlayer(resetPlayer);
     setTiles(newTiles);
     setSummons([]);
+    setObstacles([]);
     setSelectedSummonId(null);
     setSelectedEnemyId(null);
     setSummonPhaseActive(false);
@@ -4437,16 +4595,26 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const origin=lockedRoll.origin;
     const dieRoll=diceRolls[0].value;
     const base=dieRoll*SKILL_DICE_MULT;
-    const line=getForwardTiles(origin.boardPosition,origin.facing,earthRange);
-    const target = enemies.find(e=>line.some(t=>t.x===e.boardPosition.x&&t.y===e.boardPosition.y));
+    const {hitObstacle,hitTarget,newObstacleTiles}=resolveEarthTremor(origin, earthRange, enemies, obstacles, enemies.map(e=>e.boardPosition));
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Earth');
-    const dmg=target?Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost:0;
+    const rawDmg=Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost;
+    const dmg=hitTarget?rawDmg:0;
     const cost=1+earthRange;
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
-    addLog(`Tremor [d6=${dieRoll}, ${earthRange} tile${earthRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${target?dmg+' dmg'+(tileBoost>0?' [Earth tile +20]':''):'MISS (no enemy in line)'}`);
+    const outcome=hitTarget?`${dmg} dmg${tileBoost>0?' [Earth tile +20]':''}`:hitObstacle?'struck rubble instead':'MISS (nothing in line)';
+    addLog(`Tremor [d6=${dieRoll}, ${earthRange} tile${earthRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${outcome}${newObstacleTiles.length>0?` (+${newObstacleTiles.length} rubble)`:''}`);
+    if(newObstacleTiles.length>0) setObstacles(prev=>[...prev, ...newObstacleTiles.map(t=>makeObstacle(t))]);
+    if(hitObstacle){
+      setObstacles(prev=>{
+        const hitOne=prev.find(o=>o.id===hitObstacle.id);
+        const newHP=hitOne?Math.max(0,hitOne.health-rawDmg):0;
+        addLog(newHP<=0?'Rubble destroyed!':`Rubble takes ${rawDmg} dmg (${newHP}/${hitOne.maxHealth}).`);
+        return newHP<=0 ? prev.filter(o=>o.id!==hitObstacle.id) : prev.map(o=>o.id===hitObstacle.id?{...o,health:newHP}:o);
+      });
+    }
     resetDiceModal();
-    applySkillResultMulti(target, dmg, updatedPlayer, {}, ELEMENTS.base.Earth.color);
-  },[diceRolls,lockedRoll,player,tiles,earthRange,enemies,addLog,resetDiceModal,applySkillResultMulti]);
+    applySkillResultMulti(hitTarget, dmg, updatedPlayer, {}, ELEMENTS.base.Earth.color);
+  },[diceRolls,lockedRoll,player,tiles,obstacles,earthRange,enemies,addLog,resetDiceModal,applySkillResultMulti]);
 
   const handleAirApplyWithAccuracyMulti = useCallback((acc)=>{
     const origin=lockedRoll.origin;
@@ -4454,24 +4622,34 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const line=getForwardTiles(origin.boardPosition,origin.facing,SIZE);
     const step=line.findIndex(t=>enemies.some(e=>e.boardPosition.x===t.x&&e.boardPosition.y===t.y));
     const dist=step>=0?step+1:-1;
-    const hit=dist>0&&dist<=dieRoll;
+    const lineObstacle=findLineObstacle(origin.boardPosition,origin.facing,dieRoll,obstacles);
+    const blocked=lineObstacle && (dist<0||lineObstacle.dist<=dist);
+    const hit=!blocked&&dist>0&&dist<=dieRoll;
     const target = hit ? enemies.find(e=>e.boardPosition.x===line[step].x&&e.boardPosition.y===line[step].y) : null;
     const base=airGaleForceDamage(dieRoll);
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Air');
-    const dmg=target?Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost:0;
+    const rawDmg=Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost;
+    const dmg=target?rawDmg:0;
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),skillUsed:true};
     let extra={};
     if(target){
       const knockDist=Math.max(1,dieRoll-dist);
-      const blockers=[origin.boardPosition,...enemies.filter(e=>e.id!==target.id).map(e=>e.boardPosition)];
+      const blockers=[origin.boardPosition,...enemies.filter(e=>e.id!==target.id).map(e=>e.boardPosition),...obstacles.map(o=>o.boardPosition)];
       extra.boardPosition=getKnockbackTile(target.boardPosition,origin.facing,knockDist,blockers);
       addLog(`Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} + knockback ${knockDist} tile${knockDist>1?'s':''}`);
+    } else if(blocked){
+      setObstacles(prev=>{
+        const hitOne=prev.find(o=>o.id===lineObstacle.obstacle.id);
+        const newHP=hitOne?Math.max(0,hitOne.health-rawDmg):0;
+        addLog(`Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> struck rubble instead — ${newHP<=0?'destroyed!':`${rawDmg} dmg (${newHP}/${hitOne.maxHealth})`}`);
+        return newHP<=0 ? prev.filter(o=>o.id!==lineObstacle.obstacle.id) : prev.map(o=>o.id===lineObstacle.obstacle.id?{...o,health:newHP}:o);
+      });
     } else {
       addLog(`Gale Force [d8=${dieRoll}] -> MISS`);
     }
     resetDiceModal();
     applySkillResultMulti(target, dmg, updatedPlayer, extra, ELEMENTS.base.Air.color);
-  },[diceRolls,lockedRoll,player,tiles,enemies,addLog,resetDiceModal,applySkillResultMulti]);
+  },[diceRolls,lockedRoll,player,tiles,obstacles,enemies,addLog,resetDiceModal,applySkillResultMulti]);
 
   const handleWaterApplyWithAccuracyMulti = useCallback((acc)=>{
     const origin=lockedRoll.origin;
@@ -4490,7 +4668,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   },[diceRolls,lockedRoll,player,tiles,waterAoe,enemies,addLog,resetDiceModal,applySkillResultMulti]);
 
   // ── Compass Slash / Dark Web targeting resolution ──
-  const deployTilesMulti = getDeployTiles(tiles, player.boardPosition, enemies.map(e=>e.boardPosition), summons);
+  const deployTilesMulti = getDeployTiles(tiles, player.boardPosition, enemies.map(e=>e.boardPosition), [...summons, ...obstacles]);
   const canDeployMulti = canCircuitSigil && summons.filter(s=>s.side==='player'&&!s.promoted).length < BANDWIDTH && deployTilesMulti.length > 0;
   const deployBlockedReasonMulti = summons.filter(s=>s.side==='player'&&!s.promoted).length>=BANDWIDTH ? `bandwidth full (${BANDWIDTH}/${BANDWIDTH})`
                             : deployTilesMulti.length===0 ? 'no legal tiles on row 7'
@@ -4521,7 +4699,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       // No target on the tile — Dark Web now doubles as a repositioning
       // tool (leap to any knight-move tile), not just a wasted swing. Still
       // blocked if a summon already occupies the landing tile.
-      const occupied = summons.some(s=>s.boardPosition.x===targetTile.x&&s.boardPosition.y===targetTile.y);
+      const occupied = [...summons, ...obstacles].some(s=>s.boardPosition.x===targetTile.x&&s.boardPosition.y===targetTile.y);
       const leapFacing=facingFromMove(player.boardPosition,targetTile);
       const healedHP = occupied ? player.health : applyHealingIfLanded(targetTile,player.health,player.maxHealth);
       const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),health:healedHP,
@@ -4542,7 +4720,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     }
     addLog(`Dark Web -> ${dmg} dmg (${acc}% ${accuracyTierLabel(acc)})${newHP<=0?' — finishing blow, claims tile':''}`);
     applySkillResultMulti(target, dmg, updatedPlayer, {}, '#a0a0a0');
-  },[player,enemies,summons,addLog,applySkillResultMulti,routeAfterPlayerActionMulti,applyHealingIfLanded]);
+  },[player,enemies,summons,obstacles,addLog,applySkillResultMulti,routeAfterPlayerActionMulti,applyHealingIfLanded]);
 
   // Shared tail for a multi-hit skill (Pulse Wave, Piercing Light) once
   // damage has already been applied to every hit enemy in `damaged`: routes
@@ -4815,7 +4993,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(!target) return;
     if(player.actionpts<target.distance){ addLog(`Not enough Energy (need ${target.distance})`); return; }
     const occupiedByEnemy=isCampaign ? enemies.some(e=>e.boardPosition.x===x&&e.boardPosition.y===y) : (enemy.boardPosition.x===x&&enemy.boardPosition.y===y);
-    const occupiedBySummon=summons.some(s=>s.boardPosition.x===x&&s.boardPosition.y===y);
+    const occupiedBySummon=[...summons, ...obstacles].some(s=>s.boardPosition.x===x&&s.boardPosition.y===y);
     if(occupiedByEnemy||occupiedBySummon){ addLog('// Tile occupied'); return; }
     const oldPos=player.boardPosition;
     const newFacing=facingToward(oldPos,{x,y});
@@ -4856,7 +5034,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setPlayerSel(false);
     setValidSquares([]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[isCampaign,showDeploy,awaitingPlacement,compassTargeting,darkWebTargeting,pulseWaveTargeting,summonPhaseActive,energyPhase,summons,actedSummonIds,selectedSummonId,isPlayerTurn,player,enemy,enemies,playerSel,validSquares,tiles,loadout,wave,addLog,triggerCastFx,handleEnemyDefeated,handleEnemyDefeatedMulti,resolveDeployPlacement,resolveDeployPlacementMulti,resolveCompassSlash,resolveCompassSlashMulti,resolveDarkWeb,resolveDarkWebMulti,resolvePulseWave,resolvePulseWaveMulti,summonActionAt,summonActionAtMulti,resolveSummonAction,resolveSummonActionMulti]);
+  },[isCampaign,showDeploy,awaitingPlacement,compassTargeting,darkWebTargeting,pulseWaveTargeting,summonPhaseActive,energyPhase,summons,obstacles,actedSummonIds,selectedSummonId,isPlayerTurn,player,enemy,enemies,playerSel,validSquares,tiles,loadout,wave,addLog,triggerCastFx,handleEnemyDefeated,handleEnemyDefeatedMulti,resolveDeployPlacement,resolveDeployPlacementMulti,resolveCompassSlash,resolveCompassSlashMulti,resolveDarkWeb,resolveDarkWebMulti,resolvePulseWave,resolvePulseWaveMulti,summonActionAt,summonActionAtMulti,resolveSummonAction,resolveSummonActionMulti]);
 
   // Auto-end the summon command phase once all of the PLAYER's own summons
   // have acted (or pool is empty) — enemy-deployed summons in Campaign act
@@ -4971,6 +5149,11 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const idx=line.findIndex(t=>t.x===enemy.boardPosition.x&&t.y===enemy.boardPosition.y);
     return idx>=0?idx+1:0;
   })();
+  const nearestObstacleForEarth = (()=>{
+    const line=getForwardTiles(castOrigin.boardPosition,castOrigin.facing,SIZE);
+    const idx=line.findIndex(t=>obstacles.some(o=>o.boardPosition.x===t.x&&o.boardPosition.y===t.y));
+    return idx>=0?idx+1:0;
+  })();
   const waterAnchor = getTorrentAnchor(castOrigin.boardPosition,castOrigin.facing);
   const waterAnchorInBounds = (()=>{
     const dir={up:{dx:0,dy:-1},down:{dx:0,dy:1},left:{dx:-1,dy:0},right:{dx:1,dy:0}}[castOrigin.facing]||{dx:0,dy:1};
@@ -5071,7 +5254,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
                     validSquares={validSquares} onSquareClick={handleSquareClick}
                     playerSelected={playerSel} tiles={tiles}
                     playerFacing={player.facing} enemyFacing={enemy.facing}
-                    aoeTiles={aoeTiles} knightTiles={darkWebTiles} summons={summons} deployTiles={gridDeployHighlights}
+                    aoeTiles={aoeTiles} knightTiles={darkWebTiles} summons={summons} obstacles={obstacles} deployTiles={gridDeployHighlights}
                     castFx={castFx}
                   />
                 </div>
@@ -5156,7 +5339,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         waterAoe={waterAoe} onSetWaterAoe={handleSetWaterAoe}
         waterAvailableAP={player.actionpts}
         waterAnchorInBounds={waterAnchorInBounds} waterEnemyInFootprint={waterEnemyInFootprint}
-        playerFacing={castOrigin.facing} enemyDistance={enemyDistanceForAir}
+        playerFacing={castOrigin.facing} enemyDistance={enemyDistanceForAir} obstacleDistance={nearestObstacleForEarth}
       />
       <LoadoutModal show={showLoadoutModal} loadout={loadout} onToggle={handleToggleLoadoutSkill} onConfirm={handleConfirmLoadout} onClose={()=>setShowLoadoutModal(false)} freeSelect={scene==='skills'} craftedSkillIds={craftedSkillIds} />
       <DeployRollModal
@@ -5287,6 +5470,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         .square.summon { background: radial-gradient(circle, #9b6cff, #5a2a9a); border-color: #b08cff; color: #fff; font-weight: bold; box-shadow: 0 0 10px rgba(155,108,255,0.55); }
         .square.summon.enemySide { background: radial-gradient(circle, #ff6644, #8a2a10); border-color: #ff9966; box-shadow: 0 0 10px rgba(255,102,68,0.55); }
         .square.summon.promoted { border-color: #ffd700; box-shadow: 0 0 14px rgba(255,215,0,0.75), inset 0 0 8px rgba(255,215,0,0.5); font-size: 12px; }
+        .square.obstacle { background: linear-gradient(135deg, #6b5638, #3a2e1c); border-color: #a08860; color: #e8dcc4; font-size: 13px; cursor: default; }
         .square.aoePreview { box-shadow: inset 0 0 10px rgba(155,108,255,0.6); border-color: #9b6cff; }
         .square.knightPreview { box-shadow: inset 0 0 10px rgba(160,160,160,0.6); border-color: #a0a0a0; }
         .square.deployTile { background: linear-gradient(135deg, #2a1a4a, #1a0a3a); border-color: #9b6cff; box-shadow: inset 0 0 8px rgba(155,108,255,0.4); animation: pulsePurple 1.1s infinite; }
