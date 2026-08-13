@@ -19,9 +19,9 @@ export const ELEMENTS = {
       dice:['d4','d4'],
       color:'#ff6b00',
       icon:'🔥',
-      description:'Roll 2×d4. Die 1 = pulse count. Die 2 = dmg per pulse ×20. Cost: 3 Energy fixed.',
+      description:'Roll 2×d4. Die 1 = pulse count. Die 2 = dmg per pulse ×20. A landed hit also sets the target Burning: 10 dmg at the start of each of their next 2 turns. Cost: 3 Energy fixed.',
       isFire: true,
-      base:{name:'Ember Strike',desc:'pulses × dmg × 20',damage:0},
+      base:{name:'Ember Strike',desc:'pulses × dmg × 20 + Burn (10 dmg, 2 turns)',damage:0},
       thresholds:[],
       tierFormula:()=>0,
       accuracyApplies:true,
@@ -31,9 +31,9 @@ export const ELEMENTS = {
       dice:['d20'],
       color:'#4aafee',
       icon:'🌊',
-      description:'Roll d20. Dual-aspect matrix sets damage (50/80/120) and AoE (single/cross/spread). Range: 2 tiles forward. Cost scales 2/6/10 by AoE.',
+      description:'Roll d20. Dual-aspect matrix sets damage (50/80/120) and AoE (single/cross/spread). Range: 2 tiles forward. A roll of 10+ also Floods the anchor (center) tile into a Water tile. Cost scales 2/6/10 by AoE.',
       isWater: true,
-      base:{name:'Torrent',desc:'d20 dual-aspect: damage × AoE',damage:0},
+      base:{name:'Torrent',desc:'d20 dual-aspect: damage × AoE; 10+ Floods the anchor tile',damage:0},
       thresholds:[],
       tierFormula:()=>0,
       accuracyApplies:true,
@@ -452,7 +452,29 @@ const makeCharacter = (name,hp,level,agi,ap,pos,element,elementCategory) => ({
   playerXp:0,facing:'down',frozen:0,slowed:false,skillUsed:false,rotateUsed:false,classSkillUsed:false,
   usedSkillIds:[],
   element:element||null,elementCategory:elementCategory||null,energyRollover:0,
+  burn:null, // Fire's Burn status — {turns,dmg}; ticks at the start of this unit's own turn, see tickBurn
 });
+// Burn (Fire's terrain/status effect): a flat-damage DoT applied whenever a
+// base Fire hit lands. Ticks at the start of the afflicted unit's own turn
+// (mirrors how `frozen` is consumed there) — deals `dmg`, decrements
+// `turns`, and clears once it hits 0. A fresh Fire hit refreshes the
+// duration back to BURN_TURNS rather than stacking additional simultaneous
+// burns, so repeated Ember Strikes keep someone burning without the DoT
+// damage snowballing turn over turn.
+const BURN_TURNS = 2;
+const BURN_DMG = 10;
+const applyBurn = (target) => ({...target, burn:{turns:BURN_TURNS, dmg:BURN_DMG}});
+// Returns {unit, tickDmg, tickLog} — `unit` has burn ticked down (or
+// cleared) and HP reduced; `tickDmg`/`tickLog` are 0/null when no burn was
+// active.
+const tickBurn = (unit) => {
+  if(!unit.burn) return {unit, tickDmg:0, tickLog:null};
+  const dmg = unit.burn.dmg;
+  const newHealth = Math.max(0, unit.health-dmg);
+  const turnsLeft = unit.burn.turns-1;
+  const burn = turnsLeft>0 ? {...unit.burn, turns:turnsLeft} : null;
+  return {unit:{...unit, health:newHealth, burn}, tickDmg:dmg, tickLog:`${unit.name} burns for ${dmg} dmg${burn?` (${turnsLeft} turn${turnsLeft>1?'s':''} left)`:' (burn fades)'}`};
+};
 // Marks `skillId` as used-this-round on a player object, for the loadout's
 // per-skill once-per-round gate.
 const markSkillUsed = (p, skillId) => ({...p, usedSkillIds:[...(p.usedSkillIds||[]), skillId]});
@@ -861,7 +883,7 @@ const computeElementalStrike = (attacker, target, tiles, obstacles=[]) => {
   const ranged = elData.isEarth||elData.isAir||elData.isWater;
   const castFacing = ranged ? facingToward(attacker.boardPosition,target.boardPosition) : attacker.facing;
   let dmg=0, eCost=getSkillCost(attacker.elementCategory, attacker.element), knockbackPos=null, log='';
-  let obstacleHit=null, newObstacles=[];
+  let obstacleHit=null, newObstacles=[], appliesBurn=false, floodTile=null;
 
   if(elData.isFire){
     const pulses=rolls[0].value, dmgEach=rolls[1].value;
@@ -872,7 +894,8 @@ const computeElementalStrike = (attacker, target, tiles, obstacles=[]) => {
     if(flank.bonus>0) dmg+=flank.bonus;
     const tileBoost=getTileBoost(tiles,attacker.boardPosition,'Fire');
     if(tileBoost>0) dmg+=tileBoost;
-    log=`${attacker.name} Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${tileBoost>0?' [Fire tile +20]':''}`;
+    appliesBurn=true;
+    log=`${attacker.name} Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${tileBoost>0?' [Fire tile +20]':''} [Burn]`;
   } else if(elData.isEarth){
     const dieRoll=rolls[0].value;
     const maxRange=Math.max(1,Math.floor(dieRoll/2));
@@ -939,10 +962,14 @@ const computeElementalStrike = (attacker, target, tiles, obstacles=[]) => {
       const acc=rollD100Accuracy();
       const tileBoost=getTileBoost(tiles,attacker.boardPosition,'Water');
       dmg=hit?applyAccuracy(res.damage,acc)+tileBoost:0;
-      log=`${attacker.name} Torrent [d20=${dieRoll}, ${AOE_LABEL[chosen.aoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg':'MISS'}`;
+      // Flood: a strong enough torrent (d20 >= 10) reshapes the ground it
+      // lands on into a Water tile, regardless of whether it actually hit —
+      // only the anchor (center) tile floods, not the whole footprint.
+      if(dieRoll>=10) floodTile=anchor;
+      log=`${attacker.name} Torrent [d20=${dieRoll}, ${AOE_LABEL[chosen.aoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg':'MISS'}${floodTile?' [Flood]':''}`;
     }
   }
-  return { dmg, eCost, castFacing, knockbackPos, log, obstacleHit, newObstacles };
+  return { dmg, eCost, castFacing, knockbackPos, log, obstacleHit, newObstacles, appliesBurn, floodTile };
 };
 
 // Whether `attacker`'s equipped element could plausibly land on `target`
@@ -1726,6 +1753,7 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
             />
             <EnergyBar current={player.actionpts} rolled={playerRolledEnergy} rollover={player.energyRollover} />
             {player.frozen>0&&<StatLine label="Freeze" value={`-${player.frozen} Energy next round`} accent="#a0e4ff" />}
+            {player.burn&&<StatLine label="Burn" value={`-${player.burn.dmg} HP for ${player.burn.turns} more turn${player.burn.turns>1?'s':''}`} accent="#ff6b00" />}
             {summons.some(s=>!s.side||s.side==='player')&&(
               <div style={{marginTop:6,borderTop:'1px solid #1e3a4a',paddingTop:6}}>
                 <div style={{fontSize:'9px',color:'#3a6a8a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:4}}>Active Summons</div>
@@ -1764,6 +1792,7 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
                     </div>
                     <HealthBar current={e.health} max={e.maxHealth} />
                     <StatLine label="Energy" value={rolled===0?'-':`${e.actionpts} / ${rolled}`} accent={e.actionpts>0?'#ff6644':'#555'} />
+                    {e.burn&&<StatLine label="Burn" value={`-${e.burn.dmg} HP × ${e.burn.turns}`} accent="#ff6b00" />}
                   </div>
                 );
               })
@@ -1778,6 +1807,7 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
                 />
                 <EnergyBar current={enemy.actionpts} rolled={enemyRolledEnergy} rollover={enemy.energyRollover} />
                 {enemy.frozen>0&&<StatLine label="Freeze" value={`-${enemy.frozen} Energy next round`} accent="#a0e4ff" />}
+                {enemy.burn&&<StatLine label="Burn" value={`-${enemy.burn.dmg} HP for ${enemy.burn.turns} more turn${enemy.burn.turns>1?'s':''}`} accent="#ff6b00" />}
                 {enemy.element&&<StatLine label="Skill" value={enemy.skillUsed?'used':'ready'} accent={enemy.skillUsed?'#3a6a8a':'#00cc66'} />}
               </>
             )}
@@ -2928,6 +2958,14 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const runEnemyTurn = useCallback((currentEnemy,currentPlayer,currentSummons,currentRound,currentObstacles)=>{
     const needsRoll = currentEnemy.actionpts === 0;
     if(needsRoll){
+      const {unit:burnedEnemy, tickLog}=tickBurn(currentEnemy);
+      if(tickLog) addLog(tickLog);
+      if(burnedEnemy.health<=0){
+        setEnemy(burnedEnemy);
+        handleEnemyDefeated(currentPlayer, wave);
+        return;
+      }
+      currentEnemy = burnedEnemy;
       const eRoll = rollD12Energy();
       const rollover = currentEnemy.energyRollover || 0;
       const frozenPenalty = currentEnemy.frozen || 0;
@@ -3108,7 +3146,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       if(canUseSkill){
         const elData=eElData;
         const rolls=elData.dice.map(d=>({type:d,value:rollDie(parseInt(d.slice(1)))}));
-        let dmg=0, heal=0;
+        let dmg=0, heal=0, appliesBurn=false;
         let eCost = getSkillCost(currentEnemy.elementCategory, currentEnemy.element);
         const ranged = elData.isEarth||elData.isAir||elData.isWater;
         const castFacing = ranged ? facingToward(currentEnemy.boardPosition,currentPlayer.boardPosition) : currentEnemy.facing;
@@ -3122,7 +3160,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           if(flank.bonus>0) dmg+=flank.bonus;
           const tileBoost=getTileBoost(tiles,currentEnemy.boardPosition,'Fire');
           if(tileBoost>0) dmg+=tileBoost;
-          addLog(`${currentEnemy.name} Ember Strike [${pulses} pulses x ${dmgEach*SKILL_DICE_MULT} = ${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${tileBoost>0?' [Fire tile +20]':''}`);
+          appliesBurn=true;
+          addLog(`${currentEnemy.name} Ember Strike [${pulses} pulses x ${dmgEach*SKILL_DICE_MULT} = ${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${tileBoost>0?' [Fire tile +20]':''} [Burn]`);
         } else if(elData.isEarth){
           const dieRoll=rolls[0].value;
           const maxRange=Math.max(1,Math.floor(dieRoll/2));
@@ -3200,13 +3239,16 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
             const acc=rollD100Accuracy();
             const tileBoost=getTileBoost(tiles,currentEnemy.boardPosition,'Water');
             dmg=hit?applyAccuracy(res.damage,acc)+tileBoost:0;
-            addLog(`${currentEnemy.name} Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[chosen.aoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS'}`);
+            const flooded=dieRoll>=10;
+            if(flooded) setTiles(prev=>{ if(prev[anchor.y][anchor.x]===TILE_TYPES.WATER_BOOST) return prev; const g=prev.map(r=>r.slice()); g[anchor.y][anchor.x]=TILE_TYPES.WATER_BOOST; return g; });
+            addLog(`${currentEnemy.name} Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[chosen.aoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS'}${flooded?' [Flood]':''}`);
           }
         }
 
         if(dmg>0){
           const newHP=Math.max(0,currentPlayer.health-dmg);
           updatedPlayer={...updatedPlayer,health:newHP};
+          if(appliesBurn) updatedPlayer=applyBurn(updatedPlayer);
           updatedEnemy={...currentEnemy,actionpts:Math.max(0,currentEnemy.actionpts-eCost),skillUsed:true,facing:castFacing};
           setPlayer(updatedPlayer); setEnemy(updatedEnemy);
           triggerCastFx(currentPlayer.boardPosition, ELEMENTS.base[currentEnemy.element]?.color||'#ff4422');
@@ -3335,14 +3377,16 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
 
   // ── ENERGY ROLL ──
   const handleRollEnergy = useCallback(()=>{
+    const {unit:burnedPlayer, tickLog}=tickBurn(player);
+    if(tickLog) addLog(tickLog);
     const roll = rollD12Energy();
-    const rollover = player.energyRollover || 0;
-    const frozenPenalty = player.frozen || 0;
+    const rollover = burnedPlayer.energyRollover || 0;
+    const frozenPenalty = burnedPlayer.frozen || 0;
     const total = roll + rollover;
     const newAP = Math.max(0, total - frozenPenalty);
     setPlayerRolledEnergy(total);
     addLog(`You roll d12=${roll}${rollover>0?` +${rollover} rollover`:''} = ${total} Energy${frozenPenalty>0?` (freeze -${frozenPenalty})`:''}  ->  ${newAP} AP`);
-    const rolledPlayer = { ...player, actionpts:newAP, frozen:0, energyRollover:0 };
+    const rolledPlayer = { ...burnedPlayer, actionpts:newAP, frozen:0, energyRollover:0 };
     setPlayer(rolledPlayer);
     const proceed = ()=>{
       if(summons.some(s=>!s.promoted)){
@@ -3591,8 +3635,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Fire');
     if(tileBoost>0) dmg+=tileBoost;
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-3),skillUsed:true};
-    const updatedEnemy={...enemy,health:Math.max(0,enemy.health-dmg)};
-    addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tileBoost>0?' [Fire tile +20]':''}`);
+    const updatedEnemy=applyBurn({...enemy,health:Math.max(0,enemy.health-dmg)});
+    addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tileBoost>0?' [Fire tile +20]':''} [Burn]`);
     triggerCastFx(enemy.boardPosition, ELEMENTS.base.Fire.color);
     resetDiceModal();
     if(updatedEnemy.health<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
@@ -3686,7 +3730,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const cost=TORRENT_AOE_COST[waterAoe];
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
     const updatedEnemy={...enemy,health:Math.max(0,enemy.health-dmg)};
-    addLog(`Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[waterAoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS (enemy outside blast)'}`);
+    const flooded=dieRoll>=10;
+    if(flooded) setTiles(prev=>{ if(prev[anchor.y][anchor.x]===TILE_TYPES.WATER_BOOST) return prev; const g=prev.map(r=>r.slice()); g[anchor.y][anchor.x]=TILE_TYPES.WATER_BOOST; return g; });
+    addLog(`Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[waterAoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS (enemy outside blast)'}${flooded?' [Flood]':''}`);
     if(hit) triggerCastFx(enemy.boardPosition, ELEMENTS.base.Water.color);
     resetDiceModal();
     if(updatedEnemy.health<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
@@ -4001,6 +4047,15 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const runSingleEnemyAITurn = useCallback((thisEnemy, allEnemies, currentPlayer, currentSummons, currentRound, onDone, currentObstacles)=>{
     const needsRoll = thisEnemy.actionpts===0;
     if(needsRoll){
+      const {unit:burnedEnemy, tickLog}=tickBurn(thisEnemy);
+      if(tickLog) addLog(tickLog);
+      if(burnedEnemy.health<=0){
+        const deadEnemies=allEnemies.map(e=>e.id===thisEnemy.id?burnedEnemy:e);
+        setEnemies(deadEnemies);
+        handleEnemyDefeatedMulti(thisEnemy.id, currentPlayer, deadEnemies);
+        return;
+      }
+      thisEnemy = burnedEnemy;
       const eRoll=rollD12Energy();
       const rollover=thisEnemy.energyRollover||0;
       const frozenPenalty=thisEnemy.frozen||0;
@@ -4201,10 +4256,15 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
             updatedObstacles = newHP<=0 ? updatedObstacles.filter(o=>o.id!==id) : updatedObstacles.map(o=>o.id===id?{...o,health:newHP}:o);
             setObstacles(updatedObstacles);
           }
+          if(strike.floodTile){
+            const ft=strike.floodTile;
+            setTiles(prev=>{ if(prev[ft.y][ft.x]===TILE_TYPES.WATER_BOOST) return prev; const g=prev.map(r=>r.slice()); g[ft.y][ft.x]=TILE_TYPES.WATER_BOOST; return g; });
+          }
           if(strike.dmg>0){
             const newHP=Math.max(0,updatedPlayer.health-strike.dmg);
             triggerCastFx(updatedPlayer.boardPosition, ELEMENTS.base[updatedEnemy.element]?.color||'#ff4422');
             updatedPlayer={...updatedPlayer,health:newHP,boardPosition:strike.knockbackPos||updatedPlayer.boardPosition};
+            if(strike.appliesBurn) updatedPlayer=applyBurn(updatedPlayer);
             setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
             if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
           } else {
@@ -4442,14 +4502,16 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   },[addLog]);
 
   const handleRollEnergyMulti = useCallback(()=>{
+    const {unit:burnedPlayer, tickLog}=tickBurn(player);
+    if(tickLog) addLog(tickLog);
     const roll=rollD12Energy();
-    const rollover=player.energyRollover||0;
-    const frozenPenalty=player.frozen||0;
+    const rollover=burnedPlayer.energyRollover||0;
+    const frozenPenalty=burnedPlayer.frozen||0;
     const total=roll+rollover;
     const newAP=Math.max(0,total-frozenPenalty);
     setPlayerRolledEnergy(total);
     addLog(`You roll d12=${roll}${rollover>0?` +${rollover} rollover`:''} = ${total} Energy${frozenPenalty>0?` (freeze -${frozenPenalty})`:''}  ->  ${newAP} AP`);
-    const rolledPlayer={...player,actionpts:newAP,frozen:0,energyRollover:0};
+    const rolledPlayer={...burnedPlayer,actionpts:newAP,frozen:0,energyRollover:0};
     setPlayer(rolledPlayer);
     const proceed = ()=>{
       if(summons.some(s=>s.side==='player'&&!s.promoted)){
@@ -4608,9 +4670,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Fire');
     if(tileBoost>0) dmg+=tileBoost;
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-3),skillUsed:true};
-    if(target) addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tileBoost>0?' [Fire tile +20]':''}`);
+    if(target) addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tileBoost>0?' [Fire tile +20]':''} [Burn]`);
     resetDiceModal();
-    applySkillResultMulti(target, dmg, updatedPlayer, {}, ELEMENTS.base.Fire.color);
+    applySkillResultMulti(target, dmg, updatedPlayer, {burn:{turns:BURN_TURNS,dmg:BURN_DMG}}, ELEMENTS.base.Fire.color);
   },[diceRolls,lockedRoll,player,tiles,addLog,resetDiceModal,resolveTargetForSkill,applySkillResultMulti]);
 
   const handleEarthApplyWithAccuracyMulti = useCallback((acc)=>{
@@ -4684,7 +4746,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const dmg=target?applyAccuracy(res.damage,acc)+tileBoost:0;
     const cost=TORRENT_AOE_COST[waterAoe];
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
-    addLog(`Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[waterAoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${target?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS (no enemy in blast)'}`);
+    const flooded=dieRoll>=10;
+    if(flooded) setTiles(prev=>{ if(prev[anchor.y][anchor.x]===TILE_TYPES.WATER_BOOST) return prev; const g=prev.map(r=>r.slice()); g[anchor.y][anchor.x]=TILE_TYPES.WATER_BOOST; return g; });
+    addLog(`Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[waterAoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${target?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS (no enemy in blast)'}${flooded?' [Flood]':''}`);
     resetDiceModal();
     applySkillResultMulti(target, dmg, updatedPlayer, {}, ELEMENTS.base.Water.color);
   },[diceRolls,lockedRoll,player,tiles,waterAoe,enemies,addLog,resetDiceModal,applySkillResultMulti]);
