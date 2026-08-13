@@ -19,9 +19,9 @@ export const ELEMENTS = {
       dice:['d4','d4'],
       color:'#ff6b00',
       icon:'🔥',
-      description:'Roll 2×d4. Die 1 = pulse count. Die 2 = dmg per pulse ×20. A landed hit also sets the target Burning: 10 dmg at the start of each of their next 2 turns. Cost: 3 Energy fixed.',
+      description:'Roll 2×d4. Die 1 = pulse count. Die 2 = dmg per pulse ×20. Rolling 3+ pulses also sets the target Burning: 10 dmg at the start of each of their next 2 turns. Cost: 3 Energy fixed.',
       isFire: true,
-      base:{name:'Ember Strike',desc:'pulses × dmg × 20 + Burn (10 dmg, 2 turns)',damage:0},
+      base:{name:'Ember Strike',desc:'pulses × dmg × 20; 3+ pulses also Burns (10 dmg, 2 turns)',damage:0},
       thresholds:[],
       tierFormula:()=>0,
       accuracyApplies:true,
@@ -894,8 +894,8 @@ const computeElementalStrike = (attacker, target, tiles, obstacles=[]) => {
     if(flank.bonus>0) dmg+=flank.bonus;
     const tileBoost=getTileBoost(tiles,attacker.boardPosition,'Fire');
     if(tileBoost>0) dmg+=tileBoost;
-    appliesBurn=true;
-    log=`${attacker.name} Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${tileBoost>0?' [Fire tile +20]':''} [Burn]`;
+    appliesBurn=pulses>=3;
+    log=`${attacker.name} Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${tileBoost>0?' [Fire tile +20]':''}${appliesBurn?' [Burn]':''}`;
   } else if(elData.isEarth){
     const dieRoll=rolls[0].value;
     const maxRange=Math.max(1,Math.floor(dieRoll/2));
@@ -1271,12 +1271,36 @@ const StatLine = ({label,value,accent}) => (
   </div>
 );
 
+// HP text lives below the bar (the "foot"), not inside the shrinking fill —
+// cramming it inside meant it got clipped unreadable once the fill got
+// narrow. At full health it reads as one centered "X / Max". Once damaged,
+// it splits at the fill's edge: the current value hugs the end of the
+// filled color, "/ Max" floats free in the empty remainder — so the fill's
+// own edge doubles as the divisor slash. The fill's right edge is cut on a
+// diagonal (rather than a flat vertical line) to actually look like that
+// slash rather than just imply it.
+const HEALTH_BAR_SLANT = 7;
 const HealthBar = ({current,max}) => {
-  const pct=Math.max(0,(current/max)*100);
+  const pct=Math.max(0,Math.min(100,(current/max)*100));
+  const isFull=current>=max;
+  const fillColor=`hsl(${pct*1.2},80%,45%)`;
   return (
-    <div style={{width:'100%',height:'16px',background:'#1a1a2e',border:'1px solid #2a4a5e',borderRadius:'3px',overflow:'hidden',margin:'6px 0'}}>
-      <div style={{height:'100%',width:`${pct}%`,background:`hsl(${pct*1.2},80%,45%)`,transition:'width 0.3s',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'10px',fontWeight:'bold',color:'#fff',fontFamily:'monospace'}}>
-        {Math.round(current)} / {max}
+    <div style={{width:'100%',margin:'6px 0 4px'}}>
+      <div style={{width:'100%',height:'16px',background:'#1a1a2e',border:'1px solid #2a4a5e',borderRadius:'3px',position:'relative',overflow:'hidden'}}>
+        <div style={{
+          height:'100%',width:`${pct}%`,background:fillColor,transition:'width 0.3s',
+          clipPath: (!isFull && pct>0) ? `polygon(0 0, 100% 0, calc(100% - ${HEALTH_BAR_SLANT}px) 100%, 0 100%)` : 'none',
+        }} />
+      </div>
+      <div style={{position:'relative',height:12,marginTop:2,fontSize:10,fontWeight:'bold',fontFamily:'monospace',whiteSpace:'nowrap'}}>
+        {isFull ? (
+          <div style={{textAlign:'center',color:'#b0dff4'}}>{Math.round(current)} / {max}</div>
+        ) : (
+          <>
+            <span style={{position:'absolute',left:`${pct}%`,transform:'translateX(-100%)',paddingRight:2,color:fillColor}}>{Math.round(current)}</span>
+            <span style={{position:'absolute',left:`${pct}%`,paddingLeft:2,color:'#7a9db5'}}>/ {max}</span>
+          </>
+        )}
       </div>
     </div>
   );
@@ -1985,6 +2009,7 @@ const FireDiceSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRollAcc
   const pulses   = rolls.length > 0 ? rolls[0].value : null;
   const dmgEach  = rolls.length > 1 ? rolls[1].value : null;
   const baseDmg  = pulses !== null && dmgEach !== null ? pulses * dmgEach * SKILL_DICE_MULT : null;
+  const willBurn = pulses !== null && pulses >= 3;
 
   return (
     <>
@@ -2025,6 +2050,9 @@ const FireDiceSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRollAcc
                 <span style={{fontSize:18,fontWeight:'bold',color:elColor}}>{baseDmg}</span>
                 <span style={{color:'#3a6a8a'}}>base dmg</span>
               </div>
+              <div style={{fontSize:'11px',marginTop:6,color:willBurn?'#ff6b00':'#3a6a8a'}}>
+                {willBurn ? '🔥 3+ pulses — sets Burning (10 dmg, 2 turns)' : `Needs 3+ pulses to Burn (rolled ${pulses})`}
+              </div>
               <button onClick={onProceedToAccuracy}
                 style={{width:'100%',marginTop:12,padding:11,background:`${elColor}22`,color:elColor,border:`1px solid ${elColor}`,borderRadius:6,fontSize:14,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.08em'}}>
                 Roll Accuracy
@@ -2038,7 +2066,7 @@ const FireDiceSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRollAcc
         <>
           <div style={{textAlign:'center',marginBottom:14}}>
             <div style={{fontSize:13,color:'#7a9db5',marginBottom:4}}>
-              Ember Strike: <span style={{color:elColor}}>{pulses} x {dmgEach*SKILL_DICE_MULT} = {baseDmg}</span> base dmg
+              Ember Strike: <span style={{color:elColor}}>{pulses} x {dmgEach*SKILL_DICE_MULT} = {baseDmg}</span> base dmg{willBurn&&<span style={{color:'#ff6b00'}}> + Burn</span>}
             </div>
             <div style={{fontSize:'11px',color:'#5a7a8a'}}>Roll d100. ≥79 full · 40–78 half · under 40 quarter</div>
           </div>
@@ -3160,8 +3188,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           if(flank.bonus>0) dmg+=flank.bonus;
           const tileBoost=getTileBoost(tiles,currentEnemy.boardPosition,'Fire');
           if(tileBoost>0) dmg+=tileBoost;
-          appliesBurn=true;
-          addLog(`${currentEnemy.name} Ember Strike [${pulses} pulses x ${dmgEach*SKILL_DICE_MULT} = ${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${tileBoost>0?' [Fire tile +20]':''} [Burn]`);
+          appliesBurn=pulses>=3;
+          addLog(`${currentEnemy.name} Ember Strike [${pulses} pulses x ${dmgEach*SKILL_DICE_MULT} = ${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${tileBoost>0?' [Fire tile +20]':''}${appliesBurn?' [Burn]':''}`);
         } else if(elData.isEarth){
           const dieRoll=rolls[0].value;
           const maxRange=Math.max(1,Math.floor(dieRoll/2));
@@ -3635,8 +3663,10 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Fire');
     if(tileBoost>0) dmg+=tileBoost;
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-3),skillUsed:true};
-    const updatedEnemy=applyBurn({...enemy,health:Math.max(0,enemy.health-dmg)});
-    addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tileBoost>0?' [Fire tile +20]':''} [Burn]`);
+    const appliesBurn=pulses>=3;
+    let updatedEnemy={...enemy,health:Math.max(0,enemy.health-dmg)};
+    if(appliesBurn) updatedEnemy=applyBurn(updatedEnemy);
+    addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tileBoost>0?' [Fire tile +20]':''}${appliesBurn?' [Burn]':''}`);
     triggerCastFx(enemy.boardPosition, ELEMENTS.base.Fire.color);
     resetDiceModal();
     if(updatedEnemy.health<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
@@ -4670,9 +4700,10 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Fire');
     if(tileBoost>0) dmg+=tileBoost;
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-3),skillUsed:true};
-    if(target) addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tileBoost>0?' [Fire tile +20]':''} [Burn]`);
+    const appliesBurn=pulses>=3;
+    if(target) addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tileBoost>0?' [Fire tile +20]':''}${appliesBurn?' [Burn]':''}`);
     resetDiceModal();
-    applySkillResultMulti(target, dmg, updatedPlayer, {burn:{turns:BURN_TURNS,dmg:BURN_DMG}}, ELEMENTS.base.Fire.color);
+    applySkillResultMulti(target, dmg, updatedPlayer, appliesBurn?{burn:{turns:BURN_TURNS,dmg:BURN_DMG}}:{}, ELEMENTS.base.Fire.color);
   },[diceRolls,lockedRoll,player,tiles,addLog,resetDiceModal,resolveTargetForSkill,applySkillResultMulti]);
 
   const handleEarthApplyWithAccuracyMulti = useCallback((acc)=>{
