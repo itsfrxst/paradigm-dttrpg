@@ -19,9 +19,9 @@ export const ELEMENTS = {
       dice:['d4','d4'],
       color:'#ff6b00',
       icon:'🔥',
-      description:'Roll 2×d4. Die 1 = pulse count. Die 2 = dmg per pulse ×20. Cost: 3 Energy fixed.',
+      description:'Roll 2×d4. Die 1 = pulse count. Die 2 = dmg per pulse ×20. Rolling 3+ pulses also sets the target Burning: 10 dmg at the start of each of their next 2 turns. Cost: 3 Energy fixed.',
       isFire: true,
-      base:{name:'Ember Strike',desc:'pulses × dmg × 20',damage:0},
+      base:{name:'Ember Strike',desc:'pulses × dmg × 20; 3+ pulses also Burns (10 dmg, 2 turns)',damage:0},
       thresholds:[],
       tierFormula:()=>0,
       accuracyApplies:true,
@@ -31,9 +31,9 @@ export const ELEMENTS = {
       dice:['d20'],
       color:'#4aafee',
       icon:'🌊',
-      description:'Roll d20. Dual-aspect matrix sets damage (50/80/120) and AoE (single/cross/spread). Range: 2 tiles forward. Cost scales 2/6/10 by AoE.',
+      description:'Roll d20. Dual-aspect matrix sets damage (50/80/120) and AoE (single/cross/spread). Range: 2 tiles forward. A roll of 10+ also Floods the anchor (center) tile into a Water tile. Cost scales 2/6/10 by AoE.',
       isWater: true,
-      base:{name:'Torrent',desc:'d20 dual-aspect: damage × AoE',damage:0},
+      base:{name:'Torrent',desc:'d20 dual-aspect: damage × AoE; 10+ Floods the anchor tile',damage:0},
       thresholds:[],
       tierFormula:()=>0,
       accuracyApplies:true,
@@ -452,7 +452,29 @@ const makeCharacter = (name,hp,level,agi,ap,pos,element,elementCategory) => ({
   playerXp:0,facing:'down',frozen:0,slowed:false,skillUsed:false,rotateUsed:false,classSkillUsed:false,
   usedSkillIds:[],
   element:element||null,elementCategory:elementCategory||null,energyRollover:0,
+  burn:null, // Fire's Burn status — {turns,dmg}; ticks at the start of this unit's own turn, see tickBurn
 });
+// Burn (Fire's terrain/status effect): a flat-damage DoT applied whenever a
+// base Fire hit lands. Ticks at the start of the afflicted unit's own turn
+// (mirrors how `frozen` is consumed there) — deals `dmg`, decrements
+// `turns`, and clears once it hits 0. A fresh Fire hit refreshes the
+// duration back to BURN_TURNS rather than stacking additional simultaneous
+// burns, so repeated Ember Strikes keep someone burning without the DoT
+// damage snowballing turn over turn.
+const BURN_TURNS = 2;
+const BURN_DMG = 10;
+const applyBurn = (target) => ({...target, burn:{turns:BURN_TURNS, dmg:BURN_DMG}});
+// Returns {unit, tickDmg, tickLog} — `unit` has burn ticked down (or
+// cleared) and HP reduced; `tickDmg`/`tickLog` are 0/null when no burn was
+// active.
+const tickBurn = (unit) => {
+  if(!unit.burn) return {unit, tickDmg:0, tickLog:null};
+  const dmg = unit.burn.dmg;
+  const newHealth = Math.max(0, unit.health-dmg);
+  const turnsLeft = unit.burn.turns-1;
+  const burn = turnsLeft>0 ? {...unit.burn, turns:turnsLeft} : null;
+  return {unit:{...unit, health:newHealth, burn}, tickDmg:dmg, tickLog:`${unit.name} burns for ${dmg} dmg${burn?` (${turnsLeft} turn${turnsLeft>1?'s':''} left)`:' (burn fades)'}`};
+};
 // Marks `skillId` as used-this-round on a player object, for the loadout's
 // per-skill once-per-round gate.
 const markSkillUsed = (p, skillId) => ({...p, usedSkillIds:[...(p.usedSkillIds||[]), skillId]});
@@ -861,7 +883,7 @@ const computeElementalStrike = (attacker, target, tiles, obstacles=[]) => {
   const ranged = elData.isEarth||elData.isAir||elData.isWater;
   const castFacing = ranged ? facingToward(attacker.boardPosition,target.boardPosition) : attacker.facing;
   let dmg=0, eCost=getSkillCost(attacker.elementCategory, attacker.element), knockbackPos=null, log='';
-  let obstacleHit=null, newObstacles=[];
+  let obstacleHit=null, newObstacles=[], appliesBurn=false, floodTile=null;
 
   if(elData.isFire){
     const pulses=rolls[0].value, dmgEach=rolls[1].value;
@@ -872,7 +894,8 @@ const computeElementalStrike = (attacker, target, tiles, obstacles=[]) => {
     if(flank.bonus>0) dmg+=flank.bonus;
     const tileBoost=getTileBoost(tiles,attacker.boardPosition,'Fire');
     if(tileBoost>0) dmg+=tileBoost;
-    log=`${attacker.name} Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${tileBoost>0?' [Fire tile +20]':''}`;
+    appliesBurn=pulses>=3;
+    log=`${attacker.name} Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${tileBoost>0?' [Fire tile +20]':''}${appliesBurn?' [Burn]':''}`;
   } else if(elData.isEarth){
     const dieRoll=rolls[0].value;
     const maxRange=Math.max(1,Math.floor(dieRoll/2));
@@ -939,10 +962,14 @@ const computeElementalStrike = (attacker, target, tiles, obstacles=[]) => {
       const acc=rollD100Accuracy();
       const tileBoost=getTileBoost(tiles,attacker.boardPosition,'Water');
       dmg=hit?applyAccuracy(res.damage,acc)+tileBoost:0;
-      log=`${attacker.name} Torrent [d20=${dieRoll}, ${AOE_LABEL[chosen.aoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg':'MISS'}`;
+      // Flood: a strong enough torrent (d20 >= 10) reshapes the ground it
+      // lands on into a Water tile, regardless of whether it actually hit —
+      // only the anchor (center) tile floods, not the whole footprint.
+      if(dieRoll>=10) floodTile=anchor;
+      log=`${attacker.name} Torrent [d20=${dieRoll}, ${AOE_LABEL[chosen.aoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg':'MISS'}${floodTile?' [Flood]':''}`;
     }
   }
-  return { dmg, eCost, castFacing, knockbackPos, log, obstacleHit, newObstacles };
+  return { dmg, eCost, castFacing, knockbackPos, log, obstacleHit, newObstacles, appliesBurn, floodTile };
 };
 
 // Whether `attacker`'s equipped element could plausibly land on `target`
@@ -1085,7 +1112,7 @@ const commandEnemySummons = (thisEnemy, allSummons, otherEnemies, player, curren
 // procs off movement itself, see checkLongshotProtocol.) Pure decision — no
 // state writes, no dice rolled here (that happens where the result is
 // applied, same separation `computeElementalStrike` uses).
-const resolveEnemyClassSkill = (thisEnemy, currentPlayer, currentSummons, tiles, enemyPositions) => {
+const resolveEnemyClassSkill = (thisEnemy, currentPlayer, currentSummons, tiles, enemyPositions, obstacles=[]) => {
   const loadout = thisEnemy.loadout || [];
   const used = thisEnemy.usedSkillIds || [];
   const ap = thisEnemy.actionpts;
@@ -1110,7 +1137,7 @@ const resolveEnemyClassSkill = (thisEnemy, currentPlayer, currentSummons, tiles,
   if(has('circuitSigil',2)){
     const ownCount = currentSummons.filter(s=>s.side==='enemy'&&s.ownerId===thisEnemy.id).length;
     if(ownCount<BANDWIDTH){
-      const legal = getDeployTilesOnRow(ENEMY_SUMMON_ROW, tiles, currentPlayer.boardPosition, enemyPositions, currentSummons);
+      const legal = getDeployTilesOnRow(ENEMY_SUMMON_ROW, tiles, currentPlayer.boardPosition, enemyPositions, [...currentSummons, ...obstacles]);
       if(legal.length>0){
         const tile = legal.reduce((best,t)=>
           Math.abs(t.x-thisEnemy.boardPosition.x)<Math.abs(best.x-thisEnemy.boardPosition.x)?t:best, legal[0]);
@@ -1244,12 +1271,36 @@ const StatLine = ({label,value,accent}) => (
   </div>
 );
 
+// HP text lives below the bar (the "foot"), not inside the shrinking fill —
+// cramming it inside meant it got clipped unreadable once the fill got
+// narrow. At full health it reads as one centered "X / Max". Once damaged,
+// it splits at the fill's edge: the current value hugs the end of the
+// filled color, "/ Max" floats free in the empty remainder — so the fill's
+// own edge doubles as the divisor slash. The fill's right edge is cut on a
+// diagonal (rather than a flat vertical line) to actually look like that
+// slash rather than just imply it.
+const HEALTH_BAR_SLANT = 7;
 const HealthBar = ({current,max}) => {
-  const pct=Math.max(0,(current/max)*100);
+  const pct=Math.max(0,Math.min(100,(current/max)*100));
+  const isFull=current>=max;
+  const fillColor=`hsl(${pct*1.2},80%,45%)`;
   return (
-    <div style={{width:'100%',height:'16px',background:'#1a1a2e',border:'1px solid #2a4a5e',borderRadius:'3px',overflow:'hidden',margin:'6px 0'}}>
-      <div style={{height:'100%',width:`${pct}%`,background:`hsl(${pct*1.2},80%,45%)`,transition:'width 0.3s',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'10px',fontWeight:'bold',color:'#fff',fontFamily:'monospace'}}>
-        {Math.round(current)} / {max}
+    <div style={{width:'100%',margin:'6px 0 4px'}}>
+      <div style={{width:'100%',height:'16px',background:'#1a1a2e',border:'1px solid #2a4a5e',borderRadius:'3px',position:'relative',overflow:'hidden'}}>
+        <div style={{
+          height:'100%',width:`${pct}%`,background:fillColor,transition:'width 0.3s',
+          clipPath: (!isFull && pct>0) ? `polygon(0 0, 100% 0, calc(100% - ${HEALTH_BAR_SLANT}px) 100%, 0 100%)` : 'none',
+        }} />
+      </div>
+      <div style={{position:'relative',height:12,marginTop:2,fontSize:10,fontWeight:'bold',fontFamily:'monospace',whiteSpace:'nowrap'}}>
+        {isFull ? (
+          <div style={{textAlign:'center',color:'#b0dff4'}}>{Math.round(current)} / {max}</div>
+        ) : (
+          <>
+            <span style={{position:'absolute',left:`${pct}%`,transform:'translateX(-100%)',paddingRight:2,color:fillColor}}>{Math.round(current)}</span>
+            <span style={{position:'absolute',left:`${pct}%`,paddingLeft:2,color:'#7a9db5'}}>/ {max}</span>
+          </>
+        )}
       </div>
     </div>
   );
@@ -1726,6 +1777,7 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
             />
             <EnergyBar current={player.actionpts} rolled={playerRolledEnergy} rollover={player.energyRollover} />
             {player.frozen>0&&<StatLine label="Freeze" value={`-${player.frozen} Energy next round`} accent="#a0e4ff" />}
+            {player.burn&&<StatLine label="Burn" value={`-${player.burn.dmg} HP for ${player.burn.turns} more turn${player.burn.turns>1?'s':''}`} accent="#ff6b00" />}
             {summons.some(s=>!s.side||s.side==='player')&&(
               <div style={{marginTop:6,borderTop:'1px solid #1e3a4a',paddingTop:6}}>
                 <div style={{fontSize:'9px',color:'#3a6a8a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:4}}>Active Summons</div>
@@ -1764,6 +1816,7 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
                     </div>
                     <HealthBar current={e.health} max={e.maxHealth} />
                     <StatLine label="Energy" value={rolled===0?'-':`${e.actionpts} / ${rolled}`} accent={e.actionpts>0?'#ff6644':'#555'} />
+                    {e.burn&&<StatLine label="Burn" value={`-${e.burn.dmg} HP × ${e.burn.turns}`} accent="#ff6b00" />}
                   </div>
                 );
               })
@@ -1778,6 +1831,7 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
                 />
                 <EnergyBar current={enemy.actionpts} rolled={enemyRolledEnergy} rollover={enemy.energyRollover} />
                 {enemy.frozen>0&&<StatLine label="Freeze" value={`-${enemy.frozen} Energy next round`} accent="#a0e4ff" />}
+                {enemy.burn&&<StatLine label="Burn" value={`-${enemy.burn.dmg} HP for ${enemy.burn.turns} more turn${enemy.burn.turns>1?'s':''}`} accent="#ff6b00" />}
                 {enemy.element&&<StatLine label="Skill" value={enemy.skillUsed?'used':'ready'} accent={enemy.skillUsed?'#3a6a8a':'#00cc66'} />}
               </>
             )}
@@ -1955,6 +2009,7 @@ const FireDiceSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRollAcc
   const pulses   = rolls.length > 0 ? rolls[0].value : null;
   const dmgEach  = rolls.length > 1 ? rolls[1].value : null;
   const baseDmg  = pulses !== null && dmgEach !== null ? pulses * dmgEach * SKILL_DICE_MULT : null;
+  const willBurn = pulses !== null && pulses >= 3;
 
   return (
     <>
@@ -1995,6 +2050,9 @@ const FireDiceSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRollAcc
                 <span style={{fontSize:18,fontWeight:'bold',color:elColor}}>{baseDmg}</span>
                 <span style={{color:'#3a6a8a'}}>base dmg</span>
               </div>
+              <div style={{fontSize:'11px',marginTop:6,color:willBurn?'#ff6b00':'#3a6a8a'}}>
+                {willBurn ? '🔥 3+ pulses — sets Burning (10 dmg, 2 turns)' : `Needs 3+ pulses to Burn (rolled ${pulses})`}
+              </div>
               <button onClick={onProceedToAccuracy}
                 style={{width:'100%',marginTop:12,padding:11,background:`${elColor}22`,color:elColor,border:`1px solid ${elColor}`,borderRadius:6,fontSize:14,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.08em'}}>
                 Roll Accuracy
@@ -2008,7 +2066,7 @@ const FireDiceSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRollAcc
         <>
           <div style={{textAlign:'center',marginBottom:14}}>
             <div style={{fontSize:13,color:'#7a9db5',marginBottom:4}}>
-              Ember Strike: <span style={{color:elColor}}>{pulses} x {dmgEach*SKILL_DICE_MULT} = {baseDmg}</span> base dmg
+              Ember Strike: <span style={{color:elColor}}>{pulses} x {dmgEach*SKILL_DICE_MULT} = {baseDmg}</span> base dmg{willBurn&&<span style={{color:'#ff6b00'}}> + Burn</span>}
             </div>
             <div style={{fontSize:'11px',color:'#5a7a8a'}}>Roll d100. ≥79 full · 40–78 half · under 40 quarter</div>
           </div>
@@ -2764,14 +2822,14 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           addLog('=== Summons done — enemy turn ===');
           setIsPlayerTurn(false);
           setEnemyRolledEnergy(0);
-          setTimeout(()=>runEnemyTurn({...curE,actionpts:0}, curP, summons, ctx.round), 400);
+          setTimeout(()=>runEnemyTurn({...curE,actionpts:0}, curP, summons, ctx.round, obstacles), 400);
         }
         return curE;
       });
       return curP;
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[addLog,round,summons]);
+  },[addLog,round,summons,obstacles]);
 
   // Resolves a single summon's move/attack against the current (closured)
   // player/enemy/summons state — deliberately NOT nested setState updaters.
@@ -2925,9 +2983,17 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[addLog]);
   // ── ENEMY TURN ──
-  const runEnemyTurn = useCallback((currentEnemy,currentPlayer,currentSummons,currentRound)=>{
+  const runEnemyTurn = useCallback((currentEnemy,currentPlayer,currentSummons,currentRound,currentObstacles)=>{
     const needsRoll = currentEnemy.actionpts === 0;
     if(needsRoll){
+      const {unit:burnedEnemy, tickLog}=tickBurn(currentEnemy);
+      if(tickLog) addLog(tickLog);
+      if(burnedEnemy.health<=0){
+        setEnemy(burnedEnemy);
+        handleEnemyDefeated(currentPlayer, wave);
+        return;
+      }
+      currentEnemy = burnedEnemy;
       const eRoll = rollD12Energy();
       const rollover = currentEnemy.energyRollover || 0;
       const frozenPenalty = currentEnemy.frozen || 0;
@@ -2948,13 +3014,13 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         finishEnemyToPlayer(currentPlayer, rolledEnemy, currentRound);
         return;
       }
-      setTimeout(()=>runEnemyTurn(rolledEnemy, currentPlayer, currentSummons, currentRound), 600);
+      setTimeout(()=>runEnemyTurn(rolledEnemy, currentPlayer, currentSummons, currentRound, currentObstacles), 600);
       return;
     }
 
     addLog(`// Enemy computing... (${currentEnemy.actionpts} Energy)`);
     setTimeout(()=>{
-      let updatedPlayer=currentPlayer, updatedEnemy=currentEnemy, updatedSummons=currentSummons;
+      let updatedPlayer=currentPlayer, updatedEnemy=currentEnemy, updatedSummons=currentSummons, updatedObstacles=currentObstacles;
       const adjacent=isAdjacent(currentEnemy.boardPosition,currentPlayer.boardPosition);
       const eElData=currentEnemy.element?ELEMENTS[currentEnemy.elementCategory]&&ELEMENTS[currentEnemy.elementCategory][currentEnemy.element]:null;
       const eMinCost=eElData?getSkillCost(currentEnemy.elementCategory,currentEnemy.element):1;
@@ -2974,10 +3040,17 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       const willFlee = lowHP && healTile && currentEnemy.fleeCommit;
 
       if(willFlee && !onHealTile){
+        // Reroute only proposes candidates around the *player* — it doesn't
+        // know about rubble, so a blocked primary/reroute pair here doesn't
+        // mean truly no path exists, just that these two guesses missed.
+        // Falling all the way through to "holds position" (like the
+        // approach-move branch below) rather than burning 1 AP per blocked
+        // attempt avoids draining the whole banked pool on a single failed
+        // step.
         const moves=getMoveCandidatesWithReroute(currentEnemy.boardPosition,healTile);
         let moved=false;
         for(const m of moves){
-          const onSummon=[...updatedSummons, ...obstacles].some(s=>s.boardPosition.x===m.x&&s.boardPosition.y===m.y);
+          const onSummon=[...updatedSummons, ...updatedObstacles].some(s=>s.boardPosition.x===m.x&&s.boardPosition.y===m.y);
           if(m.x>=0&&m.x<SIZE&&m.y>=0&&m.y<SIZE&&!(m.x===currentPlayer.boardPosition.x&&m.y===currentPlayer.boardPosition.y)&&!onSummon){
             const nf=facingFromMove(currentEnemy.boardPosition,m);
             let healed=false, newHP=currentEnemy.health;
@@ -2996,10 +3069,17 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
             moved=true; break;
           }
         }
-        if(!moved){ updatedEnemy={...currentEnemy,actionpts:currentEnemy.actionpts-1}; addLog(`${currentEnemy.name} blocked from healing path`); }
+        if(!moved){
+          const saved=currentEnemy.actionpts;
+          addLog(`${currentEnemy.name} can't find a path to heal — holds position, saving ${saved} Energy`);
+          const restedEnemy={...currentEnemy,actionpts:0,energyRollover:(currentEnemy.energyRollover||0)+saved};
+          setEnemy(restedEnemy);
+          finishEnemyToPlayer(updatedPlayer,restedEnemy,currentRound);
+          return;
+        }
         setEnemy(updatedEnemy);
         setTimeout(()=>{
-          if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound);
+          if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound,updatedObstacles);
           else finishEnemyToPlayer(updatedPlayer,updatedEnemy,currentRound);
         },600);
         return;
@@ -3013,14 +3093,14 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         addLog(`${currentEnemy.name} heals on tile → +100 HP (${newHP}/${currentEnemy.maxHealth})`);
         setEnemy(updatedEnemy);
         setTimeout(()=>{
-          if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound);
+          if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound,updatedObstacles);
           else finishEnemyToPlayer(updatedPlayer,updatedEnemy,currentRound);
         },600);
         return;
       }
 
       if(canUseClassSkill){
-        const decision = resolveEnemyClassSkill(currentEnemy, currentPlayer, updatedSummons, tiles, [currentEnemy.boardPosition]);
+        const decision = resolveEnemyClassSkill(currentEnemy, currentPlayer, updatedSummons, tiles, [currentEnemy.boardPosition], updatedObstacles);
         if(decision?.kind==='direct'){
           const dmg=60;
           const newHP=Math.max(0,currentPlayer.health-dmg);
@@ -3032,7 +3112,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           setPlayer(updatedPlayer); setEnemy(updatedEnemy);
           if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
           setTimeout(()=>{
-            if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound);
+            if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound,updatedObstacles);
             else finishEnemyToPlayer(updatedPlayer,updatedEnemy,currentRound);
           },600);
           return;
@@ -3050,7 +3130,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           setPlayer(updatedPlayer); setEnemy(updatedEnemy);
           if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
           setTimeout(()=>{
-            if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound);
+            if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound,updatedObstacles);
             else finishEnemyToPlayer(updatedPlayer,updatedEnemy,currentRound);
           },600);
           return;
@@ -3066,7 +3146,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           setPlayer(updatedPlayer); setEnemy(updatedEnemy);
           if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
           setTimeout(()=>{
-            if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound);
+            if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound,updatedObstacles);
             else finishEnemyToPlayer(updatedPlayer,updatedEnemy,currentRound);
           },600);
           return;
@@ -3082,7 +3162,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           setPlayer(updatedPlayer); setEnemy(updatedEnemy);
           if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
           setTimeout(()=>{
-            if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound);
+            if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound,updatedObstacles);
             else finishEnemyToPlayer(updatedPlayer,updatedEnemy,currentRound);
           },600);
           return;
@@ -3094,7 +3174,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       if(canUseSkill){
         const elData=eElData;
         const rolls=elData.dice.map(d=>({type:d,value:rollDie(parseInt(d.slice(1)))}));
-        let dmg=0, heal=0;
+        let dmg=0, heal=0, appliesBurn=false;
         let eCost = getSkillCost(currentEnemy.elementCategory, currentEnemy.element);
         const ranged = elData.isEarth||elData.isAir||elData.isWater;
         const castFacing = ranged ? facingToward(currentEnemy.boardPosition,currentPlayer.boardPosition) : currentEnemy.facing;
@@ -3108,14 +3188,15 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           if(flank.bonus>0) dmg+=flank.bonus;
           const tileBoost=getTileBoost(tiles,currentEnemy.boardPosition,'Fire');
           if(tileBoost>0) dmg+=tileBoost;
-          addLog(`${currentEnemy.name} Ember Strike [${pulses} pulses x ${dmgEach*SKILL_DICE_MULT} = ${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${tileBoost>0?' [Fire tile +20]':''}`);
+          appliesBurn=pulses>=3;
+          addLog(`${currentEnemy.name} Ember Strike [${pulses} pulses x ${dmgEach*SKILL_DICE_MULT} = ${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${tileBoost>0?' [Fire tile +20]':''}${appliesBurn?' [Burn]':''}`);
         } else if(elData.isEarth){
           const dieRoll=rolls[0].value;
           const maxRange=Math.max(1,Math.floor(dieRoll/2));
           const avail=Math.max(1,Math.min(maxRange, currentEnemy.actionpts-1));
           const chosenRange=avail;
           const {hitObstacle,hitTarget,newObstacleTiles}=resolveEarthTremor(
-            {boardPosition:currentEnemy.boardPosition,facing:castFacing}, chosenRange, [currentPlayer], obstacles, [currentPlayer.boardPosition]
+            {boardPosition:currentEnemy.boardPosition,facing:castFacing}, chosenRange, [currentPlayer], updatedObstacles, [currentPlayer.boardPosition]
           );
           const base=dieRoll*SKILL_DICE_MULT;
           const acc=rollD100Accuracy();
@@ -3123,14 +3204,12 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           const rawDmg=Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost;
           dmg = hitTarget ? rawDmg : 0;
           eCost=1+chosenRange;
-          if(newObstacleTiles.length>0) setObstacles(prev=>[...prev, ...newObstacleTiles.map(t=>makeObstacle(t))]);
+          if(newObstacleTiles.length>0){ updatedObstacles=[...updatedObstacles, ...newObstacleTiles.map(t=>makeObstacle(t))]; setObstacles(updatedObstacles); }
           if(hitObstacle){
-            setObstacles(prev=>{
-              const hitOne=prev.find(o=>o.id===hitObstacle.id);
-              const newHP=hitOne?Math.max(0,hitOne.health-rawDmg):0;
-              addLog(newHP<=0?'Rubble destroyed!':`Rubble takes ${rawDmg} dmg (${newHP}/${hitOne.maxHealth}).`);
-              return newHP<=0 ? prev.filter(o=>o.id!==hitObstacle.id) : prev.map(o=>o.id===hitObstacle.id?{...o,health:newHP}:o);
-            });
+            const newHP=Math.max(0,hitObstacle.health-rawDmg);
+            addLog(newHP<=0?'Rubble destroyed!':`Rubble takes ${rawDmg} dmg (${newHP}/${hitObstacle.maxHealth}).`);
+            updatedObstacles = newHP<=0 ? updatedObstacles.filter(o=>o.id!==hitObstacle.id) : updatedObstacles.map(o=>o.id===hitObstacle.id?{...o,health:newHP}:o);
+            setObstacles(updatedObstacles);
           }
           const outcome = hitTarget ? `${dmg} dmg${tileBoost>0?' [Earth tile +20]':''}` : hitObstacle ? 'struck rubble instead' : 'MISS';
           addLog(`${currentEnemy.name} Tremor [d6=${dieRoll}, ${chosenRange} tile${chosenRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${outcome}${newObstacleTiles.length>0?` (+${newObstacleTiles.length} rubble)`:''}`);
@@ -3143,7 +3222,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           // (hit if the player's within that many tiles), and damage comes
           // purely from airGaleForceDamage(roll) regardless of distance. A
           // closer obstacle takes the gust instead of the player.
-          const lineObstacle=findLineObstacle(currentEnemy.boardPosition,castFacing,dieRoll,obstacles);
+          const lineObstacle=findLineObstacle(currentEnemy.boardPosition,castFacing,dieRoll,updatedObstacles);
           const blocked=lineObstacle && (playerDist<0||lineObstacle.dist<=playerDist);
           const hit = !blocked && playerDist>0 && playerDist<=dieRoll;
           const base=airGaleForceDamage(dieRoll);
@@ -3156,16 +3235,14 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
             // Whatever roll wasn't spent reaching the player becomes
             // knockback distance, minimum 1 tile, until it hits a wall.
             const knockDist=Math.max(1,dieRoll-playerDist);
-            const kbPos=getKnockbackTile(currentPlayer.boardPosition,castFacing,knockDist,[currentEnemy.boardPosition,...obstacles.map(o=>o.boardPosition)]);
+            const kbPos=getKnockbackTile(currentPlayer.boardPosition,castFacing,knockDist,[currentEnemy.boardPosition,...updatedObstacles.map(o=>o.boardPosition)]);
             updatedPlayer={...currentPlayer,boardPosition:kbPos};
             addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} + knockback ${knockDist} tile${knockDist>1?'s':''}`);
           } else if(blocked){
-            setObstacles(prev=>{
-              const hitOne=prev.find(o=>o.id===lineObstacle.obstacle.id);
-              const newHP=hitOne?Math.max(0,hitOne.health-rawDmg):0;
-              addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> struck rubble instead — ${newHP<=0?'destroyed!':`${rawDmg} dmg (${newHP}/${hitOne.maxHealth})`}`);
-              return newHP<=0 ? prev.filter(o=>o.id!==lineObstacle.obstacle.id) : prev.map(o=>o.id===lineObstacle.obstacle.id?{...o,health:newHP}:o);
-            });
+            const newHP=Math.max(0,lineObstacle.obstacle.health-rawDmg);
+            addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> struck rubble instead — ${newHP<=0?'destroyed!':`${rawDmg} dmg (${newHP}/${lineObstacle.obstacle.maxHealth})`}`);
+            updatedObstacles = newHP<=0 ? updatedObstacles.filter(o=>o.id!==lineObstacle.obstacle.id) : updatedObstacles.map(o=>o.id===lineObstacle.obstacle.id?{...o,health:newHP}:o);
+            setObstacles(updatedObstacles);
           } else {
             addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}] -> MISS`);
           }
@@ -3190,13 +3267,16 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
             const acc=rollD100Accuracy();
             const tileBoost=getTileBoost(tiles,currentEnemy.boardPosition,'Water');
             dmg=hit?applyAccuracy(res.damage,acc)+tileBoost:0;
-            addLog(`${currentEnemy.name} Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[chosen.aoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS'}`);
+            const flooded=dieRoll>=10;
+            if(flooded) setTiles(prev=>{ if(prev[anchor.y][anchor.x]===TILE_TYPES.WATER_BOOST) return prev; const g=prev.map(r=>r.slice()); g[anchor.y][anchor.x]=TILE_TYPES.WATER_BOOST; return g; });
+            addLog(`${currentEnemy.name} Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[chosen.aoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS'}${flooded?' [Flood]':''}`);
           }
         }
 
         if(dmg>0){
           const newHP=Math.max(0,currentPlayer.health-dmg);
           updatedPlayer={...updatedPlayer,health:newHP};
+          if(appliesBurn) updatedPlayer=applyBurn(updatedPlayer);
           updatedEnemy={...currentEnemy,actionpts:Math.max(0,currentEnemy.actionpts-eCost),skillUsed:true,facing:castFacing};
           setPlayer(updatedPlayer); setEnemy(updatedEnemy);
           triggerCastFx(currentPlayer.boardPosition, ELEMENTS.base[currentEnemy.element]?.color||'#ff4422');
@@ -3247,7 +3327,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         setEnemy(updatedEnemy);
       } else {
         const tier=enemyTier(currentEnemy.level);
-        const summonBlockers=[...updatedSummons, ...obstacles].map(s=>s.boardPosition);
+        const summonBlockers=[...updatedSummons, ...updatedObstacles].map(s=>s.boardPosition);
         const target=pickApproachTile(currentEnemy.boardPosition,currentPlayer.boardPosition,currentPlayer.facing,tier,[currentPlayer.boardPosition,...summonBlockers]);
         const goal = target || currentPlayer.boardPosition;
         const curDist = manhattan(currentEnemy.boardPosition, goal);
@@ -3288,12 +3368,12 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         setEnemy(updatedEnemy);
       }
       setTimeout(()=>{
-        if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound);
+        if(updatedEnemy.actionpts>0) runEnemyTurn(updatedEnemy,updatedPlayer,updatedSummons,currentRound,updatedObstacles);
         else finishEnemyToPlayer(updatedPlayer,updatedEnemy,currentRound);
       },600);
     },900);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[addLog,tiles,obstacles,wave,triggerCastFx]);
+  },[addLog,tiles,wave,triggerCastFx]);
   // ── ROUND ORCHESTRATION ──
   const beginRound = useCallback((rP, rE, currentRound)=>{
     setIsPlayerTurn(true);
@@ -3325,14 +3405,16 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
 
   // ── ENERGY ROLL ──
   const handleRollEnergy = useCallback(()=>{
+    const {unit:burnedPlayer, tickLog}=tickBurn(player);
+    if(tickLog) addLog(tickLog);
     const roll = rollD12Energy();
-    const rollover = player.energyRollover || 0;
-    const frozenPenalty = player.frozen || 0;
+    const rollover = burnedPlayer.energyRollover || 0;
+    const frozenPenalty = burnedPlayer.frozen || 0;
     const total = roll + rollover;
     const newAP = Math.max(0, total - frozenPenalty);
     setPlayerRolledEnergy(total);
     addLog(`You roll d12=${roll}${rollover>0?` +${rollover} rollover`:''} = ${total} Energy${frozenPenalty>0?` (freeze -${frozenPenalty})`:''}  ->  ${newAP} AP`);
-    const rolledPlayer = { ...player, actionpts:newAP, frozen:0, energyRollover:0 };
+    const rolledPlayer = { ...burnedPlayer, actionpts:newAP, frozen:0, energyRollover:0 };
     setPlayer(rolledPlayer);
     const proceed = ()=>{
       if(summons.some(s=>!s.promoted)){
@@ -3420,9 +3502,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     addLog('=== Enemy Turn ===');
     setIsPlayerTurn(false);
     setEnemyRolledEnergy(0);
-    setTimeout(()=>runEnemyTurn({...updatedEnemy,actionpts:0}, updatedPlayer, summons, round), 400);
+    setTimeout(()=>runEnemyTurn({...updatedEnemy,actionpts:0}, updatedPlayer, summons, round, obstacles), 400);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[round,summons,addLog,runEnemyTurn]);
+  },[round,summons,obstacles,addLog,runEnemyTurn]);
 
   // ── MELEE ──
   const handleMeleeOpen = useCallback(()=>{
@@ -3462,9 +3544,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setIsPlayerTurn(false);
     setEnemyRolledEnergy(0);
     addLog('=== Enemy Turn ===');
-    setTimeout(()=>runEnemyTurn({...enemy,actionpts:0}, updatedPlayer, summons, round), 400);
+    setTimeout(()=>runEnemyTurn({...enemy,actionpts:0}, updatedPlayer, summons, round, obstacles), 400);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[player,enemy,summons,round,addLog,runEnemyTurn]);
+  },[player,enemy,summons,obstacles,round,addLog,runEnemyTurn]);
 
   const handleSurrender = useCallback(()=>{
     // Quitting leaves the mode entirely — hand off to the parent (returns to
@@ -3581,8 +3663,10 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Fire');
     if(tileBoost>0) dmg+=tileBoost;
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-3),skillUsed:true};
-    const updatedEnemy={...enemy,health:Math.max(0,enemy.health-dmg)};
-    addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tileBoost>0?' [Fire tile +20]':''}`);
+    const appliesBurn=pulses>=3;
+    let updatedEnemy={...enemy,health:Math.max(0,enemy.health-dmg)};
+    if(appliesBurn) updatedEnemy=applyBurn(updatedEnemy);
+    addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tileBoost>0?' [Fire tile +20]':''}${appliesBurn?' [Burn]':''}`);
     triggerCastFx(enemy.boardPosition, ELEMENTS.base.Fire.color);
     resetDiceModal();
     if(updatedEnemy.health<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
@@ -3676,7 +3760,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const cost=TORRENT_AOE_COST[waterAoe];
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
     const updatedEnemy={...enemy,health:Math.max(0,enemy.health-dmg)};
-    addLog(`Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[waterAoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS (enemy outside blast)'}`);
+    const flooded=dieRoll>=10;
+    if(flooded) setTiles(prev=>{ if(prev[anchor.y][anchor.x]===TILE_TYPES.WATER_BOOST) return prev; const g=prev.map(r=>r.slice()); g[anchor.y][anchor.x]=TILE_TYPES.WATER_BOOST; return g; });
+    addLog(`Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[waterAoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS (enemy outside blast)'}${flooded?' [Flood]':''}`);
     if(hit) triggerCastFx(enemy.boardPosition, ELEMENTS.base.Water.color);
     resetDiceModal();
     if(updatedEnemy.health<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
@@ -3988,9 +4074,18 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // resulting pool one decision at a time (own-summons, class skill,
   // elemental skill, melee, approach-move, hold), recursing via setTimeout
   // exactly the way the single-enemy engine's runEnemyTurn already does.
-  const runSingleEnemyAITurn = useCallback((thisEnemy, allEnemies, currentPlayer, currentSummons, currentRound, onDone)=>{
+  const runSingleEnemyAITurn = useCallback((thisEnemy, allEnemies, currentPlayer, currentSummons, currentRound, onDone, currentObstacles)=>{
     const needsRoll = thisEnemy.actionpts===0;
     if(needsRoll){
+      const {unit:burnedEnemy, tickLog}=tickBurn(thisEnemy);
+      if(tickLog) addLog(tickLog);
+      if(burnedEnemy.health<=0){
+        const deadEnemies=allEnemies.map(e=>e.id===thisEnemy.id?burnedEnemy:e);
+        setEnemies(deadEnemies);
+        handleEnemyDefeatedMulti(thisEnemy.id, currentPlayer, deadEnemies);
+        return;
+      }
+      thisEnemy = burnedEnemy;
       const eRoll=rollD12Energy();
       const rollover=thisEnemy.energyRollover||0;
       const frozenPenalty=thisEnemy.frozen||0;
@@ -4007,16 +4102,16 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       setEnemies(rolledEnemies);
       if(newAP<=0){
         addLog(`// ${thisEnemy.name} has 0 Energy — passing`);
-        onDone(currentPlayer,rolledEnemies,currentSummons);
+        onDone(currentPlayer,rolledEnemies,currentSummons,currentObstacles);
         return;
       }
-      setTimeout(()=>runSingleEnemyAITurn(rolledEnemy,rolledEnemies,currentPlayer,currentSummons,currentRound,onDone),500);
+      setTimeout(()=>runSingleEnemyAITurn(rolledEnemy,rolledEnemies,currentPlayer,currentSummons,currentRound,onDone,currentObstacles),500);
       return;
     }
 
     setTimeout(()=>{
       const others = allEnemies.filter(e=>e.id!==thisEnemy.id && e.health>0);
-      let updatedPlayer=currentPlayer, updatedEnemy=thisEnemy, updatedSummons=currentSummons;
+      let updatedPlayer=currentPlayer, updatedEnemy=thisEnemy, updatedSummons=currentSummons, updatedObstacles=currentObstacles;
 
       // Own-summon command (only meaningful for a Circuit-Sigil-carrying
       // enemy, i.e. the boss) — batched once at the top of this enemy's
@@ -4049,16 +4144,22 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       const healTile = findHealingTile(tiles);
       const onHealTile = healTile && updatedEnemy.boardPosition.x===healTile.x && updatedEnemy.boardPosition.y===healTile.y;
       const willFlee = lowHP && healTile && updatedEnemy.fleeCommit;
-      const moveBlockers = [...others.map(e=>e.boardPosition), ...updatedSummons.map(s=>s.boardPosition), ...obstacles.map(o=>o.boardPosition)];
+      const moveBlockers = [...others.map(e=>e.boardPosition), ...updatedSummons.map(s=>s.boardPosition), ...updatedObstacles.map(o=>o.boardPosition)];
 
       const finishStep = ()=>{
         setTimeout(()=>{
-          if(updatedEnemy.actionpts>0) runSingleEnemyAITurn(updatedEnemy,allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e),updatedPlayer,updatedSummons,currentRound,onDone);
-          else onDone(updatedPlayer,allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e),updatedSummons);
+          if(updatedEnemy.actionpts>0) runSingleEnemyAITurn(updatedEnemy,allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e),updatedPlayer,updatedSummons,currentRound,onDone,updatedObstacles);
+          else onDone(updatedPlayer,allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e),updatedSummons,updatedObstacles);
         },600);
       };
 
       if(willFlee && !onHealTile){
+        // Reroute only proposes candidates around the *player* — a blocked
+        // primary/reroute pair doesn't mean no path exists, just that these
+        // two guesses missed. Falls through to holding position (banking the
+        // rest as rollover) instead of burning 1 AP per blocked attempt,
+        // which used to drain a fleeing enemy's whole banked pool on one
+        // stuck step.
         const moves=getMoveCandidatesWithReroute(updatedEnemy.boardPosition,healTile);
         let moved=false;
         for(const m of moves){
@@ -4078,7 +4179,14 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
             moved=true; break;
           }
         }
-        if(!moved){ updatedEnemy={...updatedEnemy,actionpts:updatedEnemy.actionpts-1}; addLog(`${updatedEnemy.name} blocked from healing path`); }
+        if(!moved){
+          const saved=updatedEnemy.actionpts;
+          addLog(`${updatedEnemy.name} can't find a path to heal — holds position, saving ${saved} Energy`);
+          updatedEnemy={...updatedEnemy,actionpts:0,energyRollover:(updatedEnemy.energyRollover||0)+saved};
+          setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
+          onDone(updatedPlayer,allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e),updatedSummons,updatedObstacles);
+          return;
+        }
         setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
         finishStep();
         return;
@@ -4095,7 +4203,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       }
 
       if(canUseClass){
-        const decision = resolveEnemyClassSkill(updatedEnemy, updatedPlayer, updatedSummons, tiles, [updatedEnemy.boardPosition, ...others.map(e=>e.boardPosition)]);
+        const decision = resolveEnemyClassSkill(updatedEnemy, updatedPlayer, updatedSummons, tiles, [updatedEnemy.boardPosition, ...others.map(e=>e.boardPosition)], updatedObstacles);
         if(decision?.kind==='direct'){
           const dmg=60;
           const newHP=Math.max(0,updatedPlayer.health-dmg);
@@ -4165,24 +4273,28 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       }
 
       if(canUseElement){
-        const strike = computeElementalStrike(updatedEnemy, updatedPlayer, tiles, obstacles);
+        const strike = computeElementalStrike(updatedEnemy, updatedPlayer, tiles, updatedObstacles);
         if(strike){
           addLog(strike.log);
           updatedEnemy={...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-strike.eCost),skillUsed:true,facing:strike.castFacing};
-          if(strike.newObstacles?.length>0) setObstacles(prev=>[...prev, ...strike.newObstacles]);
+          if(strike.newObstacles?.length>0){ updatedObstacles=[...updatedObstacles, ...strike.newObstacles]; setObstacles(updatedObstacles); }
           if(strike.obstacleHit){
             const {id,dmg:obsDmg}=strike.obstacleHit;
-            setObstacles(prev=>{
-              const hitOne=prev.find(o=>o.id===id);
-              const newHP=hitOne?Math.max(0,hitOne.health-obsDmg):0;
-              addLog(newHP<=0?`Rubble destroyed!`:`Rubble takes ${obsDmg} dmg (${newHP}/${hitOne.maxHealth}).`);
-              return newHP<=0 ? prev.filter(o=>o.id!==id) : prev.map(o=>o.id===id?{...o,health:newHP}:o);
-            });
+            const hitOne=updatedObstacles.find(o=>o.id===id);
+            const newHP=hitOne?Math.max(0,hitOne.health-obsDmg):0;
+            addLog(newHP<=0?`Rubble destroyed!`:`Rubble takes ${obsDmg} dmg (${newHP}/${hitOne.maxHealth}).`);
+            updatedObstacles = newHP<=0 ? updatedObstacles.filter(o=>o.id!==id) : updatedObstacles.map(o=>o.id===id?{...o,health:newHP}:o);
+            setObstacles(updatedObstacles);
+          }
+          if(strike.floodTile){
+            const ft=strike.floodTile;
+            setTiles(prev=>{ if(prev[ft.y][ft.x]===TILE_TYPES.WATER_BOOST) return prev; const g=prev.map(r=>r.slice()); g[ft.y][ft.x]=TILE_TYPES.WATER_BOOST; return g; });
           }
           if(strike.dmg>0){
             const newHP=Math.max(0,updatedPlayer.health-strike.dmg);
             triggerCastFx(updatedPlayer.boardPosition, ELEMENTS.base[updatedEnemy.element]?.color||'#ff4422');
             updatedPlayer={...updatedPlayer,health:newHP,boardPosition:strike.knockbackPos||updatedPlayer.boardPosition};
+            if(strike.appliesBurn) updatedPlayer=applyBurn(updatedPlayer);
             setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
             if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
           } else {
@@ -4262,7 +4374,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         addLog(`${updatedEnemy.name} holds position — saving ${saved} Energy`);
         updatedEnemy={...updatedEnemy,actionpts:0,energyRollover:(updatedEnemy.energyRollover||0)+saved};
         setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
-        onDone(updatedPlayer,allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e),updatedSummons);
+        onDone(updatedPlayer,allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e),updatedSummons,updatedObstacles);
         return;
       }
       // Longshot Protocol — a repositioning move, so it checks right here.
@@ -4281,7 +4393,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       finishStep();
     },700);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[addLog,tiles,obstacles,triggerCastFx]);
+  },[addLog,tiles,triggerCastFx]);
 
   // Sequences the roster: each living enemy takes its full independent turn
   // (own roll, own AP pool) before control returns to the player. Mirrors
@@ -4290,7 +4402,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // move, per the Codex's chess framing. Only re-sorted at the start of a
   // fresh sequence (idx===0); the resulting order is then threaded through
   // the recursive chain like everything else here.
-  const runEnemiesSequence = useCallback((idx, currentEnemies, currentPlayer, currentSummons, currentRound)=>{
+  const runEnemiesSequence = useCallback((idx, currentEnemies, currentPlayer, currentSummons, currentRound, currentObstacles)=>{
     if(currentPlayer.health<=0) return; // mirrors the single-enemy engine's own lack of a game-over flow
     const ordered = idx===0 ? [...currentEnemies].sort((a,b)=>b.rank-a.rank) : currentEnemies;
     if(idx>=ordered.length){
@@ -4299,13 +4411,13 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     }
     const thisEnemy=ordered[idx];
     if(!thisEnemy||thisEnemy.health<=0){
-      runEnemiesSequence(idx+1,ordered,currentPlayer,currentSummons,currentRound);
+      runEnemiesSequence(idx+1,ordered,currentPlayer,currentSummons,currentRound,currentObstacles);
       return;
     }
-    runSingleEnemyAITurn(thisEnemy,ordered,currentPlayer,currentSummons,currentRound,(updatedPlayer,updatedEnemies,updatedSummons)=>{
+    runSingleEnemyAITurn(thisEnemy,ordered,currentPlayer,currentSummons,currentRound,(updatedPlayer,updatedEnemies,updatedSummons,updatedObstacles)=>{
       if(updatedPlayer.health<=0) return;
-      runEnemiesSequence(idx+1,updatedEnemies,updatedPlayer,updatedSummons,currentRound);
-    });
+      runEnemiesSequence(idx+1,updatedEnemies,updatedPlayer,updatedSummons,currentRound,updatedObstacles);
+    },currentObstacles);
   },[finishEnemiesToPlayerMulti,runSingleEnemyAITurn]);
 
   // Same pawns-clear-the-way sequencing as the single-enemy engine: summons
@@ -4327,14 +4439,14 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           addLog('=== Summons done — enemies act ===');
           setIsPlayerTurn(false);
           setEnemyRolledEnergyById({});
-          setTimeout(()=>runEnemiesSequence(0, curE.map(e=>({...e,actionpts:0})), curP, summons, ctx.round), 400);
+          setTimeout(()=>runEnemiesSequence(0, curE.map(e=>({...e,actionpts:0})), curP, summons, ctx.round, obstacles), 400);
         }
         return curE;
       });
       return curP;
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[addLog,round,summons]);
+  },[addLog,round,summons,obstacles]);
 
   const routeAfterPlayerActionMulti = useCallback((updatedPlayer, updatedEnemies)=>{
     if(updatedPlayer.actionpts>0){
@@ -4345,8 +4457,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     addLog("=== Enemies' Turn ===");
     setIsPlayerTurn(false);
     setEnemyRolledEnergyById({});
-    setTimeout(()=>runEnemiesSequence(0, updatedEnemies.map(e=>({...e,actionpts:0})), updatedPlayer, summons, round), 400);
-  },[round,summons,addLog,runEnemiesSequence]);
+    setTimeout(()=>runEnemiesSequence(0, updatedEnemies.map(e=>({...e,actionpts:0})), updatedPlayer, summons, round, obstacles), 400);
+  },[round,summons,obstacles,addLog,runEnemiesSequence]);
 
   const handleEnemyDefeatedMulti = useCallback((defeatedId, curPlayer, curEnemies)=>{
     const dead = curEnemies.find(e=>e.id===defeatedId);
@@ -4420,14 +4532,16 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   },[addLog]);
 
   const handleRollEnergyMulti = useCallback(()=>{
+    const {unit:burnedPlayer, tickLog}=tickBurn(player);
+    if(tickLog) addLog(tickLog);
     const roll=rollD12Energy();
-    const rollover=player.energyRollover||0;
-    const frozenPenalty=player.frozen||0;
+    const rollover=burnedPlayer.energyRollover||0;
+    const frozenPenalty=burnedPlayer.frozen||0;
     const total=roll+rollover;
     const newAP=Math.max(0,total-frozenPenalty);
     setPlayerRolledEnergy(total);
     addLog(`You roll d12=${roll}${rollover>0?` +${rollover} rollover`:''} = ${total} Energy${frozenPenalty>0?` (freeze -${frozenPenalty})`:''}  ->  ${newAP} AP`);
-    const rolledPlayer={...player,actionpts:newAP,frozen:0,energyRollover:0};
+    const rolledPlayer={...burnedPlayer,actionpts:newAP,frozen:0,energyRollover:0};
     setPlayer(rolledPlayer);
     const proceed = ()=>{
       if(summons.some(s=>s.side==='player'&&!s.promoted)){
@@ -4460,9 +4574,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setIsPlayerTurn(false);
     setEnemyRolledEnergyById({});
     addLog("=== Enemies' Turn ===");
-    setTimeout(()=>runEnemiesSequence(0, enemies.map(e=>({...e,actionpts:0})), updatedPlayer, summons, round), 400);
+    setTimeout(()=>runEnemiesSequence(0, enemies.map(e=>({...e,actionpts:0})), updatedPlayer, summons, round, obstacles), 400);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[player,enemies,summons,round,addLog,runEnemiesSequence]);
+  },[player,enemies,summons,obstacles,round,addLog,runEnemiesSequence]);
 
   const handleSurrenderMulti = useCallback(()=>{
     addLog('=== You retreat from the Campaign. ===');
@@ -4586,9 +4700,10 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Fire');
     if(tileBoost>0) dmg+=tileBoost;
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-3),skillUsed:true};
-    if(target) addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tileBoost>0?' [Fire tile +20]':''}`);
+    const appliesBurn=pulses>=3;
+    if(target) addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tileBoost>0?' [Fire tile +20]':''}${appliesBurn?' [Burn]':''}`);
     resetDiceModal();
-    applySkillResultMulti(target, dmg, updatedPlayer, {}, ELEMENTS.base.Fire.color);
+    applySkillResultMulti(target, dmg, updatedPlayer, appliesBurn?{burn:{turns:BURN_TURNS,dmg:BURN_DMG}}:{}, ELEMENTS.base.Fire.color);
   },[diceRolls,lockedRoll,player,tiles,addLog,resetDiceModal,resolveTargetForSkill,applySkillResultMulti]);
 
   const handleEarthApplyWithAccuracyMulti = useCallback((acc)=>{
@@ -4662,7 +4777,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const dmg=target?applyAccuracy(res.damage,acc)+tileBoost:0;
     const cost=TORRENT_AOE_COST[waterAoe];
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
-    addLog(`Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[waterAoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${target?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS (no enemy in blast)'}`);
+    const flooded=dieRoll>=10;
+    if(flooded) setTiles(prev=>{ if(prev[anchor.y][anchor.x]===TILE_TYPES.WATER_BOOST) return prev; const g=prev.map(r=>r.slice()); g[anchor.y][anchor.x]=TILE_TYPES.WATER_BOOST; return g; });
+    addLog(`Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[waterAoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${target?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS (no enemy in blast)'}${flooded?' [Flood]':''}`);
     resetDiceModal();
     applySkillResultMulti(target, dmg, updatedPlayer, {}, ELEMENTS.base.Water.color);
   },[diceRolls,lockedRoll,player,tiles,waterAoe,enemies,addLog,resetDiceModal,applySkillResultMulti]);
