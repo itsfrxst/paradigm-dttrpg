@@ -4219,7 +4219,13 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         }
         if(decision?.kind==='deploy'){
           const roll=rollD100(); const tier=summonTierFromRoll(roll);
-          const s=makeSummon(tier,decision.tile,'enemy',updatedEnemy.id);
+          // actedRound:currentRound marks it as already having acted this
+          // round (its deployment) -- without this, finishStep()'s recursive
+          // re-entry into this same AP-spend pass would let
+          // commandEnemySummons see it as un-acted and immediately march or
+          // strike with it later in this very turn, a free extra action a
+          // freshly-deployed summon shouldn't get.
+          const s={...makeSummon(tier,decision.tile,'enemy',updatedEnemy.id),actedRound:currentRound};
           updatedSummons=[...updatedSummons,s];
           setSummons(updatedSummons);
           addLog(`◈ ${updatedEnemy.name} deploys ${s.name} at (${decision.tile.x},${decision.tile.y})`);
@@ -4651,10 +4657,16 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // All five share one shape: resolve `target` from selectedEnemyId (falling
   // back to the sole enemy in range), compute damage with the exact same
   // math as the single-enemy handlers, then route through the Multi helpers.
+  // An enemy-deployed summon in range is exactly as legal a target as any
+  // roster enemy -- parking behind one shouldn't make it immune -- so a
+  // resolved `target` may be either; `target.side==='enemy'` (only summons
+  // carry a `side` field) tells applySkillResultMulti which kind it got.
   const resolveTargetForSkill = useCallback((rangeCheckFn)=>{
     const inRange = enemies.filter(e=>rangeCheckFn(e));
-    return inRange.find(e=>e.id===selectedEnemyId) || inRange[0] || null;
-  },[enemies,selectedEnemyId]);
+    const picked = inRange.find(e=>e.id===selectedEnemyId) || inRange[0];
+    if(picked) return picked;
+    return summons.find(s=>s.side==='enemy' && rangeCheckFn(s)) || null;
+  },[enemies,summons,selectedEnemyId]);
 
   const applySkillResultMulti = useCallback((target, dmg, updatedPlayer, extra={}, color)=>{
     if(!target || dmg<=0){
@@ -4662,6 +4674,17 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       return;
     }
     if(color) triggerCastFx(target.boardPosition, color);
+    if(target.side==='enemy'){ // an enemy-deployed summon, not a roster enemy
+      const newHP=Math.max(0,target.health-dmg);
+      if(newHP<=0){
+        setSummons(prev=>prev.filter(s=>s.id!==target.id));
+        addLog(`${target.name} destroyed!`);
+      } else {
+        setSummons(prev=>prev.map(s=>s.id===target.id?{...s,health:newHP,...extra}:s));
+      }
+      routeAfterPlayerActionMulti(updatedPlayer, enemies);
+      return;
+    }
     const newHP=Math.max(0,target.health-dmg);
     if(newHP<=0){
       const remaining=enemies.map(e=>e.id===target.id?{...e,health:0,...extra}:e);
@@ -4670,7 +4693,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       return;
     }
     routeAfterPlayerActionMulti(updatedPlayer, enemies.map(e=>e.id===target.id?{...e,health:newHP,...extra}:e));
-  },[enemies,handleEnemyDefeatedMulti,routeAfterPlayerActionMulti,triggerCastFx]);
+  },[enemies,addLog,handleEnemyDefeatedMulti,routeAfterPlayerActionMulti,triggerCastFx]);
 
   const handleModalAbilityMulti = useCallback((ability,accuracy)=>{
     if(dicePhase==='roll'){ setPendingAbility(ability); setDicePhase('accuracy'); setAccuracyRoll(null); return; }
@@ -4710,7 +4733,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const origin=lockedRoll.origin;
     const dieRoll=diceRolls[0].value;
     const base=dieRoll*SKILL_DICE_MULT;
-    const {hitObstacle,hitTarget,newObstacleTiles}=resolveEarthTremor(origin, earthRange, enemies, obstacles, enemies.map(e=>e.boardPosition));
+    const strikeables=[...enemies, ...summons.filter(s=>s.side==='enemy')];
+    const {hitObstacle,hitTarget,newObstacleTiles}=resolveEarthTremor(origin, earthRange, strikeables, obstacles, strikeables.map(e=>e.boardPosition));
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Earth');
     const rawDmg=Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost;
     const dmg=hitTarget?rawDmg:0;
@@ -4729,18 +4753,19 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     }
     resetDiceModal();
     applySkillResultMulti(hitTarget, dmg, updatedPlayer, {}, ELEMENTS.base.Earth.color);
-  },[diceRolls,lockedRoll,player,tiles,obstacles,earthRange,enemies,addLog,resetDiceModal,applySkillResultMulti]);
+  },[diceRolls,lockedRoll,player,tiles,obstacles,earthRange,enemies,summons,addLog,resetDiceModal,applySkillResultMulti]);
 
   const handleAirApplyWithAccuracyMulti = useCallback((acc)=>{
     const origin=lockedRoll.origin;
     const dieRoll=diceRolls[0].value;
+    const strikeables=[...enemies, ...summons.filter(s=>s.side==='enemy')];
     const line=getForwardTiles(origin.boardPosition,origin.facing,SIZE);
-    const step=line.findIndex(t=>enemies.some(e=>e.boardPosition.x===t.x&&e.boardPosition.y===t.y));
+    const step=line.findIndex(t=>strikeables.some(u=>u.boardPosition.x===t.x&&u.boardPosition.y===t.y));
     const dist=step>=0?step+1:-1;
     const lineObstacle=findLineObstacle(origin.boardPosition,origin.facing,dieRoll,obstacles);
     const blocked=lineObstacle && (dist<0||lineObstacle.dist<=dist);
     const hit=!blocked&&dist>0&&dist<=dieRoll;
-    const target = hit ? enemies.find(e=>e.boardPosition.x===line[step].x&&e.boardPosition.y===line[step].y) : null;
+    const target = hit ? strikeables.find(u=>u.boardPosition.x===line[step].x&&u.boardPosition.y===line[step].y) : null;
     const base=airGaleForceDamage(dieRoll);
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Air');
     const rawDmg=Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost;
@@ -4749,7 +4774,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     let extra={};
     if(target){
       const knockDist=Math.max(1,dieRoll-dist);
-      const blockers=[origin.boardPosition,...enemies.filter(e=>e.id!==target.id).map(e=>e.boardPosition),...obstacles.map(o=>o.boardPosition)];
+      const blockers=[origin.boardPosition,...strikeables.filter(u=>u.id!==target.id).map(u=>u.boardPosition),...obstacles.map(o=>o.boardPosition)];
       extra.boardPosition=getKnockbackTile(target.boardPosition,origin.facing,knockDist,blockers);
       addLog(`Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} + knockback ${knockDist} tile${knockDist>1?'s':''}`);
     } else if(blocked){
@@ -4764,7 +4789,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     }
     resetDiceModal();
     applySkillResultMulti(target, dmg, updatedPlayer, extra, ELEMENTS.base.Air.color);
-  },[diceRolls,lockedRoll,player,tiles,obstacles,enemies,addLog,resetDiceModal,applySkillResultMulti]);
+  },[diceRolls,lockedRoll,player,tiles,obstacles,enemies,summons,addLog,resetDiceModal,applySkillResultMulti]);
 
   const handleWaterApplyWithAccuracyMulti = useCallback((acc)=>{
     const origin=lockedRoll.origin;
@@ -4772,7 +4797,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const res=resolveTorrent(dieRoll);
     const anchor=getTorrentAnchor(origin.boardPosition,origin.facing);
     const footprint=getTorrentFootprint(anchor,waterAoe);
-    const target = enemies.find(e=>footprint.some(t=>t.x===e.boardPosition.x&&t.y===e.boardPosition.y));
+    const strikeables=[...enemies, ...summons.filter(s=>s.side==='enemy')];
+    const target = strikeables.find(u=>footprint.some(t=>t.x===u.boardPosition.x&&t.y===u.boardPosition.y));
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Water');
     const dmg=target?applyAccuracy(res.damage,acc)+tileBoost:0;
     const cost=TORRENT_AOE_COST[waterAoe];
@@ -4782,7 +4808,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     addLog(`Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[waterAoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${target?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS (no enemy in blast)'}${flooded?' [Flood]':''}`);
     resetDiceModal();
     applySkillResultMulti(target, dmg, updatedPlayer, {}, ELEMENTS.base.Water.color);
-  },[diceRolls,lockedRoll,player,tiles,waterAoe,enemies,addLog,resetDiceModal,applySkillResultMulti]);
+  },[diceRolls,lockedRoll,player,tiles,waterAoe,enemies,summons,addLog,resetDiceModal,applySkillResultMulti]);
 
   // ── Compass Slash / Dark Web targeting resolution ──
   const deployTilesMulti = getDeployTiles(tiles, player.boardPosition, enemies.map(e=>e.boardPosition), [...summons, ...obstacles]);
@@ -4794,7 +4820,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
 
   const resolveCompassSlashMulti = useCallback((targetTile)=>{
     if(!isAdjacent8(player.boardPosition,targetTile)){ addLog('// Target not in the 8 surrounding tiles'); return; }
-    const target = enemies.find(e=>e.boardPosition.x===targetTile.x&&e.boardPosition.y===targetTile.y);
+    const target = [...enemies, ...summons.filter(s=>s.side==='enemy')].find(u=>u.boardPosition.x===targetTile.x&&u.boardPosition.y===targetTile.y);
     setCompassTargeting(false);
     if(!target){
       addLog('// Compass Slash strikes empty tile — 2 Energy spent');
@@ -4806,11 +4832,11 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     addLog(`Compass Slash -> ${dmg} dmg`);
     const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),facing:slashFacing},'compassSlash');
     applySkillResultMulti(target, dmg, updatedPlayer, {}, '#9b6cff');
-  },[player,enemies,addLog,applySkillResultMulti,routeAfterPlayerActionMulti]);
+  },[player,enemies,summons,addLog,applySkillResultMulti,routeAfterPlayerActionMulti]);
 
   const resolveDarkWebMulti = useCallback((targetTile)=>{
     if(!isKnightMove(player.boardPosition,targetTile)){ addLog('// Target not a knight-move tile'); return; }
-    const target = enemies.find(e=>e.boardPosition.x===targetTile.x&&e.boardPosition.y===targetTile.y);
+    const target = [...enemies, ...summons.filter(s=>s.side==='enemy')].find(u=>u.boardPosition.x===targetTile.x&&u.boardPosition.y===targetTile.y);
     setDarkWebTargeting(false);
     if(!target){
       // No target on the tile — Dark Web now doubles as a repositioning
@@ -4848,7 +4874,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // "battle cleared" check still sees the true final roster.
   const resolveMultiHitKills = useCallback((hitIds, damaged, updatedPlayer, skillLabel)=>{
     const firstKillId = damaged.find(e=>hitIds.has(e.id)&&e.health<=0)?.id;
-    if(!firstKillId){ setPlayer(updatedPlayer); setEnemies(damaged); return; }
+    if(!firstKillId){ routeAfterPlayerActionMulti(updatedPlayer, damaged); return; }
     const otherDeadIds = damaged.filter(e=>hitIds.has(e.id)&&e.id!==firstKillId&&e.health<=0).map(e=>e.id);
     const rosterForDefeat = otherDeadIds.length===0 ? damaged : damaged.filter(e=>!otherDeadIds.includes(e.id));
     if(otherDeadIds.length>0){
@@ -4860,7 +4886,23 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     } else {
       handleEnemyDefeatedMulti(firstKillId, updatedPlayer, rosterForDefeat);
     }
-  },[campaignBattle,addLog,handleEnemyDefeatedMulti]);
+  },[campaignBattle,addLog,handleEnemyDefeatedMulti,routeAfterPlayerActionMulti]);
+
+  // Applies flat `dmg` to every enemy-side summon in `hitSummons` (the
+  // summon half of a multi-hit AoE skill's damage — see resolveMultiHitKills
+  // for the enemy-roster half), removing any that die. No XP/Hexas for a
+  // summon kill, same as melee's summon branch.
+  const applyAoeDamageToSummons = useCallback((hitSummons, dmg)=>{
+    if(hitSummons.length===0) return;
+    const hitIds = new Set(hitSummons.map(s=>s.id));
+    setSummons(prev=>prev.reduce((acc,s)=>{
+      if(!hitIds.has(s.id)){ acc.push(s); return acc; }
+      const newHP=Math.max(0,s.health-dmg);
+      if(newHP<=0) addLog(`${s.name} destroyed!`);
+      else acc.push({...s,health:newHP});
+      return acc;
+    },[]));
+  },[addLog]);
 
   // ── PULSE WAVE (Tactical Skill) — Campaign ──
   const resolvePulseWaveMulti = useCallback((targetTile)=>{
@@ -4872,18 +4914,24 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(!strike){ addLog('// No element equipped'); return; }
     const line = getAxisLine(player.boardPosition, dir, 3);
     const hitIds = new Set(enemies.filter(e=>line.some(t=>t.x===e.boardPosition.x&&t.y===e.boardPosition.y)).map(e=>e.id));
+    const hitSummons = summons.filter(s=>s.side==='enemy' && line.some(t=>t.x===s.boardPosition.x&&t.y===s.boardPosition.y));
     const newFacing=facingToward(player.boardPosition,targetTile);
     const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-4),facing:newFacing},'pulseWave');
-    if(hitIds.size===0){
+    if(hitIds.size===0 && hitSummons.length===0){
       addLog(`Pulse Wave [${strike.rollsLabel}, ${strike.acc}% (${accuracyTierLabel(strike.acc)})] -> no targets on the line`);
       routeAfterPlayerActionMulti(updatedPlayer, enemies);
       return;
     }
-    addLog(`Pulse Wave [${strike.rollsLabel}, ${strike.acc}% (${accuracyTierLabel(strike.acc)})] -> ${strike.dmg} dmg to ${hitIds.size} target${hitIds.size>1?'s':''}`);
-    enemies.forEach(e=>{ if(hitIds.has(e.id)) triggerCastFx(e.boardPosition, ELEMENTS[selCategory]?.[selElement]?.color||'#c9a7f7'); });
+    const totalHits=hitIds.size+hitSummons.length;
+    addLog(`Pulse Wave [${strike.rollsLabel}, ${strike.acc}% (${accuracyTierLabel(strike.acc)})] -> ${strike.dmg} dmg to ${totalHits} target${totalHits>1?'s':''}`);
+    const color=ELEMENTS[selCategory]?.[selElement]?.color||'#c9a7f7';
+    enemies.forEach(e=>{ if(hitIds.has(e.id)) triggerCastFx(e.boardPosition, color); });
+    hitSummons.forEach(s=>triggerCastFx(s.boardPosition, color));
+    applyAoeDamageToSummons(hitSummons, strike.dmg);
+    if(hitIds.size===0){ routeAfterPlayerActionMulti(updatedPlayer, enemies); return; }
     const damaged = enemies.map(e=>hitIds.has(e.id)?{...e,health:Math.max(0,e.health-strike.dmg)}:e);
     resolveMultiHitKills(hitIds, damaged, updatedPlayer, 'Pulse Wave');
-  },[player,enemies,selCategory,selElement,addLog,resolveMultiHitKills,routeAfterPlayerActionMulti,triggerCastFx]);
+  },[player,enemies,summons,selCategory,selElement,addLog,resolveMultiHitKills,applyAoeDamageToSummons,routeAfterPlayerActionMulti,triggerCastFx]);
 
   // ── PIERCING LIGHT (Tactical Skill) — Campaign ──
   const resolvePiercingLightMulti = useCallback((energySpent)=>{
@@ -4891,17 +4939,22 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const dmg = piercingLightDamage(energySpent);
     const line = getForwardTiles(player.boardPosition, player.facing, 2);
     const hitIds = new Set(enemies.filter(e=>line.some(t=>t.x===e.boardPosition.x&&t.y===e.boardPosition.y)).map(e=>e.id));
+    const hitSummons = summons.filter(s=>s.side==='enemy' && line.some(t=>t.x===s.boardPosition.x&&t.y===s.boardPosition.y));
     const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-energySpent)},'piercingLight');
-    if(hitIds.size===0){
+    if(hitIds.size===0 && hitSummons.length===0){
       addLog(`Piercing Light thrust -> no targets in the 2 tiles ahead — ${energySpent} Energy spent`);
       routeAfterPlayerActionMulti(updatedPlayer, enemies);
       return;
     }
-    addLog(`Piercing Light -> ${dmg} dmg to ${hitIds.size} target${hitIds.size>1?'s':''}`);
+    const totalHits=hitIds.size+hitSummons.length;
+    addLog(`Piercing Light -> ${dmg} dmg to ${totalHits} target${totalHits>1?'s':''}`);
     enemies.forEach(e=>{ if(hitIds.has(e.id)) triggerCastFx(e.boardPosition,'#ffdd77'); });
+    hitSummons.forEach(s=>triggerCastFx(s.boardPosition,'#ffdd77'));
+    applyAoeDamageToSummons(hitSummons, dmg);
+    if(hitIds.size===0){ routeAfterPlayerActionMulti(updatedPlayer, enemies); return; }
     const damaged = enemies.map(e=>hitIds.has(e.id)?{...e,health:Math.max(0,e.health-dmg)}:e);
     resolveMultiHitKills(hitIds, damaged, updatedPlayer, 'Piercing Light');
-  },[player,enemies,addLog,resolveMultiHitKills,routeAfterPlayerActionMulti,triggerCastFx]);
+  },[player,enemies,summons,addLog,resolveMultiHitKills,applyAoeDamageToSummons,routeAfterPlayerActionMulti,triggerCastFx]);
 
   const resolveDeployPlacementMulti = useCallback((tile)=>{
     const legal=deployTilesMulti.some(t=>t.x===tile.x&&t.y===tile.y);

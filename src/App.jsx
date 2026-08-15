@@ -6,6 +6,7 @@ import NavBar from './NavBar.jsx'
 import FloatingMenuButton from './FloatingMenuButton.jsx'
 import CharacterScreen from './CharacterScreen.jsx'
 import CraftingScreen from './CraftingScreen.jsx'
+import InventoryScreen from './InventoryScreen.jsx'
 import PlaceholderScreen from './PlaceholderScreen.jsx'
 
 const PLACEHOLDER_CONTENT = {
@@ -14,13 +15,6 @@ const PLACEHOLDER_CONTENT = {
     lines:[
       'Operator identity matrix uninitialized.',
       'Account sync, achievements, and cosmetic loadouts come online in a future build.',
-    ],
-  },
-  inventory: {
-    icon:'🎒', title:'Inventory', color:'#c9a227',
-    lines:[
-      'Cyberworld cache offline.',
-      'Loot, gear, and consumables come online in a future build.',
     ],
   },
   social: {
@@ -128,6 +122,8 @@ function App() {
             ? <CharacterScreen liveState={liveState} hasActiveSession={gauntletStarted} onLaunch={()=>goTo('gauntlet')} />
             : screen==='crafting'
             ? <CraftingScreen unlocked={craftingUnlocked} hexas={liveState?.hexas ?? 0} craftedSkillIds={craftedSkillIds} onLearnSkill={handleLearnSkill} />
+            : screen==='inventory'
+            ? <InventoryScreen />
             : <PlaceholderScreen {...PLACEHOLDER_CONTENT[screen]} />}
         </div>
       )}
