@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
+import { MATERIALS, rollEnemyDrop } from './ItemData.jsx';
 
 const SIZE = 9;
 
@@ -805,9 +806,16 @@ const randomEnemyLoadout = () => {
 // pool remains for computeAgentStep's ally-side Agents only).
 const ENEMY_CLASS_POOL = ['Summoner','Rogue'];
 
+// Rank now doubles as the HP tier: R4 grunts are the weakest/most common,
+// R1 is a full player-shaped "Proxie" build (same 1000 HP as the player
+// themselves) -- matches how the finale boss already mirrors the player's
+// own loadout/element 1-for-1. See rollEnemyDrop (ItemData.jsx) for how
+// this same rank also sets a defeated enemy's drop odds.
+const RANK_HP = { 4:250, 3:500, 2:750, 1:1000 };
+
 let ENEMY_SEQ = 0;
 const makeEnemyProxie = (rank, level, pos, { element=null, loadout=[], isBoss=false, hp=null } = {}) => {
-  const hpValue = hp ?? (ENEMY_HP_W1+(level-1)*ENEMY_HP_SCALE);
+  const hpValue = hp ?? RANK_HP[rank] ?? (ENEMY_HP_W1+(level-1)*ENEMY_HP_SCALE);
   const agi = Math.min(1+Math.floor(level/3),3);
   const name = isBoss ? 'Command Proxie' : element ? `${element} Warden` : 'Grunt Proxie';
   return {
@@ -821,21 +829,26 @@ const makeEnemyProxie = (rank, level, pos, { element=null, loadout=[], isBoss=fa
   };
 };
 
-// The 3-battle Campaign arc: escalating from a pair of single-skill Rank 4
-// grunts to a lone Rank 1 "Full Proxie" finale. `level` still drives
-// agility/melee-base scaling via the existing enemyTier system, but HP is
-// now an explicit per-battle `hp` tuning knob instead of being derived from
-// `level` (which Gauntlet also depends on) — first-pass balance numbers,
-// meant to be adjusted from here as playtesting continues. `narrative` is
-// the lead-in shown before that battle starts (intro modal for stage 1,
-// battle-complete "Continue" modal for 2/3). `victoryNarrative` is
-// finale-only, shown on Campaign completion alongside the reward grant.
+// The 5-battle Campaign arc: escalating from a trio of single-skill Rank 4
+// grunts through mixed and same-rank squads up to a lone Rank 1 "Full
+// Proxie" finale, one rank tougher each step. `level` still drives
+// agility/melee-base scaling via the existing enemyTier system; HP is now
+// derived per-roster-member from RANK_HP instead of one flat per-battle
+// value, so a mixed-rank roster (e.g. stage 2's R4s + R3) actually
+// differentiates. `narrative` is the lead-in shown before that battle
+// starts (intro modal for stage 1, battle-complete "Continue" modal for
+// every stage after). `victoryNarrative` is finale-only, shown on Campaign
+// completion alongside the reward grant.
 export const CAMPAIGN_BATTLES = [
-  { stage:1, name:'Skirmish Line',  roster:[{rank:4},{rank:4}], level:2,  hp:250,
-    narrative:'Grid intercepts flag a fractured patrol at the outer perimeter — two rogue processes running on minimal instruction sets. Clear them before they regroup.' },
-  { stage:2, name:'Strike Squad',   roster:[{rank:3},{rank:3}], level:8,  hp:400,
+  { stage:1, name:'Skirmish Line',   roster:[{rank:4},{rank:4},{rank:4}], level:2,
+    narrative:'Grid intercepts flag a fractured patrol at the outer perimeter — three rogue processes running on minimal instruction sets. Clear them before they regroup.' },
+  { stage:2, name:'Reinforced Line', roster:[{rank:4},{rank:4},{rank:3}], level:4,
+    narrative:'The patrol regroups faster than expected — a heavier process has joined the line, running interference for what\'s left of the scouts.' },
+  { stage:3, name:'Strike Squad',    roster:[{rank:3},{rank:3}], level:6,
     narrative:'The breach widens. A coordinated strike squad has moved in to reinforce the perimeter — better instantiated than the scouts that came before.' },
-  { stage:3, name:'Command Proxie', roster:[{rank:1}],          level:10, hp:650, isFinale:true,
+  { stage:4, name:'Elite Guard',     roster:[{rank:2},{rank:2}], level:8,
+    narrative:'Deeper in the breach, the defense sharpens. These aren\'t grunts running borrowed instruction sets — Elite Guard units, fully specialized, holding the line with purpose.' },
+  { stage:5, name:'Command Proxie',  roster:[{rank:1}], level:10, isFinale:true,
     narrative:'At the heart of the breach: a Command Proxie, fully instantiated, every subsystem online — mirroring your own build back at you, shadowboxing against exactly what you brought in. This is what has been holding the line.',
     victoryNarrative:'The Command Proxie\'s core destabilizes and goes dark. The breach is yours.' },
 ];
@@ -846,12 +859,14 @@ export const CAMPAIGN_BATTLES = [
 export const FIRST_EQUIPMENT = { name:'Salvaged Core Chip', statBonus:'+100 Max HP', maxHealthBonus:100 };
 
 // Places each roster slot on the enemy back row (row 0), retrying on
-// collision with player/previously-placed enemies. Regular battles (1-2)
-// get a randomized element + tactical loadout per grunt. The finale boss
-// instead mirrors whatever `mirror` carries — the player's own actual
-// loadout and element, "shadowboxing" a build identical to theirs, which is
-// also how a boss legitimately gets a Core skill (Circuit Sigil) despite
-// grunts never rolling one.
+// collision with player/previously-placed enemies. Regular battles get a
+// randomized element + tactical loadout per grunt; HP is left for
+// makeEnemyProxie to derive from each slot's own rank (RANK_HP), so a
+// mixed-rank roster differentiates correctly. The finale boss instead
+// mirrors whatever `mirror` carries — the player's own actual loadout and
+// element, "shadowboxing" a build identical to theirs, which is also how a
+// boss legitimately gets a Core skill (Circuit Sigil) despite grunts never
+// rolling one.
 const spawnCampaignRoster = (stage, playerPos, mirror=null) => {
   const battle = CAMPAIGN_BATTLES[stage-1];
   const placed = [];
@@ -864,7 +879,7 @@ const spawnCampaignRoster = (stage, playerPos, mirror=null) => {
     const isBoss = !!battle.isFinale;
     const element = isBoss && mirror ? mirror.element : BOSS_ELEMENTS[Math.floor(Math.random()*BOSS_ELEMENTS.length)];
     const loadout = isBoss && mirror ? mirror.loadout : randomEnemyLoadout();
-    placed.push(makeEnemyProxie(rank, battle.level, {x:pos.x,y:pos.y}, {element, loadout, isBoss, hp:battle.hp}));
+    placed.push(makeEnemyProxie(rank, battle.level, {x:pos.x,y:pos.y}, {element, loadout, isBoss}));
   });
   return placed;
 };
@@ -2558,7 +2573,7 @@ const CampaignBattleCompleteModal = ({show, isFinale, battle, nextBattle, equipm
   return (
     <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.85)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:4000}}>
       <div style={{background:'#080e14',border:`2px solid ${color}`,borderRadius:12,padding:'2rem',maxWidth:440,width:'92%',textAlign:'center',color:'#b0dff4',boxShadow:`0 0 50px ${color}66`}}>
-        <div style={{fontSize:'11px',letterSpacing:'0.2em',textTransform:'uppercase',color}}>{isFinale ? '// Campaign Complete' : `// Battle ${battle?.stage}/3 Cleared`}</div>
+        <div style={{fontSize:'11px',letterSpacing:'0.2em',textTransform:'uppercase',color}}>{isFinale ? '// Campaign Complete' : `// Battle ${battle?.stage}/${CAMPAIGN_BATTLES.length} Cleared`}</div>
         <h2 style={{fontSize:'1.4rem',letterSpacing:'0.1em',textTransform:'uppercase',color,marginTop:8}}>{isFinale ? 'The Army Falls' : `${battle?.name} Down`}</h2>
         <div style={{background:'#0a1218',border:`1px solid ${color}33`,borderRadius:8,padding:'12px 14px',margin:'14px 0',fontSize:12,color:'#7a9db5',lineHeight:1.6,fontStyle:'italic',textAlign:'left'}}>
           {isFinale ? battle?.victoryNarrative : nextBattle?.narrative}
@@ -2622,7 +2637,6 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const [enemies,          setEnemies]          = useState(()=> isCampaign ? spawnCampaignRoster(1, initPlayer().boardPosition) : []);
   const [campaignBattle,   setCampaignBattle]   = useState(1);
   const [campaignComplete, setCampaignComplete] = useState(false);
-  const [craftingUnlocked, setCraftingUnlocked] = useState(false);
   const [showBattleComplete, setShowBattleComplete] = useState(false);
   // Shown once, before Battle 1 — Campaign locks name/loadout/element up front
   // instead of Gauntlet's post-boss unlock or Training's free swapping.
@@ -2641,6 +2655,10 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const [enemyRolledEnergy,  setEnemyRolledEnergy]  = useState(0);
   const [energyPhase,    setEnergyPhase]    = useState('roll');
   const [hexas,          setHexas]          = useState(0);
+  // Battle-acquired synthesis materials (Campaign only) -- materialId -> qty.
+  // Unequipped equipment drops live on player.equipment (see FIRST_EQUIPMENT
+  // and rollEnemyDrop) rather than their own top-level state, same shape.
+  const [materials,      setMaterials]      = useState({});
   const [isPlayerTurn,   setIsPlayerTurn]   = useState(true);
   const [playerSel,      setPlayerSel]      = useState(false);
   const [validSquares,   setValidSquares]   = useState([]);
@@ -2757,9 +2775,19 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const applyLevelUp = useCallback((p)=>{
     const needed=getXPThreshold(p.level);
     if(p.playerXp<needed) return p;
-    const updated={...p,level:p.level+1,playerXp:p.playerXp-needed,health:p.maxHealth};
+    // The player's very first level-up (starting level is always 1) also
+    // triggers the Custom Skill unlock -- a placeholder for now (see
+    // Crafting's Custom Synthesis section) but a real, one-time flag on the
+    // player and a real notification, not just a comment.
+    const isFirstLevelUp = p.level===1;
+    const updated={...p,level:p.level+1,playerXp:p.playerXp-needed,health:p.maxHealth,
+      ...(isFirstLevelUp?{customSkillUnlocked:true}:{})};
     addLog(`=== LEVEL UP! ${updated.name} Lv${updated.level}! HP restored. ===`);
-    showReward(`<h2 style="color:#ffd700;letter-spacing:.1em">LEVEL UP</h2><p style="font-size:1.4rem;margin:10px 0;color:#00c8ff">Level ${updated.level}</p><p style="color:#00cc66;font-size:.9rem">HP fully restored</p>`,2500);
+    if(isFirstLevelUp) addLog('◈ Custom Skill unlocked — full ability crafting comes online in a future build.');
+    const customSkillBlock = isFirstLevelUp
+      ? `<div style="margin-top:14px;padding-top:14px;border-top:1px solid #1e3a4a"><p style="color:#9b6cff;font-weight:bold;letter-spacing:.05em;font-size:.95rem">◈ CUSTOM SKILL UNLOCKED</p><p style="color:#7a9db5;font-size:.78rem;margin-top:4px">Full ability crafting comes online in a future build.</p></div>`
+      : '';
+    showReward(`<h2 style="color:#ffd700;letter-spacing:.1em">LEVEL UP</h2><p style="font-size:1.4rem;margin:10px 0;color:#00c8ff">Level ${updated.level}</p><p style="color:#00cc66;font-size:.9rem">HP fully restored</p>${customSkillBlock}`,isFirstLevelUp?4000:2500);
     return updated;
   },[addLog,showReward]);
 
@@ -4477,18 +4505,26 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const hexGain = 40 + campaignBattle*30;
     addLog(`=== ${dead.name} (R${dead.rank}) defeated! +${xpGain} XP, +${hexGain} Hexas ===`);
     setHexas(h=>h+hexGain);
+    // Battle acquisition: rank sets the drop odds (see DROP_CHANCES in
+    // ItemData.jsx) -- every enemy always drops its attuned elemental Core,
+    // rank only ever raises the chance of a bonus +/- stat Core and (from
+    // R2 up) an equipment item on top of that.
+    const drop = rollEnemyDrop(dead);
+    const dropParts = Object.entries(drop.materials).map(([id,qty])=>`+${qty} ${MATERIALS.find(m=>m.id===id)?.name||id}`);
+    if(dropParts.length>0) addLog(`◈ Salvaged: ${dropParts.join(', ')}`);
+    if(drop.equipment) addLog(`◈ Equipment drop: ${drop.equipment.name}!`);
+    setMaterials(prev=>{
+      const next={...prev};
+      Object.entries(drop.materials).forEach(([id,qty])=>{ next[id]=(next[id]||0)+qty; });
+      return next;
+    });
     let leveled = { ...curPlayer, playerXp:(curPlayer.playerXp||0)+xpGain };
+    if(drop.equipment) leveled = { ...leveled, equipmentDrops:[...(leveled.equipmentDrops||[]), drop.equipment] };
     leveled = applyLevelUp(leveled);
     setPlayer(leveled);
     if(remaining.length>0) return; // battle continues with the survivors
     const battle = CAMPAIGN_BATTLES[campaignBattle-1];
-    addLog(battle.isFinale ? '=== CAMPAIGN COMPLETE — the army falls. ===' : `=== Battle ${campaignBattle}/3 cleared! ===`);
-    // Crafting unlocks after the first Campaign win, not the whole run —
-    // the finale still grants the equipment reward on top of that.
-    if(campaignBattle===1){
-      setCraftingUnlocked(true);
-      addLog('◈ Synthesis protocol online — Crafting unlocked.');
-    }
+    addLog(battle.isFinale ? '=== CAMPAIGN COMPLETE — the army falls. ===' : `=== Battle ${campaignBattle}/${CAMPAIGN_BATTLES.length} cleared! ===`);
     if(battle.isFinale){
       setCampaignComplete(true);
       setPlayer(p=>({...p, equipment:[...(p.equipment||[]), FIRST_EQUIPMENT],
@@ -4523,7 +4559,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setLockedRoll(null);
     setHealingConsumed(false);
     setIsPlayerTurn(true);
-    addLog(`=== Battle ${nextStage}/3 — ${battle.name} ===`);
+    addLog(`=== Battle ${nextStage}/${CAMPAIGN_BATTLES.length} — ${battle.name} ===`);
   },[addLog,loadout,selElement]);
 
   const handleCampaignIntroSubmit = useCallback((name, pickedLoadout, element)=>{
@@ -4586,7 +4622,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
 
   const handleSurrenderMulti = useCallback(()=>{
     addLog('=== You retreat from the Campaign. ===');
-    onCampaignComplete?.();
+    onCampaignComplete?.(false); // quitting, not a real finale win
   },[addLog,onCampaignComplete]);
 
   // ── Melee ──
@@ -5261,8 +5297,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // screen elsewhere in the app) that isn't otherwise able to see this
   // component's internal state. No-op if no callback was passed in.
   useEffect(()=>{
-    onStateSync?.({ player, loadout, wave, hexas, craftingUnlocked });
-  },[player, loadout, wave, hexas, craftingUnlocked, onStateSync]);
+    onStateSync?.({ player, loadout, wave, hexas, materials });
+  },[player, loadout, wave, hexas, materials, onStateSync]);
 
   // Track viewport orientation so the rotate prompt reacts to resize/rotation.
   useEffect(()=>{
@@ -5352,7 +5388,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:8,flexWrap:'wrap',gap:6}}>
           <div style={{display:'flex',alignItems:'baseline',gap:10}}>
             <h1 style={{fontFamily:"'Advent Pro',sans-serif",fontSize:'1.25rem',fontWeight:700,letterSpacing:'0.18em',textTransform:'uppercase',color:'#00c8ff',textShadow:'0 0 18px rgba(0,200,255,0.4)',margin:0}}>Paradigm</h1>
-            <span style={{fontSize:'0.7rem',letterSpacing:'0.2em',color:'#3a6a8a',textTransform:'uppercase'}}>{sceneMeta ? `Training — ${sceneMeta.name}` : isCampaign ? `Campaign — Battle ${campaignBattle}/3: ${CAMPAIGN_BATTLES[campaignBattle-1].name}` : 'Grid Battler'}</span>
+            <span style={{fontSize:'0.7rem',letterSpacing:'0.2em',color:'#3a6a8a',textTransform:'uppercase'}}>{sceneMeta ? `Training — ${sceneMeta.name}` : isCampaign ? `Campaign — Battle ${campaignBattle}/${CAMPAIGN_BATTLES.length}: ${CAMPAIGN_BATTLES[campaignBattle-1].name}` : 'Grid Battler'}</span>
             <span style={{fontSize:'0.62rem',letterSpacing:'0.15em',color:'#2a4a5e',fontFamily:'monospace'}}>v4.3</span>
           </div>
           <div style={{display:'flex',gap:14,alignItems:'center',fontSize:'0.8rem',fontFamily:'monospace'}}>
@@ -5539,7 +5575,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         nextBattle={CAMPAIGN_BATTLES[campaignBattle]}
         equipmentReward={FIRST_EQUIPMENT}
         onContinue={()=>{ setShowBattleComplete(false); startNextCampaignBattle(player, campaignBattle+1); }}
-        onFinish={()=>{ setShowBattleComplete(false); onCampaignComplete?.(); }}
+        onFinish={()=>{ setShowBattleComplete(false); onCampaignComplete?.(true); }}
       />
       <CampaignIntroModal show={isCampaign&&showCampaignIntro} onSubmit={handleCampaignIntroSubmit} craftedSkillIds={craftedSkillIds} />
 

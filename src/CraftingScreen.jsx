@@ -10,6 +10,7 @@ const RECIPES = [
   {
     skillId: 'circuitSigil',
     cost: 0, // free during the Crafting dev-unlock phase — recipe costs come online later
+    campaignRequired: true, // stays locked in the bench until the Campaign is won once, even though Crafting itself is open from the start
     parameters: [
       { label:'Range',    value:'Deploys to your back row (row 7)' },
       { label:'Damage',   value:'30 ATK per summon strike' },
@@ -28,16 +29,18 @@ const CUSTOM_AXES = [
   { label:'Effects',  hint:'Status effects, summons, or other side effects. Eventually.' },
 ];
 
-const RecipeCard = ({ skill, recipe, learned, hexas, onLearn }) => (
-  <div style={{background:'rgba(10,18,28,0.9)',border:`1px solid ${skill.color}66`,borderRadius:10,padding:'18px 20px',marginBottom:14}}>
+const RecipeCard = ({ skill, recipe, learned, locked, hexas, onLearn }) => (
+  <div style={{background:'rgba(10,18,28,0.9)',border:`1px solid ${locked?'#1e3a4a':skill.color+'66'}`,borderRadius:10,padding:'18px 20px',marginBottom:14,opacity:locked?0.7:1}}>
     <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:10}}>
-      <span style={{fontSize:28}}>{skill.icon}</span>
+      <span style={{fontSize:28,filter:locked?'grayscale(1)':'none'}}>{skill.icon}</span>
       <div style={{flex:1}}>
-        <div style={{fontSize:16,fontWeight:'bold',color:skill.color}}>{skill.name}</div>
+        <div style={{fontSize:16,fontWeight:'bold',color:locked?'#5a7a8a':skill.color}}>{skill.name}</div>
         <div style={{fontSize:11,color:'#7a9db5'}}>{skill.tagline}</div>
       </div>
       {learned ? (
         <span style={{fontSize:10,color:'#66dd88',fontWeight:'bold',letterSpacing:'0.08em',border:'1px solid #1e6a3a',borderRadius:4,padding:'4px 9px',background:'rgba(0,200,100,0.1)'}}>✓ LEARNED</span>
+      ) : locked ? (
+        <span style={{fontSize:10,color:'#5a7a8a',fontWeight:'bold',letterSpacing:'0.08em',border:'1px solid #1e3a4a',borderRadius:4,padding:'4px 9px'}}>🔒 LOCKED</span>
       ) : (
         <span style={{fontSize:10,color:'#ffd700',fontWeight:'bold',letterSpacing:'0.08em'}}>{recipe.cost>0 ? `${recipe.cost} HEXAS` : 'FREE'}</span>
       )}
@@ -53,7 +56,11 @@ const RecipeCard = ({ skill, recipe, learned, hexas, onLearn }) => (
       ))}
     </div>
 
-    {!learned && (
+    {locked ? (
+      <div style={{fontSize:11,color:'#5a7a8a',fontStyle:'italic',padding:'9px 12px',background:'rgba(0,0,0,0.25)',border:'1px solid #1e3a4a',borderRadius:6}}>
+        🔒 Complete the Campaign to unlock this recipe.
+      </div>
+    ) : !learned && (
       <button onClick={onLearn} disabled={hexas<recipe.cost}
         style={{width:'100%',padding:11,background:hexas>=recipe.cost?`${skill.color}22`:'rgba(20,30,40,0.6)',color:hexas>=recipe.cost?skill.color:'#2a4a5e',border:`1px solid ${hexas>=recipe.cost?skill.color:'#1e3a4a'}`,borderRadius:6,cursor:hexas>=recipe.cost?'pointer':'not-allowed',fontSize:13,fontWeight:'bold',letterSpacing:'0.06em'}}>
         {hexas>=recipe.cost ? `Learn ${skill.name}` : `Need ${recipe.cost - hexas} more Hexas`}
@@ -62,20 +69,7 @@ const RecipeCard = ({ skill, recipe, learned, hexas, onLearn }) => (
   </div>
 );
 
-const CraftingScreen = ({ unlocked, hexas, craftedSkillIds, onLearnSkill }) => {
-  if(!unlocked){
-    return (
-      <div style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',padding:'4rem 1.5rem',textAlign:'center',gap:16,minHeight:'70vh'}}>
-        <div style={{fontSize:64,filter:'drop-shadow(0 0 20px #ff884488)'}}>🔧</div>
-        <h1 style={{fontFamily:"'Advent Pro',sans-serif",fontSize:'1.7rem',letterSpacing:'0.18em',textTransform:'uppercase',color:'#ff8844',margin:0,textShadow:'0 0 18px #ff884466'}}>Crafting</h1>
-        <div style={{maxWidth:440,color:'#7a9db5',fontSize:14,lineHeight:1.8}}>
-          <p style={{margin:'6px 0'}}>Synthesis protocol not yet compiled.</p>
-          <p style={{margin:'6px 0'}}>Win Campaign Battle 1 to bring it online.</p>
-        </div>
-      </div>
-    );
-  }
-
+const CraftingScreen = ({ hexas, craftedSkillIds, onLearnSkill, campaignCompletedOnce, customSkillUnlocked }) => {
   return (
     <div style={{maxWidth:820,margin:'0 auto',padding:'24px 20px 60px',width:'100%'}}>
       <div style={{display:'flex',alignItems:'center',gap:16,marginBottom:8,flexWrap:'wrap'}}>
@@ -97,14 +91,20 @@ const CraftingScreen = ({ unlocked, hexas, craftedSkillIds, onLearnSkill }) => {
         if(!skill) return null;
         return (
           <RecipeCard key={recipe.skillId} skill={skill} recipe={recipe} learned={isSkillUnlocked(skill, craftedSkillIds)}
+            locked={!!recipe.campaignRequired && !campaignCompletedOnce}
             hexas={hexas ?? 0} onLearn={()=>onLearnSkill(skill.id)} />
         );
       })}
 
-      <h2 style={{fontSize:'0.78rem',letterSpacing:'0.15em',textTransform:'uppercase',color:'#00c8ff',borderBottom:'1px solid #1e3a4a',paddingBottom:8,margin:'32px 0 16px'}}>Custom Synthesis</h2>
+      <h2 style={{fontSize:'0.78rem',letterSpacing:'0.15em',textTransform:'uppercase',color:'#00c8ff',borderBottom:'1px solid #1e3a4a',paddingBottom:8,margin:'32px 0 16px'}}>
+        Custom Synthesis
+        {customSkillUnlocked && <span style={{marginLeft:10,fontSize:9,color:'#9b6cff',letterSpacing:'0.15em',border:'1px solid #9b6cff66',borderRadius:4,padding:'2px 8px',verticalAlign:'middle'}}>◈ UNLOCKED</span>}
+      </h2>
       <div style={{background:'rgba(10,18,28,0.7)',border:'1px dashed #2a4a5e',borderRadius:10,padding:'18px 20px'}}>
         <div style={{fontSize:12,color:'#5a7a8a',lineHeight:1.6,marginBottom:16}}>
-          Tune your own skill from scratch across these axes. In development — recipes above are fixed presets until this comes online.
+          {customSkillUnlocked
+            ? 'Tune your own skill from scratch across these axes. Unlocked, but still in development — recipes above are fixed presets until full custom synthesis comes online.'
+            : 'Tune your own skill from scratch across these axes. Unlocks the first time your Proxie levels up in battle.'}
         </div>
         <div style={{display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(140px,1fr))',gap:10}}>
           {CUSTOM_AXES.map(axis=>(

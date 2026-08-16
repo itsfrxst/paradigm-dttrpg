@@ -42,6 +42,10 @@ function App() {
   // one Gauntlet/Campaign session) since a crafted skill should carry into
   // every mode once learned, the same way real progression would.
   const [craftedSkillIds, setCraftedSkillIds] = useState([])
+  // Whether the Campaign has been won at least once (not just started/quit)
+  // — Circuit Sigil specifically stays locked in Crafting until this is
+  // true, even though Crafting itself is available from the start now.
+  const [campaignCompletedOnce, setCampaignCompletedOnce] = useState(false)
 
   const goTo = useCallback((s)=>{
     if(s==='gauntlet') setGauntletStarted(true)
@@ -49,9 +53,10 @@ function App() {
     setScreen(s)
   },[])
 
-  const handleCampaignComplete = useCallback(()=>{
+  const handleCampaignComplete = useCallback((victorious)=>{
     setCampaignStarted(false)
     setScreen('start')
+    if(victorious) setCampaignCompletedOnce(true)
   },[])
 
   const handleGauntletQuit = useCallback(()=>{
@@ -73,10 +78,6 @@ function App() {
   const handleLearnSkill = useCallback((skillId)=>{
     setCraftedSkillIds(prev => prev.includes(skillId) ? prev : [...prev, skillId])
   },[])
-
-  // Unlocks after winning Campaign Battle 1 (see GridBattlerGame's
-  // craftingUnlocked state, synced up via onStateSync).
-  const craftingUnlocked = !!liveState?.craftingUnlocked
 
   if(screen==='start'){
     return <StartScreen onSelectMode={goTo} onNavigate={goTo} hasActiveSession={gauntletStarted} hasActiveCampaignSession={campaignStarted} />
@@ -121,9 +122,9 @@ function App() {
           {screen==='character'
             ? <CharacterScreen liveState={liveState} hasActiveSession={gauntletStarted} onLaunch={()=>goTo('gauntlet')} />
             : screen==='crafting'
-            ? <CraftingScreen unlocked={craftingUnlocked} hexas={liveState?.hexas ?? 0} craftedSkillIds={craftedSkillIds} onLearnSkill={handleLearnSkill} />
+            ? <CraftingScreen hexas={liveState?.hexas ?? 0} craftedSkillIds={craftedSkillIds} onLearnSkill={handleLearnSkill} campaignCompletedOnce={campaignCompletedOnce} customSkillUnlocked={!!liveState?.player?.customSkillUnlocked} />
             : screen==='inventory'
-            ? <InventoryScreen />
+            ? <InventoryScreen materials={liveState?.materials ?? {}} equipmentDrops={liveState?.player?.equipmentDrops ?? []} />
             : <PlaceholderScreen {...PLACEHOLDER_CONTENT[screen]} />}
         </div>
       )}
