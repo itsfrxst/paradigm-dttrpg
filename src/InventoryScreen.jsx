@@ -1,5 +1,5 @@
 import React from 'react';
-import { RARITY_TIERS, EQUIPMENT_SLOTS, ACCESSORY_TYPES, MATERIALS } from './ItemData.jsx';
+import { RARITY_TIERS, EQUIPMENT_SLOTS, ACCESSORY_TYPES, MATERIALS, rarityById } from './ItemData.jsx';
 
 const EquipmentSlot = ({ slot, item }) => (
   <div style={{
@@ -28,6 +28,24 @@ const RarityLegend = () => (
   </div>
 );
 
+// Battle drops that haven't been equipped into a slot yet -- there's no
+// equip/unequip interaction built yet, so this is just a held-items list
+// rather than something draggable onto EquipmentSlot above.
+const HeldEquipmentCard = ({ item }) => {
+  const rarity = rarityById(item.tier);
+  const slotMeta = EQUIPMENT_SLOTS.find(s => s.id === item.slot);
+  return (
+    <div style={{background:'rgba(10,18,28,0.85)', border:`1px solid ${rarity?.color ?? '#1e3a4a'}44`, borderRadius:8, padding:'12px 14px'}}>
+      <div style={{display:'flex', alignItems:'center', gap:8, marginBottom:4}}>
+        <span style={{fontSize:16}}>{slotMeta?.icon ?? '◈'}</span>
+        <span style={{color:rarity?.color ?? '#b0dff4', fontWeight:'bold', fontSize:13, flex:1}}>{item.name}</span>
+        {rarity && <span style={{fontSize:9, color:rarity.color, textTransform:'uppercase', letterSpacing:'0.1em'}}>{rarity.label}</span>}
+      </div>
+      <div style={{fontSize:10, color:'#5a7a8a', textTransform:'uppercase', letterSpacing:'0.1em'}}>{slotMeta?.name ?? item.slot} slot</div>
+    </div>
+  );
+};
+
 const MaterialCard = ({ material, qty }) => (
   <div style={{background:'rgba(10,18,28,0.85)', border:`1px solid ${material.color}44`, borderRadius:8, padding:'12px 14px', opacity:qty>0?1:0.6}}>
     <div style={{display:'flex', alignItems:'center', gap:8, marginBottom:6}}>
@@ -44,7 +62,7 @@ const MaterialCard = ({ material, qty }) => (
   </div>
 );
 
-const InventoryScreen = ({ equipment = {}, materials = {} }) => {
+const InventoryScreen = ({ equipment = {}, materials = {}, equipmentDrops = [] }) => {
   const materialsByTier = RARITY_TIERS.map(tier => ({
     tier,
     items: MATERIALS.filter(m => m.tier === tier.id),
@@ -64,11 +82,22 @@ const InventoryScreen = ({ equipment = {}, materials = {} }) => {
       <div style={{fontSize:11, color:'#5a7a8a', lineHeight:1.7, marginBottom:16, maxWidth:640}}>
         Six slots per Proxy — Helm, Torso, and Legs for armor, plus three open Accessory slots. Any accessory type ({ACCESSORY_TYPES.join(' · ')}) can go in any of the three.
       </div>
-      <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(110px,1fr))', gap:10, marginBottom:32}}>
+      <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(110px,1fr))', gap:10, marginBottom:24}}>
         {EQUIPMENT_SLOTS.map(slot => (
           <EquipmentSlot key={slot.id} slot={slot} item={equipment[slot.id]} />
         ))}
       </div>
+
+      <div style={{fontSize:10, color:'#3a5a6a', textTransform:'uppercase', letterSpacing:'0.15em', marginBottom:10}}>
+        Held (Unequipped) — {equipmentDrops.length}
+      </div>
+      {equipmentDrops.length > 0 ? (
+        <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fill,minmax(220px,1fr))', gap:10, marginBottom:32}}>
+          {equipmentDrops.map(item => <HeldEquipmentCard key={item.id} item={item} />)}
+        </div>
+      ) : (
+        <div style={{fontSize:11, color:'#3a5a6a', fontStyle:'italic', marginBottom:32}}>No equipment found yet — Campaign Rank 2 and up have a chance to drop it.</div>
+      )}
 
       <h2 style={{fontSize:'0.8rem', letterSpacing:'0.15em', textTransform:'uppercase', color:'#00c8ff', borderBottom:'1px solid #1e3a4a', paddingBottom:8, marginBottom:14}}>Materials</h2>
       <div style={{fontSize:11, color:'#5a7a8a', lineHeight:1.7, marginBottom:16, maxWidth:640}}>

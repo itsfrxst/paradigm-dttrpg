@@ -5,7 +5,7 @@ import WaterBackground from './WaterBackground.jsx';
 // then Training, then Gauntlet, then the locked Arena teaser.
 const MODES = [
   { id:'campaign', name:'Campaign', icon:'📜', color:'#cc4422', locked:false,
-    desc:'Fight through an army. Three escalating squad battles — from a pair of single-skill grunts to a lone Full Proxie finale.' },
+    desc:'Fight through an army. Five escalating squad battles — from a trio of single-skill grunts to a lone Full Proxie finale.' },
   { id:'training', name:'Training Mode', icon:'🧭', color:'#00cc66', locked:false,
     desc:'A tutorial hub of focused practice scenes — movement, classes, and elements, each teachable in isolation. No grind.' },
   { id:'gauntlet', name:'Gauntlet Test Mode', icon:'⚔', color:'#00c8ff', locked:false,
