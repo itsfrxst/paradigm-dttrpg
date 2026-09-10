@@ -62,7 +62,7 @@ const MaterialCard = ({ material, qty }) => (
   </div>
 );
 
-const InventoryScreen = ({ equipment = {}, materials = {}, equipmentDrops = [] }) => {
+const InventoryScreen = ({ hexas = 0, equipment = {}, materials = {}, equipmentDrops = [] }) => {
   const materialsByTier = RARITY_TIERS.map(tier => ({
     tier,
     items: MATERIALS.filter(m => m.tier === tier.id),
@@ -76,6 +76,7 @@ const InventoryScreen = ({ equipment = {}, materials = {}, equipmentDrops = [] }
           <h1 style={{fontFamily:"'Advent Pro',sans-serif", fontSize:'1.4rem', letterSpacing:'0.12em', textTransform:'uppercase', color:'#c9a227', margin:0}}>Cyberworld Cache</h1>
           <div style={{fontSize:12, color:'#7a9db5'}}>Equipment loadout and synthesis materials.</div>
         </div>
+        <div style={{marginLeft:'auto', fontSize:13, color:'#ffd700', fontWeight:'bold'}}>{hexas} Hexas</div>
       </div>
 
       <h2 style={{fontSize:'0.8rem', letterSpacing:'0.15em', textTransform:'uppercase', color:'#00c8ff', borderBottom:'1px solid #1e3a4a', paddingBottom:8, marginBottom:14}}>Equipment</h2>

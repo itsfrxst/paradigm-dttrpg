@@ -78,6 +78,55 @@ export const MATERIALS = [
     kind: 'stat', stat: 'energy', sign: -1, tier: 'hexahedron',  desc: 'Bleeds bandwidth off the Energy pool. Lowers Energy.' },
 ];
 
+// ─── SKILL MODIFIERS ─────────────────────────────────────────────────────
+// The Modifier Panel: pick a skill, drag its slider to a target tier, spend
+// Hexas (and, for an elemental skill, one matching Core per tier) to buy a
+// flat, permanent stat bump on it -- the loop that turns Campaign kills into
+// a stronger loadout instead of just XP. Damage is the first stat; the shape
+// here (one entry per stat, each skill just holding a tier 0..max/step) is
+// set up so a future stat (e.g. Energy cost) is another SKILL_MOD_STATS
+// entry, not a new system.
+export const SKILL_MOD_STATS = {
+  damage:   { label: 'Damage',   max: 100, step: 10 }, // 10 tiers, +10 flat per tier
+  accuracy: { label: 'Accuracy', max: 50,  step: 10 }, // 5 tiers, +10% dmg multiplier per tier
+};
+export const skillModMaxTier = (statId) => SKILL_MOD_STATS[statId].max / SKILL_MOD_STATS[statId].step;
+
+// Every modifiable skill belongs to exactly one group, and a group's
+// baseCost sets how steep its per-tier Hexas curve climbs (cost = baseCost
+// * tier). Core skills (Melee, Circuit Sigil) are the strongest abilities in
+// the game, so their curve is priced well above a Foundational (Tactical)
+// skill's; Elemental skills share the Foundational Hexas curve but
+// additionally spend one matching elemental Core per tier (see coreId on
+// MODIFIABLE_ELEMENTS below).
+export const SKILL_MOD_GROUPS = {
+  core:         { label: 'Core',         baseCost: 150, ids: ['melee', 'circuitSigil', 'customSkill'] },
+  foundational: { label: 'Foundational', baseCost: 50,  ids: ['compassSlash', 'darkWeb', 'pulseWave', 'longshotProtocol', 'piercingLight'] },
+  elemental:    { label: 'Elemental',    baseCost: 50,  ids: ['Fire', 'Water', 'Earth', 'Air'] },
+};
+export const skillModGroupIdFor = (skillId) =>
+  Object.keys(SKILL_MOD_GROUPS).find(g => SKILL_MOD_GROUPS[g].ids.includes(skillId)) || null;
+// Cost in Hexas to buy tier `nextTier` (1-based) of a stat on `skillId` --
+// climbs with every purchase so maxing a skill out is a real, escalating
+// investment rather than a flat repeated buy.
+export const skillModTierCost = (skillId, nextTier) => {
+  const groupId = skillModGroupIdFor(skillId);
+  const baseCost = groupId ? SKILL_MOD_GROUPS[groupId].baseCost : SKILL_MOD_GROUPS.foundational.baseCost;
+  return baseCost * nextTier;
+};
+
+// The 4 base elements as modifier targets, keyed the same way
+// player.element is (see ELEMENTS.base in GridBattlerGame.jsx) -- upgrading
+// one spends a matching elemental Core per tier on top of the Hexas cost,
+// same idea as the Core/Foundational BATTLE_SKILLS (imported directly by
+// CraftingScreen.jsx, not duplicated here) needing Hexas alone.
+export const MODIFIABLE_ELEMENTS = [
+  { id: 'Fire',  name: 'Fire',  icon: el.Fire.icon,  color: el.Fire.color,  coreId: 'fireCore' },
+  { id: 'Water', name: 'Water', icon: el.Water.icon, color: el.Water.color, coreId: 'waterCore' },
+  { id: 'Earth', name: 'Earth', icon: el.Earth.icon, color: el.Earth.color, coreId: 'earthCore' },
+  { id: 'Air',   name: 'Air',   icon: el.Air.icon,   color: el.Air.color,   coreId: 'airCore' },
+];
+
 // ─── BATTLE ACQUISITION ──────────────────────────────────────────────────
 // Campaign enemy rank doubles as a drop-odds tier, same as it doubles as an
 // HP tier (see RANK_HP in GridBattlerGame.jsx). Every Campaign enemy always

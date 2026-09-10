@@ -9,7 +9,9 @@ lerna-debug.log*
 
 node_modules
 dist
+dist-mobile
 dist-ssr
+mobile-artifact/output.html
 *.local
 
 # Editor directories and files

@@ -1,0 +1,63 @@
+<title>Paradigm Mobile</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Advent+Pro:wght@400;600;700&family=Rajdhani:wght@400;500;600;700&family=Share+Tech+Mono&display=swap" rel="stylesheet" />
+<style>
+  /* Wrapper shell only -- honors the game's own established dark
+     cyberpunk system (near-black ground, cyan accent, light-blue text,
+     Advent Pro / Rajdhani / Share Tech Mono) rather than inventing a new
+     one. The game is hardcoded dark throughout with no light-theme
+     variants anywhere in its ~30 components, so this shell commits to
+     that same single dark world deliberately, painting every color
+     explicitly rather than relying on the viewer's theme. */
+  :root {
+    --pdm-bg: #0a0a0a;
+    --pdm-accent: #00c8ff;
+    --pdm-text: #b0dff4;
+    --pdm-dim: #3a6a8a;
+  }
+  html, body { margin: 0; background: var(--pdm-bg); }
+  #root { min-height: 100svh; background: var(--pdm-bg); }
+
+  .pdm-loading {
+    position: fixed;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 14px;
+    background: var(--pdm-bg);
+    color: var(--pdm-text);
+    font-family: 'Rajdhani', sans-serif;
+  }
+  .pdm-loading .pdm-mark {
+    font-family: 'Advent Pro', sans-serif;
+    font-size: 1.6rem;
+    font-weight: 700;
+    letter-spacing: 0.2em;
+    text-transform: uppercase;
+    color: var(--pdm-accent);
+    text-shadow: 0 0 24px rgba(0, 200, 255, 0.45);
+  }
+  .pdm-loading .pdm-status {
+    font-size: 0.72rem;
+    letter-spacing: 0.25em;
+    text-transform: uppercase;
+    color: var(--pdm-dim);
+    font-family: 'Share Tech Mono', monospace;
+  }
+  .pdm-loading .pdm-ring {
+    width: 34px;
+    height: 34px;
+    border-radius: 50%;
+    border: 2px solid rgba(0, 200, 255, 0.18);
+    border-top-color: var(--pdm-accent);
+    animation: pdm-spin 0.9s linear infinite;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .pdm-loading .pdm-ring { animation: none; }
+  }
+  @keyframes pdm-spin { to { transform: rotate(360deg); } }
+
+  /* --- begin built app CSS (dist-mobile/assets/mobile-*.css) --- */

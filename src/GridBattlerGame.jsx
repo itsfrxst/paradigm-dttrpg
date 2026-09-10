@@ -20,9 +20,9 @@ export const ELEMENTS = {
       dice:['d4','d4'],
       color:'#ff6b00',
       icon:'🔥',
-      description:'Roll 2×d4. Die 1 = pulse count. Die 2 = dmg per pulse ×20. Rolling 3+ pulses also sets the target Burning: 10 dmg at the start of each of their next 2 turns. Cost: 3 Energy fixed.',
+      description:'Roll 2×d4. Die 1 = pulse count. Die 2 = dmg per pulse ×20. Rolling 3+ pulses also sets the target Burning (10 dmg at the start of each of their next 2 turns) and Scorches their tile into a Fire tile. Cost: 3 Energy fixed.',
       isFire: true,
-      base:{name:'Ember Strike',desc:'pulses × dmg × 20; 3+ pulses also Burns (10 dmg, 2 turns)',damage:0},
+      base:{name:'Ember Strike',desc:'pulses × dmg × 20; 3+ pulses also Burns (10 dmg, 2 turns) and Scorches the tile',damage:0},
       thresholds:[],
       tierFormula:()=>0,
       accuracyApplies:true,
@@ -32,9 +32,9 @@ export const ELEMENTS = {
       dice:['d20'],
       color:'#4aafee',
       icon:'🌊',
-      description:'Roll d20. Dual-aspect matrix sets damage (50/80/120) and AoE (single/cross/spread). Range: 2 tiles forward. A roll of 10+ also Floods the anchor (center) tile into a Water tile. Cost scales 2/6/10 by AoE.',
+      description:'Roll d20. Dual-aspect matrix sets damage (50/80/120) and AoE (single/cross/spread). Range: 2 tiles forward. A roll of 10+ also Floods the whole cast footprint into Water tiles — just the anchor for Single, 5 tiles for Cross, all 9 for Spread. Cost scales 2/6/10 by AoE.',
       isWater: true,
-      base:{name:'Torrent',desc:'d20 dual-aspect: damage × AoE; 10+ Floods the anchor tile',damage:0},
+      base:{name:'Torrent',desc:'d20 dual-aspect: damage × AoE; 10+ Floods the whole footprint',damage:0},
       thresholds:[],
       tierFormula:()=>0,
       accuracyApplies:true,
@@ -43,9 +43,9 @@ export const ELEMENTS = {
       dice:['d6'],
       color:'#c49a52',
       icon:'🪨',
-      description:'Roll d6. Damage = roll×20. Max reach = floor(roll/2) tiles forward — commit exactly enough to reach and it\'s a cheap, clean hit; commit farther than needed and every other tile in that span cracks into rubble (an obstacle blocking movement and skills until destroyed). A pre-existing obstacle stops the shockwave cold. Cost: 1 + chosen tiles.',
+      description:'Roll d6. Damage = roll×40. Max reach = floor(roll/2) tiles forward — commit exactly enough to reach and it\'s a cheap, clean hit; commit farther than needed and every other tile in that span cracks into rubble (an obstacle blocking movement and skills until destroyed). A pre-existing obstacle stops the shockwave cold. Cost: 1 + chosen tiles.',
       isEarth: true,
-      base:{name:'Tremor',desc:'roll×20 dmg; overreach turns spare tiles into rubble',damage:0},
+      base:{name:'Tremor',desc:'roll×40 dmg; overreach turns spare tiles into rubble',damage:0},
       thresholds:[],
       tierFormula:()=>0,
       accuracyApplies:true,
@@ -110,10 +110,13 @@ export const ELEMENTS = {
   },
 };
 export const getXPThreshold = (level) => Math.floor(1000 * Math.pow(level, 1.5));
-// Per-die damage multiplier for Fire / Earth / Air base skills (v4.3: 10 -> 20).
+// Per-die damage multiplier for Fire / Air base skills (v4.3: 10 -> 20).
 // Raises skill output so a skill reliably out-damages an equivalent melee stack.
-// Water uses its own fixed tiers in resolveTorrent instead.
+// Water uses its own fixed tiers in resolveTorrent instead. Earth uses its own
+// higher multiplier (EARTH_DICE_MULT) rather than this one -- its single d6
+// needs to hit harder than Fire/Air's two-factor rolls to stay competitive.
 const SKILL_DICE_MULT = 20;
+const EARTH_DICE_MULT = 40;
 const rollDie = (sides) => Math.floor(Math.random() * sides) + 1;
 const rollD100Accuracy = () => Math.floor(Math.random() * 91) + 10;
 const rollD100 = () => Math.floor(Math.random() * 100) + 1;
@@ -134,6 +137,15 @@ const applyAccuracy = (base, roll) => {
 // Label for a given accuracy roll's tier (for combat-log clarity).
 const accuracyTierLabel = (roll) => roll>=ACCURACY_FULL ? 'full' : roll>=ACCURACY_HALF ? 'half' : 'quarter';
 const rollD12Energy = () => rollDie(12);
+// Decides who acts first each round in Gauntlet/Training (1v1) matches --
+// a d12 roll-off, rerolled on ties, entirely separate from either side's own
+// Energy-pool d12 roll (does not consume or affect it). Not used by Campaign,
+// which keeps its fixed Summons -> Player -> Enemy order.
+const rollInitiative = () => {
+  let p, e;
+  do { p = rollD12Energy(); e = rollD12Energy(); } while(p === e);
+  return { winner: p > e ? 'player' : 'enemy', p, e };
+};
 
 const getSkillCost = (category, elementName) => {
   const el = ELEMENTS[category]?.[elementName];
@@ -177,6 +189,34 @@ const getMoveCandidatesWithReroute = (from, to) => {
   const allDirs = [{x:from.x+1,y:from.y},{x:from.x-1,y:from.y},{x:from.x,y:from.y+1},{x:from.x,y:from.y-1}];
   const detour = allDirs.filter(m=>!primary.some(p=>p.x===m.x&&p.y===m.y));
   return [...primary, ...detour];
+};
+
+// How many tiles an enemy's approach step covers per AI action — previously
+// hardcoded to 1, which read as sluggish next to how far a player can dash
+// in a single move click. Still capped by available Energy (1 AP/tile), same
+// economy as before, just no longer stopping after the first tile.
+const ENEMY_MOVE_SPEED = 2;
+
+// Greedily walks up to `speed` tiles toward `goal` (re-picking the dominant
+// direction each step via getMoveToward, same as the old single-step logic,
+// so it still curves around a blocked lane instead of giving up outright),
+// stopping early if a step would land on `blockers`, wouldn't reduce
+// remaining distance, the goal is reached, or `actionpts` runs out. Returns
+// {pos, facing, steps} — `steps` is how many tiles were actually taken (0 if
+// none were possible, same meaning as the old "not moved" case).
+const walkTowardGoal = (fromPos, fromFacing, goal, blockers, actionpts, speed) => {
+  let pos=fromPos, facing=fromFacing, steps=0;
+  while(steps<speed && steps<actionpts){
+    const curDist=manhattan(pos,goal);
+    if(curDist===0) break;
+    const moves=getMoveToward(pos.x,pos.y,goal.x,goal.y);
+    const next=moves.find(m=>m.x>=0&&m.x<SIZE&&m.y>=0&&m.y<SIZE&&manhattan(m,goal)<curDist&&!blockers.some(b=>b.x===m.x&&b.y===m.y));
+    if(!next) break;
+    facing=facingFromMove(pos,next);
+    pos=next;
+    steps++;
+  }
+  return {pos,facing,steps};
 };
 
 const isAdjacent = (a,b) => { const dx=Math.abs(a.x-b.x),dy=Math.abs(a.y-b.y); return (dx===1&&dy===0)||(dx===0&&dy===1); };
@@ -242,22 +282,28 @@ const getForwardTiles = (pos, facing, count) => {
 };
 
 // Knocks `targetPos` back `distance` tiles along `castFacing`, going as far
-// as it can and stopping at the board edge ("hits a wall") or if it would
-// land on `blockerPos` (the caster's own tile). Always returns a valid tile
-// — the original position if it can't move at all. Used for Air Gale Force
-// knockback, whose distance is now roll-minus-range (see airGaleForceDamage
-// for the matching roll-based damage table).
-const getKnockbackTile = (targetPos, castFacing, distance, blockerPos) => {
+// as it can and stopping at the board edge ("hits a wall"), a unit blocker
+// (the caster's own tile, another combatant), or rubble. Always returns a
+// valid tile — the original position if it can't move at all. `obstacles`
+// is the actual rubble list (not just positions) so a stop caused by rubble
+// specifically can be reported back as `hitObstacle` — callers use that to
+// deal the knockback's own collision damage into it (a unit blocker, by
+// contrast, isn't a destructible thing and takes no collision damage). Used
+// for Air Gale Force knockback, whose distance is now roll-minus-range (see
+// airGaleForceDamage for the matching roll-based damage table).
+const getKnockbackTile = (targetPos, castFacing, distance, unitBlockers=[], obstacles=[]) => {
   const dir = {up:{dx:0,dy:-1},down:{dx:0,dy:1},left:{dx:-1,dy:0},right:{dx:1,dy:0}}[castFacing]||{dx:0,dy:1};
-  const blockers = blockerPos ? (Array.isArray(blockerPos)?blockerPos:[blockerPos]) : [];
-  let x=targetPos.x, y=targetPos.y;
+  const blockers = unitBlockers ? (Array.isArray(unitBlockers)?unitBlockers:[unitBlockers]) : [];
+  let x=targetPos.x, y=targetPos.y, hitObstacle=null;
   for(let i=0;i<distance;i++){
     const nx=x+dir.dx, ny=y+dir.dy;
     if(nx<0||nx>=SIZE||ny<0||ny>=SIZE) break;
     if(blockers.some(b=>nx===b.x&&ny===b.y)) break;
+    const obs=obstacles.find(o=>o.boardPosition.x===nx&&o.boardPosition.y===ny);
+    if(obs){ hitObstacle=obs; break; }
     x=nx; y=ny;
   }
-  return {x,y};
+  return {x,y,hitObstacle};
 };
 // Air Gale Force's damage table — flat multiples of SKILL_DICE_MULT (20) so
 // it adds up in your head at the table: 40/60/80/100/120/140/160/180 for
@@ -568,11 +614,15 @@ const makeObstacle = (pos) => ({ id:`OBS${++OBSTACLE_SEQ}`, boardPosition:pos, h
 // that span into rubble, in front of AND behind the target. A tile a target
 // occupies never turns to rubble; a pre-existing obstacle instead stops the
 // shockwave cold (nothing beyond it is affected, and it takes the hit
-// itself) — rubble doesn't crack through rubble. `occupiedExtra` is every
-// other tile that should block a *new* obstacle from spawning there (other
-// targets not being hit this cast, summons, etc) without itself stopping
-// the shockwave.
-const resolveEarthTremor = (origin, chosenRange, targets, obstacles, occupiedExtra=[]) => {
+// itself — an Earth cast reinforces/heals rubble it strikes rather than
+// damaging it, see the `heal:true` obstacleHit callers) — rubble doesn't
+// crack through rubble. `occupiedExtra` is every other tile that should
+// block a *new* obstacle from spawning there (other targets not being hit
+// this cast, summons, etc) without itself stopping the shockwave. `tiles`
+// is the terrain grid — a Healing tile is excluded from `newObstacleTiles`
+// the same way an occupied tile is, so a shockwave can't bury it under
+// rubble.
+const resolveEarthTremor = (origin, chosenRange, targets, obstacles, occupiedExtra=[], tiles=null) => {
   const rawLine = getForwardTiles(origin.boardPosition, origin.facing, chosenRange);
   let span = rawLine;
   let hitObstacle = null;
@@ -587,7 +637,7 @@ const resolveEarthTremor = (origin, chosenRange, targets, obstacles, occupiedExt
   // it, not what's closer than itself).
   const hitTarget = targets.find(e=>span.some(t=>t.x===e.boardPosition.x&&t.y===e.boardPosition.y));
   const occupied = [...obstacles.map(o=>o.boardPosition), ...occupiedExtra];
-  const newObstacleTiles = span.filter(t=>!occupied.some(o=>o.x===t.x&&o.y===t.y));
+  const newObstacleTiles = span.filter(t=>!occupied.some(o=>o.x===t.x&&o.y===t.y) && !(tiles && tiles[t.y][t.x]===TILE_TYPES.HEALING));
   return { span, hitObstacle: hitTarget?null:hitObstacle, hitTarget, newObstacleTiles };
 };
 
@@ -811,7 +861,7 @@ const ENEMY_CLASS_POOL = ['Summoner','Rogue'];
 // themselves) -- matches how the finale boss already mirrors the player's
 // own loadout/element 1-for-1. See rollEnemyDrop (ItemData.jsx) for how
 // this same rank also sets a defeated enemy's drop odds.
-const RANK_HP = { 4:250, 3:500, 2:750, 1:1000 };
+const RANK_HP = { 4:150, 3:300, 2:500, 1:1000 };
 
 let ENEMY_SEQ = 0;
 const makeEnemyProxie = (rank, level, pos, { element=null, loadout=[], isBoss=false, hp=null } = {}) => {
@@ -891,14 +941,14 @@ const spawnCampaignRoster = (stage, playerPos, mirror=null) => {
 // floors, Water AoE, Air knockback), extracted here so every Campaign enemy
 // with an element gets the identical mechanics rather than a stand-in.
 // Returns null if the attacker has no element.
-const computeElementalStrike = (attacker, target, tiles, obstacles=[]) => {
+const computeElementalStrike = (attacker, target, tiles, obstacles=[], occupiedExtra=[]) => {
   const elData = attacker.element ? ELEMENTS[attacker.elementCategory]?.[attacker.element] : null;
   if(!elData) return null;
   const rolls = elData.dice.map(d=>({type:d,value:rollDie(parseInt(d.slice(1)))}));
   const ranged = elData.isEarth||elData.isAir||elData.isWater;
   const castFacing = ranged ? facingToward(attacker.boardPosition,target.boardPosition) : attacker.facing;
   let dmg=0, eCost=getSkillCost(attacker.elementCategory, attacker.element), knockbackPos=null, log='';
-  let obstacleHit=null, newObstacles=[], appliesBurn=false, floodTile=null;
+  let obstacleHit=null, newObstacles=[], appliesBurn=false, floodTiles=null, scorchTile=null;
 
   if(elData.isFire){
     const pulses=rolls[0].value, dmgEach=rolls[1].value;
@@ -910,23 +960,26 @@ const computeElementalStrike = (attacker, target, tiles, obstacles=[]) => {
     const tileBoost=getTileBoost(tiles,attacker.boardPosition,'Fire');
     if(tileBoost>0) dmg+=tileBoost;
     appliesBurn=pulses>=3;
-    log=`${attacker.name} Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${tileBoost>0?' [Fire tile +20]':''}${appliesBurn?' [Burn]':''}`;
+    // Scorch: a strong enough pulse count (3+, same threshold as Burn)
+    // leaves the struck tile smoldering as a Fire tile.
+    if(appliesBurn) scorchTile=target.boardPosition;
+    log=`${attacker.name} Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${tileBoost>0?' [Fire tile +20]':''}${appliesBurn?' [Burn]':''}${scorchTile?' [Scorch]':''}`;
   } else if(elData.isEarth){
     const dieRoll=rolls[0].value;
     const maxRange=Math.max(1,Math.floor(dieRoll/2));
     const chosenRange=Math.max(1,Math.min(maxRange, attacker.actionpts-1));
     const {hitObstacle,hitTarget,newObstacleTiles}=resolveEarthTremor(
-      {boardPosition:attacker.boardPosition,facing:castFacing}, chosenRange, [target], obstacles, [target.boardPosition]
+      {boardPosition:attacker.boardPosition,facing:castFacing}, chosenRange, [target], obstacles, [target.boardPosition, ...occupiedExtra], tiles
     );
-    const base=dieRoll*SKILL_DICE_MULT;
+    const base=dieRoll*EARTH_DICE_MULT;
     const acc=rollD100Accuracy();
     const tileBoost=getTileBoost(tiles,attacker.boardPosition,'Earth');
     const rawDmg=Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost;
     dmg = hitTarget ? rawDmg : 0;
-    if(hitObstacle) obstacleHit={id:hitObstacle.id, dmg:rawDmg};
+    if(hitObstacle) obstacleHit={id:hitObstacle.id, dmg:rawDmg, heal:true};
     newObstacles = newObstacleTiles.map(t=>makeObstacle(t));
     eCost=1+chosenRange;
-    const outcome = hitTarget ? `${dmg} dmg` : hitObstacle ? `struck rubble instead` : 'MISS';
+    const outcome = hitTarget ? `${dmg} dmg` : hitObstacle ? `reinforced rubble instead` : 'MISS';
     log=`${attacker.name} Tremor [d6=${dieRoll}, ${chosenRange} tile${chosenRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${outcome}${newObstacles.length>0?` (+${newObstacles.length} rubble)`:''}`;
   } else if(elData.isAir){
     const dieRoll=rolls[0].value;
@@ -947,15 +1000,22 @@ const computeElementalStrike = (attacker, target, tiles, obstacles=[]) => {
     const rawDmg=Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost;
     dmg=hit?rawDmg:0;
     eCost=2;
+    let knockedIntoRubble=false;
     if(hit){
       // Whatever roll wasn't spent reaching the target becomes knockback
-      // distance, minimum 1 tile, traveling until it hits a wall.
+      // distance, minimum 1 tile, traveling until it hits a wall or rubble.
+      // A rubble collision stops the knockback one tile short and deals the
+      // same collision damage a direct hit would, same as the "blocked"
+      // line-hit case below — it's how rubble in the open, not just rubble
+      // in a caster's own line, ends up destructible by Air.
       const knockDist=Math.max(1,dieRoll-targetDist);
-      knockbackPos=getKnockbackTile(target.boardPosition,castFacing,knockDist,[attacker.boardPosition,...obstacles.map(o=>o.boardPosition)]);
+      const kb=getKnockbackTile(target.boardPosition,castFacing,knockDist,[attacker.boardPosition],obstacles);
+      knockbackPos={x:kb.x,y:kb.y};
+      if(kb.hitObstacle){ obstacleHit={id:kb.hitObstacle.id, dmg:rawDmg}; knockedIntoRubble=true; }
     } else if(blocked){
       obstacleHit={id:lineObstacle.obstacle.id, dmg:rawDmg};
     }
-    log=`${attacker.name} Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg':blocked?'struck rubble instead':'MISS'}`;
+    log=`${attacker.name} Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg'+(knockedIntoRubble?' [knocked into rubble]':''):blocked?'struck rubble instead':'MISS'}`;
   } else if(elData.isWater){
     const dieRoll=rolls[0].value;
     const res=resolveTorrent(dieRoll);
@@ -978,13 +1038,13 @@ const computeElementalStrike = (attacker, target, tiles, obstacles=[]) => {
       const tileBoost=getTileBoost(tiles,attacker.boardPosition,'Water');
       dmg=hit?applyAccuracy(res.damage,acc)+tileBoost:0;
       // Flood: a strong enough torrent (d20 >= 10) reshapes the ground it
-      // lands on into a Water tile, regardless of whether it actually hit —
-      // only the anchor (center) tile floods, not the whole footprint.
-      if(dieRoll>=10) floodTile=anchor;
-      log=`${attacker.name} Torrent [d20=${dieRoll}, ${AOE_LABEL[chosen.aoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg':'MISS'}${floodTile?' [Flood]':''}`;
+      // lands on into Water tiles, regardless of whether it actually hit —
+      // the whole AoE footprint floods, matching the cast's chosen AoE size.
+      if(dieRoll>=10) floodTiles=footprint;
+      log=`${attacker.name} Torrent [d20=${dieRoll}, ${AOE_LABEL[chosen.aoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg':'MISS'}${floodTiles?' [Flood]':''}`;
     }
   }
-  return { dmg, eCost, castFacing, knockbackPos, log, obstacleHit, newObstacles, appliesBurn, floodTile };
+  return { dmg, eCost, castFacing, knockbackPos, log, obstacleHit, newObstacles, appliesBurn, floodTiles, scorchTile };
 };
 
 // Whether `attacker`'s equipped element could plausibly land on `target`
@@ -1041,23 +1101,27 @@ const computePulseWaveDamage = (attacker) => {
 // Longshot Protocol — a passive diagonal snipe. Walks each of the 4
 // diagonals out from `moverPos` up to LONGSHOT_RANGE tiles; the first thing
 // found along a line wins that line — a target there gets sniped, anything
-// else there blocks the rest of that line's line of sight. Checked once
-// right after a genuine repositioning move (see handleSquareClick /
+// else there blocks the rest of that line's line of sight. Each of the 4
+// diagonals is independent, so a target sitting on one line doesn't stop
+// another target on a different line from also being sniped in the same
+// trigger — every diagonal that finds a target lands simultaneously. Checked
+// once right after a genuine repositioning move (see handleSquareClick /
 // runEnemyTurn's approach-move branch) — melee and other skills that happen
-// to also change boardPosition don't re-trigger it. Pure — returns the unit
-// hit (or null), no state writes.
+// to also change boardPosition don't re-trigger it. Pure — returns the list
+// of units hit (possibly empty), no state writes.
 const LONGSHOT_RANGE = 3;
 const LONGSHOT_DMG = 10;
 const checkLongshotProtocol = (moverPos, targets, blockers) => {
+  const hits=[];
   for(const dir of DIAGONAL_DIRS){
     const line = getAxisLine(moverPos, dir, LONGSHOT_RANGE);
     for(const tile of line){
       const hit = targets.find(t=>t.health>0&&t.boardPosition.x===tile.x&&t.boardPosition.y===tile.y);
-      if(hit) return hit;
+      if(hit){ hits.push(hit); break; }
       if(blockers.some(b=>b.x===tile.x&&b.y===tile.y)) break;
     }
   }
-  return null;
+  return hits;
 };
 
 // Auto-resolves every un-acted-this-round summon owned by `thisEnemy` in one
@@ -1142,7 +1206,7 @@ const resolveEnemyClassSkill = (thisEnemy, currentPlayer, currentSummons, tiles,
     const facing = piercingLightFacing(thisEnemy.boardPosition, currentPlayer.boardPosition);
     if(facing) return { kind:'piercingLight', skillId:'piercingLight', facing };
   }
-  if(has('pulseWave',4) && thisEnemy.element){
+  if(has('pulseWave',3) && thisEnemy.element){
     const dir = findAxisDirection(thisEnemy.boardPosition, currentPlayer.boardPosition);
     if(dir){
       const dist = Math.max(Math.abs(currentPlayer.boardPosition.x-thisEnemy.boardPosition.x),Math.abs(currentPlayer.boardPosition.y-thisEnemy.boardPosition.y));
@@ -1256,7 +1320,7 @@ export const BATTLE_SKILLS = [
     id:'pulseWave', category:'tactical',
     name:'Pulse Wave', icon:'♛', color:'#c9a7f7',
     tagline:'A second cast of your own element, at a different range.',
-    blurb:'Fires a line of your equipped element 3 tiles out, in any of the 8 directions — hitting everyone caught along it. Uses your element\'s own dice, with no range or AoE scaling applied. 4 Energy, once per turn.',
+    blurb:'Fires a line of your equipped element 3 tiles out, in any of the 8 directions — hitting everyone caught along it. Uses your element\'s own dice, with no range or AoE scaling applied. 3 Energy, once per turn.',
   },
   {
     id:'longshotProtocol', category:'tactical',
@@ -1458,11 +1522,17 @@ const LoadoutModal = ({show, loadout, onToggle, onConfirm, onClose, freeSelect, 
 // (loadout unlocks after a boss kill) and Training's Battle Skills scene
 // (free swapping), Campaign locks these choices in up front, like loading
 // into a real run.
-const CampaignIntroModal = ({show, onSubmit, craftedSkillIds=[]}) => {
-  const [name, setName] = useState('');
-  const [loadout, setLoadout] = useState([]);
-  const [element, setElement] = useState(null);
-  if(!show) return null;
+// The character-build form: name, loadout (Core + Tactical skills, same
+// caps Campaign always enforced), and element. Used by CharacterScreen.jsx
+// to create/edit one of a player's up to-3 saved Proxy builds -- Campaign
+// itself no longer collects this mid-battle (see the `character` prop on
+// the main component below), it just requires one of these to already
+// exist. Exported so CharacterScreen can render it without duplicating
+// BATTLE_SKILLS/cap logic.
+export const CharacterCreatorForm = ({ initial, craftedSkillIds=[], onSubmit, onCancel, submitLabel='Save' }) => {
+  const [name, setName] = useState(initial?.name || '');
+  const [loadout, setLoadout] = useState(initial?.loadout || []);
+  const [element, setElement] = useState(initial?.element || null);
   const canSubmit = name.trim().length>0 && loadout.length>0 && element;
   const elMeta = element ? ELEMENTS.base[element] : null;
   const tactical = BATTLE_SKILLS.filter(s=>s.category==='tactical');
@@ -1482,50 +1552,19 @@ const CampaignIntroModal = ({show, onSubmit, craftedSkillIds=[]}) => {
     });
   };
   return (
-    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.9)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:5000,padding:'2rem'}}>
-      <div style={{background:'#080e14',border:'2px solid #cc4422',borderRadius:12,padding:'1.6rem',maxWidth:520,width:'100%',maxHeight:'90vh',overflowY:'auto',color:'#b0dff4',boxShadow:'0 0 50px rgba(204,68,34,0.4)'}}>
-        <div style={{textAlign:'center',marginBottom:18}}>
-          <div style={{fontSize:'11px',letterSpacing:'0.2em',textTransform:'uppercase',color:'#cc4422'}}>// Campaign — New Proxie</div>
-          <h2 style={{fontSize:'1.3rem',letterSpacing:'0.1em',textTransform:'uppercase',color:'#ff8866',marginTop:6}}>Load Into the Grid</h2>
-          <div style={{fontSize:'11px',color:'#5a7a8a',marginTop:4}}>Name your Proxie, choose its loadout and element. These lock in for the run.</div>
-        </div>
+    <div>
+      <div style={{marginBottom:16}}>
+        <div style={{fontSize:'10px',color:'#3a5a6a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:6}}>Proxie Name</div>
+        <input value={name} onChange={e=>setName(e.target.value)} maxLength={24} placeholder="e.g. Specter.EXE"
+          style={{width:'100%',padding:'9px 12px',background:'#0a1218',border:'1px solid #1e3a4a',borderRadius:6,color:'#b0dff4',fontSize:14,fontFamily:"'Rajdhani',sans-serif"}} />
+      </div>
 
-        <div style={{background:'#0a1218',border:'1px solid #cc442244',borderRadius:8,padding:'12px 14px',marginBottom:18,fontSize:12,color:'#7a9db5',lineHeight:1.6,fontStyle:'italic'}}>
-          {CAMPAIGN_BATTLES[0].narrative}
-        </div>
-
+      {availableCore.length>0&&(
         <div style={{marginBottom:16}}>
-          <div style={{fontSize:'10px',color:'#3a5a6a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:6}}>Proxie Name</div>
-          <input value={name} onChange={e=>setName(e.target.value)} maxLength={24} placeholder="e.g. Specter.EXE"
-            style={{width:'100%',padding:'9px 12px',background:'#0a1218',border:'1px solid #1e3a4a',borderRadius:6,color:'#b0dff4',fontSize:14,fontFamily:"'Rajdhani',sans-serif"}} />
-        </div>
-
-        {availableCore.length>0&&(
-          <div style={{marginBottom:16}}>
-            <div style={{fontSize:'10px',color:'#3a5a6a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:6}}>Loadout — Core Skills (pick up to {CORE_SKILL_CAP})</div>
-            {availableCore.map(s=>{
-              const picked = loadout.includes(s.id);
-              const disabled = !picked && coreCount>=CORE_SKILL_CAP;
-              return (
-                <div key={s.id} onClick={()=>!disabled&&toggleSkill(s.id)}
-                  style={{background:'#0a1218',border:`1px solid ${picked?s.color:s.color+'44'}`,borderRadius:8,padding:'10px 12px',marginBottom:8,cursor:disabled?'not-allowed':'pointer',opacity:disabled?0.5:1,boxShadow:picked?`0 0 12px ${s.color}55`:'none'}}>
-                  <div style={{display:'flex',alignItems:'center',gap:8}}>
-                    <span style={{fontSize:18}}>{s.icon}</span>
-                    <span style={{fontSize:13,fontWeight:'bold',color:s.color}}>{s.name}</span>
-                    <span style={{fontSize:10,color:'#7a9db5',marginLeft:'auto'}}>{s.tagline}</span>
-                    {picked&&<span style={{fontSize:14,color:s.color}}>✓</span>}
-                  </div>
-                </div>
-              );
-            })}
-          </div>
-        )}
-
-        <div style={{marginBottom:16}}>
-          <div style={{fontSize:'10px',color:'#3a5a6a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:6}}>Loadout — Tactical Skills (pick up to {TACTICAL_SKILL_CAP})</div>
-          {tactical.map(s=>{
+          <div style={{fontSize:'10px',color:'#3a5a6a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:6}}>Loadout — Core Skills (pick up to {CORE_SKILL_CAP})</div>
+          {availableCore.map(s=>{
             const picked = loadout.includes(s.id);
-            const disabled = !picked && tacticalCount>=TACTICAL_SKILL_CAP;
+            const disabled = !picked && coreCount>=CORE_SKILL_CAP;
             return (
               <div key={s.id} onClick={()=>!disabled&&toggleSkill(s.id)}
                 style={{background:'#0a1218',border:`1px solid ${picked?s.color:s.color+'44'}`,borderRadius:8,padding:'10px 12px',marginBottom:8,cursor:disabled?'not-allowed':'pointer',opacity:disabled?0.5:1,boxShadow:picked?`0 0 12px ${s.color}55`:'none'}}>
@@ -1539,24 +1578,51 @@ const CampaignIntroModal = ({show, onSubmit, craftedSkillIds=[]}) => {
             );
           })}
         </div>
+      )}
 
-        <div style={{marginBottom:20}}>
-          <div style={{fontSize:'10px',color:'#3a5a6a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:6}}>Element</div>
-          <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
-            {Object.entries(ELEMENTS.base).map(([name2,d])=>(
-              <button key={name2} onClick={()=>setElement(name2)}
-                style={{flex:'1 0 40%',display:'flex',alignItems:'center',gap:6,padding:'8px 10px',background:element===name2?`${d.color}22`:'#0a1218',border:`1px solid ${element===name2?d.color:d.color+'44'}`,borderRadius:6,color:element===name2?d.color:'#b0dff4',cursor:'pointer'}}>
-                <span style={{fontSize:16}}>{d.icon}</span><span style={{fontWeight:'bold',fontSize:12}}>{name2}</span>
-              </button>
-            ))}
-          </div>
-          {elMeta&&<div style={{fontSize:10,color:'#7a9db5',marginTop:8,lineHeight:1.5}}>{elMeta.description}</div>}
+      <div style={{marginBottom:16}}>
+        <div style={{fontSize:'10px',color:'#3a5a6a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:6}}>Loadout — Tactical Skills (pick up to {TACTICAL_SKILL_CAP})</div>
+        {tactical.map(s=>{
+          const picked = loadout.includes(s.id);
+          const disabled = !picked && tacticalCount>=TACTICAL_SKILL_CAP;
+          return (
+            <div key={s.id} onClick={()=>!disabled&&toggleSkill(s.id)}
+              style={{background:'#0a1218',border:`1px solid ${picked?s.color:s.color+'44'}`,borderRadius:8,padding:'10px 12px',marginBottom:8,cursor:disabled?'not-allowed':'pointer',opacity:disabled?0.5:1,boxShadow:picked?`0 0 12px ${s.color}55`:'none'}}>
+              <div style={{display:'flex',alignItems:'center',gap:8}}>
+                <span style={{fontSize:18}}>{s.icon}</span>
+                <span style={{fontSize:13,fontWeight:'bold',color:s.color}}>{s.name}</span>
+                <span style={{fontSize:10,color:'#7a9db5',marginLeft:'auto'}}>{s.tagline}</span>
+                {picked&&<span style={{fontSize:14,color:s.color}}>✓</span>}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+
+      <div style={{marginBottom:20}}>
+        <div style={{fontSize:'10px',color:'#3a5a6a',textTransform:'uppercase',letterSpacing:'0.1em',marginBottom:6}}>Element</div>
+        <div style={{display:'flex',gap:8,flexWrap:'wrap'}}>
+          {Object.entries(ELEMENTS.base).map(([name2,d])=>(
+            <button key={name2} onClick={()=>setElement(name2)}
+              style={{flex:'1 0 40%',display:'flex',alignItems:'center',gap:6,padding:'8px 10px',background:element===name2?`${d.color}22`:'#0a1218',border:`1px solid ${element===name2?d.color:d.color+'44'}`,borderRadius:6,color:element===name2?d.color:'#b0dff4',cursor:'pointer'}}>
+              <span style={{fontSize:16}}>{d.icon}</span><span style={{fontWeight:'bold',fontSize:12}}>{name2}</span>
+            </button>
+          ))}
         </div>
+        {elMeta&&<div style={{fontSize:10,color:'#7a9db5',marginTop:8,lineHeight:1.5}}>{elMeta.description}</div>}
+      </div>
 
-        <button onClick={()=>canSubmit&&onSubmit(name.trim(),loadout,element)} disabled={!canSubmit}
-          style={{width:'100%',padding:13,background:canSubmit?'rgba(204,68,34,0.18)':'rgba(20,30,40,0.6)',border:`1px solid ${canSubmit?'#cc4422':'#1e3a4a'}`,borderRadius:6,color:canSubmit?'#ff8866':'#2a4a5e',fontSize:14,fontWeight:'bold',cursor:canSubmit?'pointer':'not-allowed',letterSpacing:'0.08em'}}>
-          {canSubmit ? 'Deploy to Battle 1' : 'Name your Proxie, pick a loadout and element'}
+      <div style={{display:'flex',gap:10}}>
+        <button onClick={()=>canSubmit&&onSubmit({name:name.trim(),loadout,element})} disabled={!canSubmit}
+          style={{flex:1,padding:13,background:canSubmit?'rgba(204,68,34,0.18)':'rgba(20,30,40,0.6)',border:`1px solid ${canSubmit?'#cc4422':'#1e3a4a'}`,borderRadius:6,color:canSubmit?'#ff8866':'#2a4a5e',fontSize:14,fontWeight:'bold',cursor:canSubmit?'pointer':'not-allowed',letterSpacing:'0.08em'}}>
+          {canSubmit ? submitLabel : 'Name your Proxie, pick a loadout and element'}
         </button>
+        {onCancel && (
+          <button onClick={onCancel}
+            style={{padding:'13px 18px',background:'rgba(90,125,150,0.15)',border:'1px solid #3a6a8a',borderRadius:6,color:'#7a9db5',fontSize:13,fontWeight:'bold',cursor:'pointer'}}>
+            Cancel
+          </button>
+        )}
       </div>
     </div>
   );
@@ -1755,6 +1821,14 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
   const hasPulseWave = loadout.includes('pulseWave');
   const hasPiercingLight = loadout.includes('piercingLight');
   const hasTacticalAction = hasCompassSlash || hasCircuitSigil || hasDarkWeb || hasPulseWave || hasPiercingLight;
+  // Campaign always renders alongside a floating "Main" nav button (see
+  // App.jsx) that already gets you out of the session — a second, separate
+  // Quit button next to it was pure redundancy. Training scenes have no such
+  // nav overlay (their Quit is the only way back to the Tutorial Hub), so
+  // this only suppresses it for Campaign specifically, via the same
+  // `enemies` truthiness that already distinguishes the two everywhere else
+  // in this component.
+  const hideQuit = !!enemies;
   return (
     <div style={{flex:1,display:'flex',flexDirection:'column',overflow:'hidden',minHeight:0,height:'100%'}}>
         {/* Scrollable body — stats columns live here so they can never push the
@@ -1861,10 +1935,12 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
                 ROLL ENERGY
                 <div style={{fontSize:'9px',opacity:0.75,marginTop:1}}>d12{player.energyRollover>0?` + ${player.energyRollover} rollover`:''}</div>
               </button>
-              <button onClick={onSurrender}
-                style={{flex:1,padding:'9px 6px',background:'transparent',border:'1px solid #1e3a4a',borderRadius:'4px',color:'#3a6a8a',fontSize:'12px',fontWeight:600,cursor:'pointer',letterSpacing:'.05em',fontFamily:"'Rajdhani',sans-serif"}}>
-                QUIT
-              </button>
+              {!hideQuit && (
+                <button onClick={onSurrender}
+                  style={{flex:1,padding:'9px 6px',background:'transparent',border:'1px solid #1e3a4a',borderRadius:'4px',color:'#3a6a8a',fontSize:'12px',fontWeight:600,cursor:'pointer',letterSpacing:'.05em',fontFamily:"'Rajdhani',sans-serif"}}>
+                  QUIT
+                </button>
+              )}
             </>
           ) : showActions ? (
             <>
@@ -1903,7 +1979,7 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
               {hasPulseWave&&(
                 <button onClick={onPulseWave} disabled={!canPulseWave}
                   style={{flex:1.2,padding:'7px 4px',background:canPulseWave?'rgba(201,167,247,0.18)':'rgba(20,30,40,0.6)',border:`1px solid ${canPulseWave?'#c9a7f7':'#1e3a4a'}`,borderRadius:'4px',color:canPulseWave?'#c9a7f7':'#2a4a5e',fontSize:'11px',fontWeight:600,cursor:canPulseWave?'pointer':'not-allowed',letterSpacing:'.03em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
-                  PULSE WAVE<div style={{fontSize:'8px',opacity:0.7}}>{player.usedSkillIds.includes('pulseWave')?'used':'4E'}</div>
+                  PULSE WAVE<div style={{fontSize:'8px',opacity:0.7}}>{player.usedSkillIds.includes('pulseWave')?'used':'3E'}</div>
                 </button>
               )}
               {hasPiercingLight&&(
@@ -1916,17 +1992,19 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
                 style={{flex:1,padding:'7px 4px',background:'rgba(0,200,100,0.1)',border:'1px solid #1e6a3a',borderRadius:'4px',color:'#00cc66',fontSize:'11px',fontWeight:600,cursor:'pointer',letterSpacing:'.04em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
                 END<div style={{fontSize:'8px',opacity:0.7}}>{player.actionpts>0?`save ${player.actionpts}E`:'0E left'}</div>
               </button>
-              <button onClick={onSurrender}
-                style={{flex:0.7,padding:'7px 4px',background:'transparent',border:'1px solid #1e3a4a',borderRadius:'4px',color:'#3a6a8a',fontSize:'11px',fontWeight:600,cursor:'pointer',letterSpacing:'.04em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
-                QUIT
-              </button>
+              {!hideQuit && (
+                <button onClick={onSurrender}
+                  style={{flex:0.7,padding:'7px 4px',background:'transparent',border:'1px solid #1e3a4a',borderRadius:'4px',color:'#3a6a8a',fontSize:'11px',fontWeight:600,cursor:'pointer',letterSpacing:'.04em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
+                  QUIT
+                </button>
+              )}
             </>
-          ) : (
+          ) : !hideQuit ? (
             <button onClick={onSurrender}
               style={{flex:1,padding:'7px 6px',background:'transparent',border:'1px solid #1e3a4a',borderRadius:'4px',color:'#3a6a8a',fontSize:'12px',fontWeight:600,cursor:'pointer',letterSpacing:'.05em',fontFamily:"'Rajdhani',sans-serif"}}>
               QUIT
             </button>
-          )}
+          ) : null}
         </div>
         {showPicker&&<ElementPickerModal selectedCategory={selectedCategory} selectedElement={selectedElement} onSelect={onElementSelect} onClose={()=>setShowPicker(false)} restrictToBase={restrictElementsToBase} />}
     </div>
@@ -2116,7 +2194,7 @@ const EarthTremorSection = ({rolls, rolling, onRoll, phase, accuracyRoll, onRoll
   // Always at least 1 tile of range, even on the worst roll (d6=1) — a Tremor
   // should never be an unusable wasted turn.
   const maxRange = dieRoll !== null ? Math.max(1, Math.floor(dieRoll / 2)) : 0;
-  const baseDmg  = dieRoll !== null ? dieRoll * SKILL_DICE_MULT : null;
+  const baseDmg  = dieRoll !== null ? dieRoll * EARTH_DICE_MULT : null;
   const cost     = earthRange ? 1 + earthRange : null;
 
   // Preview of what a given reach `r` actually does, mirroring
@@ -2543,6 +2621,112 @@ const RewardModal = ({show,html}) => {
   return <div style={{position:'fixed',top:'50%',left:'50%',transform:'translate(-50%,-50%)',background:'#080e14',border:'2px solid #00c8ff',boxShadow:'0 0 40px rgba(0,200,255,0.5)',padding:'2rem',borderRadius:10,zIndex:1000,minWidth:300,maxWidth:'90vw',textAlign:'center',color:'#b0dff4'}} dangerouslySetInnerHTML={{__html:html}} />;
 };
 
+// Match-start ceremony, part 1: reveals the placement roll rather than it
+// just happening invisibly before the player sees the board. The roll
+// itself was already determined at character creation (newHero /
+// rollBackRowPosition) -- this animates a reveal of that value, same
+// roll-then-reveal pattern as DeployRollModal's d100 (see handlePlacementRoll).
+const PlacementRollModal = ({show, rolling, roll, onRoll, onContinue}) => {
+  if(!show) return null;
+  const isFree = roll===0;
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.85)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:4500}}>
+      <div style={{background:'#080e14',border:'2px solid #00c8ff',borderRadius:10,padding:'1.4rem',maxWidth:360,width:'92%',textAlign:'center',color:'#b0dff4',boxShadow:'0 0 40px rgba(0,200,255,0.4)'}}>
+        <div style={{fontSize:24}}>◈</div>
+        <h2 style={{fontSize:'1.05rem',letterSpacing:'0.12em',textTransform:'uppercase',color:'#00c8ff',marginTop:4}}>Placement Roll</h2>
+        <div style={{fontSize:'11px',color:'#5a7a8a',marginTop:2,marginBottom:16}}>d10 sets your back-row tile — a roll of 0 means free choice.</div>
+        <div style={{display:'flex',justifyContent:'center',marginBottom:16}}>
+          <DiceDisplay type="d10" value={roll!==null?roll:'--'} rolling={rolling} color="#00c8ff" label="Placement" />
+        </div>
+        {roll!==null && !rolling && (
+          <div style={{background:'#0a1218',border:'1px solid #00c8ff55',borderRadius:8,padding:'12px 14px',marginBottom:14}}>
+            {isFree
+              ? <div style={{fontSize:13,color:'#00c8ff'}}>Free placement! Choose any tile in your back row next.</div>
+              : <div style={{fontSize:13,color:'#00c8ff'}}>Placed at tile {roll}.</div>}
+          </div>
+        )}
+        {roll===null
+          ? <button onClick={onRoll} disabled={rolling}
+              style={{width:'100%',padding:14,background:'rgba(0,200,255,0.13)',color:'#00c8ff',border:'1px solid #00c8ff',borderRadius:6,fontSize:16,fontWeight:'bold',cursor:rolling?'not-allowed':'pointer',letterSpacing:'0.1em'}}>
+              {rolling?'Rolling...':'Roll Placement (d10)'}
+            </button>
+          : <button onClick={onContinue}
+              style={{width:'100%',padding:14,background:'rgba(0,200,255,0.13)',color:'#00c8ff',border:'1px solid #00c8ff',borderRadius:6,fontSize:16,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.1em'}}>
+              {isFree?'Choose Tile':'Continue'}
+            </button>}
+      </div>
+    </div>
+  );
+};
+
+// Match-start ceremony, part 2 (Gauntlet/Training, 1v1 only -- Campaign never
+// shows this): reveals the initiative roll-off that decides turn order for
+// the whole run (see firstMoverRef / startContestedRound). Shown once
+// PlacementRollModal (and, on a free-choice roll, the picker) has resolved.
+const InitiativeRollModal = ({show, rolling, result, onRoll, onBegin}) => {
+  if(!show) return null;
+  const winColor = result?.winner==='player' ? '#00c8ff' : '#cc4422';
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.85)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:4500}}>
+      <div style={{background:'#080e14',border:`2px solid ${result?winColor:'#00c8ff'}`,borderRadius:10,padding:'1.4rem',maxWidth:400,width:'92%',textAlign:'center',color:'#b0dff4',boxShadow:`0 0 40px ${(result?winColor:'#00c8ff')}44`}}>
+        <div style={{fontSize:24}}>⚔</div>
+        <h2 style={{fontSize:'1.05rem',letterSpacing:'0.12em',textTransform:'uppercase',color:'#00c8ff',marginTop:4}}>Initiative Roll-Off</h2>
+        <div style={{fontSize:'11px',color:'#5a7a8a',marginTop:2,marginBottom:16}}>Higher d12 acts first — every round for the rest of the match.</div>
+        <div style={{display:'flex',justifyContent:'center',gap:20,marginBottom:16}}>
+          <DiceDisplay type="d12" value={result?result.p:'--'} rolling={rolling} color="#00c8ff" label="You" />
+          <DiceDisplay type="d12" value={result?result.e:'--'} rolling={rolling} color="#cc4422" label="Enemy" />
+        </div>
+        {result && !rolling && (
+          <div style={{background:'#0a1218',border:`1px solid ${winColor}55`,borderRadius:8,padding:'12px 14px',marginBottom:14}}>
+            <div style={{fontSize:14,fontWeight:'bold',color:winColor}}>
+              {result.winner==='player' ? 'You win initiative!' : 'Enemy wins initiative!'}
+            </div>
+            <div style={{fontSize:11,color:'#7a9db5',marginTop:4}}>
+              {result.winner==='player' ? 'You act first every round from here.' : 'The enemy acts first every round from here.'}
+            </div>
+          </div>
+        )}
+        {result===null
+          ? <button onClick={onRoll} disabled={rolling}
+              style={{width:'100%',padding:14,background:'rgba(0,200,255,0.13)',color:'#00c8ff',border:'1px solid #00c8ff',borderRadius:6,fontSize:16,fontWeight:'bold',cursor:rolling?'not-allowed':'pointer',letterSpacing:'0.1em'}}>
+              {rolling?'Rolling...':'Roll Initiative (d12)'}
+            </button>
+          : <button onClick={onBegin}
+              style={{width:'100%',padding:14,background:`${winColor}22`,color:winColor,border:`1px solid ${winColor}`,borderRadius:6,fontSize:16,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.1em'}}>
+              Begin Battle
+            </button>}
+      </div>
+    </div>
+  );
+};
+
+// A placement roll of 0 means free choice of back-row column, instead of
+// the usual roll-determined one. One button per column (0-8).
+const PlacementPickerModal = ({show, onSelect}) => {
+  if(!show) return null;
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.85)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:4000}}>
+      <div style={{background:'#080e14',border:'2px solid #00c8ff',borderRadius:12,padding:'2rem',maxWidth:420,width:'92%',textAlign:'center',color:'#b0dff4',boxShadow:'0 0 50px rgba(0,200,255,0.4)'}}>
+        <div style={{fontSize:'11px',letterSpacing:'0.2em',textTransform:'uppercase',color:'#00c8ff'}}>// Placement Roll: 0</div>
+        <h2 style={{fontSize:'1.3rem',letterSpacing:'0.1em',textTransform:'uppercase',color:'#00c8ff',marginTop:8}}>Choose Your Position</h2>
+        <div style={{fontSize:12,color:'#7a9db5',marginTop:10,marginBottom:20,lineHeight:1.6}}>A roll of 0 means free placement — pick any tile (1-9) in your back row.</div>
+        <div style={{display:'flex',justifyContent:'center',gap:6,flexWrap:'wrap'}}>
+          {/* Labeled 1-9 (tile numbers a player reads off the board) rather
+              than the underlying 0-8 array index, to match how every other
+              placement roll (1-9) already reads -- onSelect still receives
+              the 0-indexed column the board actually uses internally. */}
+          {Array.from({length:9},(_,col)=>(
+            <button key={col} onClick={()=>onSelect(col)}
+              style={{width:36,height:36,background:'rgba(0,200,255,0.1)',border:'1px solid #00c8ff',borderRadius:6,color:'#00c8ff',fontWeight:'bold',cursor:'pointer',fontFamily:"'Share Tech Mono',monospace"}}>
+              {col+1}
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+};
+
 // Shown when a Training Mode scene's single enemy is defeated — replaces the
 // normal wave-progression/boss-unlock flow, since a scene is a standalone
 // lesson rather than an endless run.
@@ -2567,7 +2751,7 @@ const SceneCompleteModal = ({show, sceneMeta, onReturn}) => {
 // Shown between Campaign battles ("Continue" to the next roster) and on the
 // finale ("Return to Menu"). Player HP/level/XP/hexas carry forward — only
 // position/tiles/enemies reset, handled by startNextCampaignBattle.
-const CampaignBattleCompleteModal = ({show, isFinale, battle, nextBattle, equipmentReward, onContinue, onFinish}) => {
+const CampaignBattleCompleteModal = ({show, isFinale, battle, nextBattle, equipmentReward, onContinue, onFinish, onReturnToMenu}) => {
   if(!show) return null;
   const color = isFinale ? '#ffd700' : '#00c8ff';
   return (
@@ -2584,19 +2768,60 @@ const CampaignBattleCompleteModal = ({show, isFinale, battle, nextBattle, equipm
           </div>
         )}
         {!isFinale && (
-          <div style={{fontSize:11,color:'#5a7a8a',marginBottom:18}}>Your HP and progress carry forward — no full heal between fights.</div>
+          <div style={{fontSize:11,color:'#5a7a8a',marginBottom:18}}>Your HP and progress carry forward — no full heal between fights. Stepping back to the menu keeps everything you've earned, so this is a good spot to go craft.</div>
         )}
-        <button onClick={isFinale?onFinish:onContinue}
-          style={{width:'100%',padding:12,background:`${color}22`,border:`1px solid ${color}`,borderRadius:6,color,fontSize:14,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.08em'}}>
-          {isFinale ? 'Return to Menu' : 'Continue'}
-        </button>
+        {isFinale ? (
+          <button onClick={onFinish}
+            style={{width:'100%',padding:12,background:`${color}22`,border:`1px solid ${color}`,borderRadius:6,color,fontSize:14,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.08em'}}>
+            Return to Menu
+          </button>
+        ) : (
+          <div style={{display:'flex',gap:10}}>
+            <button onClick={onContinue}
+              style={{flex:1,padding:12,background:`${color}22`,border:`1px solid ${color}`,borderRadius:6,color,fontSize:14,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.08em'}}>
+              Continue
+            </button>
+            <button onClick={onReturnToMenu}
+              style={{flex:1,padding:12,background:'rgba(90,125,150,0.15)',border:'1px solid #3a6a8a',borderRadius:6,color:'#7a9db5',fontSize:14,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.08em'}}>
+              Return to Menu
+            </button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// Shown when the player's HP hits 0 in Campaign — previously nothing but a
+// log line, leaving the player stuck with no way forward. Hexas/materials/XP
+// already earned this run are unaffected either way (committed as they're
+// gained, not held back for a clean finish), so both options are safe.
+const CampaignDefeatModal = ({show, battle, onRetry, onReturnToMenu}) => {
+  if(!show) return null;
+  const color = '#ff4444';
+  return (
+    <div style={{position:'fixed',inset:0,background:'rgba(0,0,0,0.85)',display:'flex',alignItems:'center',justifyContent:'center',zIndex:4000}}>
+      <div style={{background:'#080e14',border:`2px solid ${color}`,borderRadius:12,padding:'2rem',maxWidth:440,width:'92%',textAlign:'center',color:'#b0dff4',boxShadow:`0 0 50px ${color}66`}}>
+        <div style={{fontSize:'11px',letterSpacing:'0.2em',textTransform:'uppercase',color}}>{`// Battle ${battle?.stage}/${CAMPAIGN_BATTLES.length} Failed`}</div>
+        <h2 style={{fontSize:'1.4rem',letterSpacing:'0.1em',textTransform:'uppercase',color,marginTop:8}}>Proxy Down</h2>
+        <div style={{fontSize:11,color:'#5a7a8a',margin:'14px 0 18px'}}>Your Hexas, materials, and XP from this run are already banked. Retry this battle at full HP, or step back to the menu to regroup — Crafting is right there.</div>
+        <div style={{display:'flex',gap:10}}>
+          <button onClick={onRetry}
+            style={{flex:1,padding:12,background:`${color}22`,border:`1px solid ${color}`,borderRadius:6,color,fontSize:14,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.08em'}}>
+            Retry Battle
+          </button>
+          <button onClick={onReturnToMenu}
+            style={{flex:1,padding:12,background:'rgba(90,125,150,0.15)',border:'1px solid #3a6a8a',borderRadius:6,color:'#7a9db5',fontSize:14,fontWeight:'bold',cursor:'pointer',letterSpacing:'0.08em'}}>
+            Return to Menu
+          </button>
+        </div>
       </div>
     </div>
   );
 };
 // ─── MAIN GAME COMPONENT ───────────────────────────────────────────────────────
 
-export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, campaign, onCampaignComplete, onQuit, craftedSkillIds = [] } = {}) {
+export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, campaign, character, leaveSignal = 0, onCampaignComplete, onReturnToMenu, onBattleCleared, onQuit, craftedSkillIds = [], skillMods = {}, initialHexas = 0, initialMaterials = {} } = {}) {
   // Training Mode scene config. `scene` is undefined for normal Gauntlet play
   // (every flag below defaults to current behavior). Each scene isolates one
   // new mechanic on top of core movement/melee rather than accumulating —
@@ -2605,6 +2830,24 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // starts true when scene==='skills', and the boss-defeat unlock path never
   // runs in scene mode (handleEnemyDefeated returns early), so the loadout
   // stays naturally locked in every other scene without an extra check.
+  // Modifier Panel bonuses (Crafting), bought with Hexas (see
+  // SKILL_MOD_STATS in ItemData.jsx). `id` is a BATTLE_SKILLS id, or the
+  // element name itself ('Fire'/'Water'/'Earth'/'Air') for a base elemental
+  // skill. Applies only to the player's own casts — an enemy's copy of the
+  // same skill/element never reads this. Memoized on skillMods so every
+  // damage-calc useCallback below can list `dmgBonus`/`accBonus` themselves
+  // as a dependency (a stable identity that only changes when skillMods
+  // actually does) instead of needing `skillMods` directly, which eslint's
+  // exhaustive-deps can't infer since it only sees `dmgBonus(...)`/
+  // `accBonus(...)` calls in those bodies.
+  // Damage: a flat, permanent +damage.
+  const dmgBonus = useCallback((id) => skillMods?.[id]?.damage || 0, [skillMods]);
+  // Accuracy: a permanent damage multiplier — +10% per tier, capped at
+  // +50% (see SKILL_MOD_STATS.accuracy) — applied to the roll-based damage
+  // *before* dmgBonus's flat add, so a skill's percentage bonus scales what
+  // the dice actually rolled rather than the flat top-up too.
+  const accBonus = useCallback((id) => (skillMods?.[id]?.accuracy || 0) * 0.10, [skillMods]);
+
   const sceneAllowSkill = !scene || scene==='elements';
   const sceneIncludeTerrain = !scene || scene==='elements';
   const sceneRestrictBaseElements = scene==='elements';
@@ -2615,7 +2858,11 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // every piece of the multi-enemy engine so Gauntlet/Training stay untouched.
   const isCampaign = !!campaign;
 
-  const initPlayer = () => newHero();
+  // Campaign now requires a character (name/loadout/element) to already
+  // exist -- created/edited on CharacterScreen.jsx, not collected mid-battle
+  // (see CharacterCreatorForm above) -- so it's applied at the very first
+  // player object rather than patched in later via an intro-modal submit.
+  const initPlayer = () => { const p = newHero(); return (isCampaign && character) ? {...p, name: character.name} : p; };
   // Battle Skills scene: a full-kit practice Proxie (melee + element + both
   // Tactical skills + Circuit Sigil) instead of a plain goblin — "an even
   // match" now that a promoted Agent can fight alongside the player, and the
@@ -2633,14 +2880,28 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
 
   const [player,         setPlayer]         = useState(()=>{ const p=initPlayer(); return p; });
   const [enemy,          setEnemy]          = useState(()=>{ const p=initPlayer(); return initEnemy(p); });
+  // A placement roll of 0 means free choice of back-row column (see
+  // rollBackRowPosition) -- gates a picker modal shown once at mount,
+  // dismissed once the player confirms a tile.
+  const [showPlacementPicker, setShowPlacementPicker] = useState(()=>player._placementRoll===0);
+  // Match-start ceremony: reveals the placement roll (already determined at
+  // character creation, see newHero/rollBackRowPosition) and then, for
+  // Gauntlet/Training only, the initiative roll-off -- rather than either
+  // just happening invisibly before the player sees the board. Both default
+  // to true/shown so they gate the very first thing a player sees; nothing
+  // ever re-shows them later (not on new rounds, not on new waves).
+  const [showPlacementRollModal, setShowPlacementRollModal] = useState(true);
+  const [placementRolling,       setPlacementRolling]       = useState(false);
+  const [placementRollValue,     setPlacementRollValue]     = useState(null);
+  const [showInitiativeRollModal, setShowInitiativeRollModal] = useState(false);
+  const [initiativeRolling,       setInitiativeRolling]       = useState(false);
+  const [initiativeResult,        setInitiativeResult]        = useState(null); // {p, e, winner}
   // ── Campaign Mode: multi-enemy roster (only meaningful when isCampaign) ──
   const [enemies,          setEnemies]          = useState(()=> isCampaign ? spawnCampaignRoster(1, initPlayer().boardPosition) : []);
   const [campaignBattle,   setCampaignBattle]   = useState(1);
   const [campaignComplete, setCampaignComplete] = useState(false);
   const [showBattleComplete, setShowBattleComplete] = useState(false);
-  // Shown once, before Battle 1 — Campaign locks name/loadout/element up front
-  // instead of Gauntlet's post-boss unlock or Training's free swapping.
-  const [showCampaignIntro, setShowCampaignIntro] = useState(isCampaign);
+  const [showDefeatModal, setShowDefeatModal] = useState(false);
   const [selectedEnemyId,  setSelectedEnemyId]  = useState(null);
   const [enemyRolledEnergyById, setEnemyRolledEnergyById] = useState({});
   const [tiles,          setTiles]          = useState(()=>{
@@ -2654,18 +2915,28 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const [playerRolledEnergy, setPlayerRolledEnergy] = useState(0);
   const [enemyRolledEnergy,  setEnemyRolledEnergy]  = useState(0);
   const [energyPhase,    setEnergyPhase]    = useState('roll');
-  const [hexas,          setHexas]          = useState(0);
+  const [hexas,          setHexas]          = useState(initialHexas);
   // Battle-acquired synthesis materials (Campaign only) -- materialId -> qty.
   // Unequipped equipment drops live on player.equipment (see FIRST_EQUIPMENT
   // and rollEnemyDrop) rather than their own top-level state, same shape.
-  const [materials,      setMaterials]      = useState({});
+  // Seeded from the app-level persisted pool (see App.jsx) so battle rewards
+  // stack on top of what Explore/previous sessions already earned instead of
+  // starting back at zero every mount.
+  const [materials,      setMaterials]      = useState(initialMaterials);
   const [isPlayerTurn,   setIsPlayerTurn]   = useState(true);
   const [playerSel,      setPlayerSel]      = useState(false);
   const [validSquares,   setValidSquares]   = useState([]);
-  const [logs,           setLogs]           = useState(['=== Battle Initiated ===','Move adjacent to attack. Position for bonuses.']);
+  const [logs,           setLogs]           = useState(()=>{
+    const base = ['=== Battle Initiated ===','Move adjacent to attack. Position for bonuses.'];
+    if(isCampaign && character){
+      const skillNames = character.loadout.map(id=>BATTLE_SKILLS.find(s=>s.id===id)?.name).filter(Boolean).join(', ');
+      base.push(`=== ${character.name} deployed — ${skillNames} · ${character.element} ===`);
+    }
+    return base;
+  });
   const [reward,         setReward]         = useState({show:false,html:''});
   const [selCategory,    setSelCategory]    = useState('base');
-  const [selElement,     setSelElement]     = useState('Fire');
+  const [selElement,     setSelElement]     = useState(()=> (isCampaign && character) ? character.element : 'Fire');
   const [showDice,       setShowDice]       = useState(false);
   const [diceRolls,      setDiceRolls]      = useState([]);
   const [abilities,      setAbilities]      = useState([]);
@@ -2683,8 +2954,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const [healingConsumed, setHealingConsumed] = useState(false);
 
   // ── Battle Skills / loadout state ──
-  const [loadout,         setLoadout]         = useState([]);   // equipped non-baseline skill ids
-  const [loadoutUnlocked, setLoadoutUnlocked] = useState(scene==='skills');  // gate flag (post-boss, or immediate in the Battle Skills scene)
+  const [loadout,         setLoadout]         = useState(()=> (isCampaign && character) ? character.loadout : []);   // equipped non-baseline skill ids
+  const [loadoutUnlocked, setLoadoutUnlocked] = useState(scene==='skills' || (isCampaign && !!character));  // gate flag (post-boss, immediate in the Battle Skills scene, or immediate in Campaign since the character already locked a loadout in on CharacterScreen)
   const [sceneComplete,   setSceneComplete]   = useState(false);  // Training Mode: this scene's single enemy is down
   const [showLoadoutModal,setShowLoadoutModal]= useState(false);  // unlock picker
   const [meleeModalCtx,setMeleeModalCtx]= useState(null);  // {perHitDamage,maxMultiplier,targetLabel,targetId} while the melee burst modal is open
@@ -2721,6 +2992,18 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // ResizeObserver effect below).
   const battleRowRef = useRef(null);
   const gridSlotRef = useRef(null);
+  // Tracks whether the player has rolled their own Energy pool yet THIS
+  // round -- distinct from actionpts<=0, which means either "hasn't rolled"
+  // or "rolled and fully spent," depending on when it's read. A ref (not
+  // state) so the enemy-went-first hand-off (finishEnemyToPlayer, reached via
+  // runEnemyTurn's own setTimeout chain) can read it synchronously without
+  // waiting on a re-render.
+  const playerHasRolledRef = useRef(true);
+  // Who won the initiative roll-off, decided once for the whole run (not
+  // re-rolled each round or each wave) -- 'player' | 'enemy' | null before
+  // it's been decided. Every round after the first follows this same
+  // established order.
+  const firstMoverRef = useRef(null);
   const [gridSize, setGridSize] = useState(480);
   // ── Player-directed summon-command sub-phase (A) ──
   const [summonPhaseActive, setSummonPhaseActive] = useState(false);
@@ -2761,7 +3044,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const canCompassSlash = loadout.includes('compassSlash') && isPlayerTurn && energyPhase==='act' && !player.usedSkillIds.includes('compassSlash') && player.actionpts >= 2;
   const canCircuitSigil = loadout.includes('circuitSigil') && isPlayerTurn && energyPhase==='act' && !player.usedSkillIds.includes('circuitSigil') && player.actionpts >= 2;
   const canDarkWeb = loadout.includes('darkWeb') && isPlayerTurn && energyPhase==='act' && !player.usedSkillIds.includes('darkWeb') && player.actionpts >= 2;
-  const canPulseWave = loadout.includes('pulseWave') && isPlayerTurn && energyPhase==='act' && !player.usedSkillIds.includes('pulseWave') && player.actionpts >= 4;
+  const canPulseWave = loadout.includes('pulseWave') && isPlayerTurn && energyPhase==='act' && !player.usedSkillIds.includes('pulseWave') && player.actionpts >= 3;
   const canPiercingLight = loadout.includes('piercingLight') && isPlayerTurn && energyPhase==='act' && !player.usedSkillIds.includes('piercingLight') && player.actionpts >= PIERCING_LIGHT_BASE_COST;
   // Rotate: 0 Energy, once per turn — a free facing change for tactical
   // repositioning (evade a flank, line up a ranged skill) without spending AP.
@@ -3007,7 +3290,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       energyRollover: (latestEnemy.energyRollover||0) + (latestEnemy.actionpts||0) };
     setPlayer(rP);
     setEnemy(rE);
-    setTimeout(()=>beginRound(rP, rE, nextRound), 300);
+    setTimeout(()=>startContestedRound(rP, rE, nextRound), 300);
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[addLog]);
   // ── ENEMY TURN ──
@@ -3186,7 +3469,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           addLog(`${currentEnemy.name} Pulse Wave [${strike.rollsLabel}, ${strike.acc}% (${accuracyTierLabel(strike.acc)})] -> ${strike.dmg} dmg`);
           triggerCastFx(currentPlayer.boardPosition, ELEMENTS[currentEnemy.elementCategory]?.[currentEnemy.element]?.color||'#c9a7f7');
           updatedPlayer={...currentPlayer,health:newHP};
-          updatedEnemy=markSkillUsed({...currentEnemy,actionpts:currentEnemy.actionpts-4,facing:newFacing},'pulseWave');
+          updatedEnemy=markSkillUsed({...currentEnemy,actionpts:currentEnemy.actionpts-3,facing:newFacing},'pulseWave');
           setPlayer(updatedPlayer); setEnemy(updatedEnemy);
           if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
           setTimeout(()=>{
@@ -3217,16 +3500,17 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           const tileBoost=getTileBoost(tiles,currentEnemy.boardPosition,'Fire');
           if(tileBoost>0) dmg+=tileBoost;
           appliesBurn=pulses>=3;
-          addLog(`${currentEnemy.name} Ember Strike [${pulses} pulses x ${dmgEach*SKILL_DICE_MULT} = ${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${tileBoost>0?' [Fire tile +20]':''}${appliesBurn?' [Burn]':''}`);
+          if(appliesBurn) setTiles(prev=>{ const g=prev.map(r=>r.slice()); g[currentPlayer.boardPosition.y][currentPlayer.boardPosition.x]=TILE_TYPES.FIRE_BOOST; return g; });
+          addLog(`${currentEnemy.name} Ember Strike [${pulses} pulses x ${dmgEach*SKILL_DICE_MULT} = ${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${tileBoost>0?' [Fire tile +20]':''}${appliesBurn?' [Burn, Scorch]':''}`);
         } else if(elData.isEarth){
           const dieRoll=rolls[0].value;
           const maxRange=Math.max(1,Math.floor(dieRoll/2));
           const avail=Math.max(1,Math.min(maxRange, currentEnemy.actionpts-1));
           const chosenRange=avail;
           const {hitObstacle,hitTarget,newObstacleTiles}=resolveEarthTremor(
-            {boardPosition:currentEnemy.boardPosition,facing:castFacing}, chosenRange, [currentPlayer], updatedObstacles, [currentPlayer.boardPosition]
+            {boardPosition:currentEnemy.boardPosition,facing:castFacing}, chosenRange, [currentPlayer], updatedObstacles, [currentPlayer.boardPosition, ...updatedSummons.map(s=>s.boardPosition)], tiles
           );
-          const base=dieRoll*SKILL_DICE_MULT;
+          const base=dieRoll*EARTH_DICE_MULT;
           const acc=rollD100Accuracy();
           const tileBoost=getTileBoost(tiles,currentEnemy.boardPosition,'Earth');
           const rawDmg=Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost;
@@ -3234,12 +3518,12 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           eCost=1+chosenRange;
           if(newObstacleTiles.length>0){ updatedObstacles=[...updatedObstacles, ...newObstacleTiles.map(t=>makeObstacle(t))]; setObstacles(updatedObstacles); }
           if(hitObstacle){
-            const newHP=Math.max(0,hitObstacle.health-rawDmg);
-            addLog(newHP<=0?'Rubble destroyed!':`Rubble takes ${rawDmg} dmg (${newHP}/${hitObstacle.maxHealth}).`);
-            updatedObstacles = newHP<=0 ? updatedObstacles.filter(o=>o.id!==hitObstacle.id) : updatedObstacles.map(o=>o.id===hitObstacle.id?{...o,health:newHP}:o);
+            const newHP=Math.min(hitObstacle.maxHealth,hitObstacle.health+rawDmg);
+            addLog(`Rubble reinforced +${rawDmg} (${newHP}/${hitObstacle.maxHealth}).`);
+            updatedObstacles = updatedObstacles.map(o=>o.id===hitObstacle.id?{...o,health:newHP}:o);
             setObstacles(updatedObstacles);
           }
-          const outcome = hitTarget ? `${dmg} dmg${tileBoost>0?' [Earth tile +20]':''}` : hitObstacle ? 'struck rubble instead' : 'MISS';
+          const outcome = hitTarget ? `${dmg} dmg${tileBoost>0?' [Earth tile +20]':''}` : hitObstacle ? 'reinforced rubble instead' : 'MISS';
           addLog(`${currentEnemy.name} Tremor [d6=${dieRoll}, ${chosenRange} tile${chosenRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${outcome}${newObstacleTiles.length>0?` (+${newObstacleTiles.length} rubble)`:''}`);
         } else if(elData.isAir){
           const dieRoll=rolls[0].value;
@@ -3261,11 +3545,19 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           eCost=2;
           if(hit){
             // Whatever roll wasn't spent reaching the player becomes
-            // knockback distance, minimum 1 tile, until it hits a wall.
+            // knockback distance, minimum 1 tile, until it hits a wall or
+            // rubble -- a rubble collision stops it a tile short and deals
+            // the same collision damage a direct hit would.
             const knockDist=Math.max(1,dieRoll-playerDist);
-            const kbPos=getKnockbackTile(currentPlayer.boardPosition,castFacing,knockDist,[currentEnemy.boardPosition,...updatedObstacles.map(o=>o.boardPosition)]);
-            updatedPlayer={...currentPlayer,boardPosition:kbPos};
-            addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} + knockback ${knockDist} tile${knockDist>1?'s':''}`);
+            const kb=getKnockbackTile(currentPlayer.boardPosition,castFacing,knockDist,[currentEnemy.boardPosition],updatedObstacles);
+            updatedPlayer={...currentPlayer,boardPosition:{x:kb.x,y:kb.y}};
+            addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} + knockback ${knockDist} tile${knockDist>1?'s':''}${kb.hitObstacle?' [knocked into rubble]':''}`);
+            if(kb.hitObstacle){
+              const newHP=Math.max(0,kb.hitObstacle.health-rawDmg);
+              addLog(newHP<=0?'Rubble destroyed!':`Rubble takes ${rawDmg} dmg (${newHP}/${kb.hitObstacle.maxHealth}).`);
+              updatedObstacles = newHP<=0 ? updatedObstacles.filter(o=>o.id!==kb.hitObstacle.id) : updatedObstacles.map(o=>o.id===kb.hitObstacle.id?{...o,health:newHP}:o);
+              setObstacles(updatedObstacles);
+            }
           } else if(blocked){
             const newHP=Math.max(0,lineObstacle.obstacle.health-rawDmg);
             addLog(`${currentEnemy.name} Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> struck rubble instead — ${newHP<=0?'destroyed!':`${rawDmg} dmg (${newHP}/${lineObstacle.obstacle.maxHealth})`}`);
@@ -3296,7 +3588,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
             const tileBoost=getTileBoost(tiles,currentEnemy.boardPosition,'Water');
             dmg=hit?applyAccuracy(res.damage,acc)+tileBoost:0;
             const flooded=dieRoll>=10;
-            if(flooded) setTiles(prev=>{ if(prev[anchor.y][anchor.x]===TILE_TYPES.WATER_BOOST) return prev; const g=prev.map(r=>r.slice()); g[anchor.y][anchor.x]=TILE_TYPES.WATER_BOOST; return g; });
+            if(flooded) setTiles(prev=>{ const g=prev.map(r=>r.slice()); footprint.forEach(ft=>{ g[ft.y][ft.x]=TILE_TYPES.WATER_BOOST; }); return g; });
             addLog(`${currentEnemy.name} Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[chosen.aoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS'}${flooded?' [Flood]':''}`);
           }
         }
@@ -3358,19 +3650,12 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         const summonBlockers=[...updatedSummons, ...updatedObstacles].map(s=>s.boardPosition);
         const target=pickApproachTile(currentEnemy.boardPosition,currentPlayer.boardPosition,currentPlayer.facing,tier,[currentPlayer.boardPosition,...summonBlockers]);
         const goal = target || currentPlayer.boardPosition;
-        const curDist = manhattan(currentEnemy.boardPosition, goal);
-        const moves=getMoveToward(currentEnemy.boardPosition.x,currentEnemy.boardPosition.y,goal.x,goal.y);
-        let moved=false;
-        for(const m of moves){
-          const onSummon=summonBlockers.some(s=>s.x===m.x&&s.y===m.y);
-          if(m.x>=0&&m.x<SIZE&&m.y>=0&&m.y<SIZE&&!(m.x===currentPlayer.boardPosition.x&&m.y===currentPlayer.boardPosition.y)&&!onSummon){
-            if(manhattan(m,goal) < curDist){
-              const nf=facingFromMove(currentEnemy.boardPosition,m);
-              updatedEnemy={...currentEnemy,boardPosition:m,facing:nf,actionpts:currentEnemy.actionpts-1};
-              const tag = target ? (target.quality>=2?' [seeking blindspot]':target.quality>=1?' [seeking flank]':'') : '';
-              addLog(`${currentEnemy.name} -> (${m.x},${m.y})${tag}`); moved=true; break;
-            }
-          }
+        const walk=walkTowardGoal(currentEnemy.boardPosition,currentEnemy.facing,goal,[currentPlayer.boardPosition,...summonBlockers],currentEnemy.actionpts,ENEMY_MOVE_SPEED);
+        let moved=walk.steps>0;
+        if(moved){
+          updatedEnemy={...currentEnemy,boardPosition:walk.pos,facing:walk.facing,actionpts:currentEnemy.actionpts-walk.steps};
+          const tag = target ? (target.quality>=2?' [seeking blindspot]':target.quality>=1?' [seeking flank]':'') : '';
+          addLog(`${currentEnemy.name} -> (${walk.pos.x},${walk.pos.y})${walk.steps>1?` [${walk.steps} tiles]`:''}${tag}`);
         }
         if(!moved){
           const saved=currentEnemy.actionpts;
@@ -3383,8 +3668,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         // Longshot Protocol — a repositioning move, so it checks right here.
         if((currentEnemy.loadout||[]).includes('longshotProtocol')){
           const blockers=updatedSummons.map(s=>s.boardPosition);
-          const hit=checkLongshotProtocol(updatedEnemy.boardPosition,[currentPlayer],blockers);
-          if(hit){
+          const hits=checkLongshotProtocol(updatedEnemy.boardPosition,[currentPlayer],blockers);
+          if(hits.length>0){
             const newHP=Math.max(0,currentPlayer.health-LONGSHOT_DMG);
             addLog(`◎ ${updatedEnemy.name} Longshot Protocol -> ${LONGSHOT_DMG} dmg (${newHP}/${currentPlayer.maxHealth})`);
             triggerCastFx(currentPlayer.boardPosition,'#88e0c0');
@@ -3403,7 +3688,12 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[addLog,tiles,wave,triggerCastFx]);
   // ── ROUND ORCHESTRATION ──
-  const beginRound = useCallback((rP, rE, currentRound)=>{
+  // Player-facing half of round-start: prompts the "Roll Energy" step.
+  // Shared by beginRound (player won initiative) and finishEnemyToPlayer's
+  // enemy-went-first hand-off (see below) -- both need the exact same state
+  // reset, just reached from different starting points.
+  const promptPlayerRoll = useCallback((rP, rE)=>{
+    playerHasRolledRef.current = false;
     setIsPlayerTurn(true);
     setEnergyPhase('roll');
     setSelectedSummonId(null);
@@ -3420,7 +3710,78 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[addLog,summons]);
 
+  const beginRound = useCallback((rP, rE, currentRound)=>{
+    promptPlayerRoll(rP, rE);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[promptPlayerRoll]);
+
+  // Enemy won the initiative roll-off -- runs the enemy's round-opening turn
+  // (runEnemyTurn already self-sufficiently rolls the enemy's own Energy when
+  // its actionpts is 0, so no separate roll step is needed here). Its
+  // eventual completion routes back through finishEnemyToPlayer, which checks
+  // playerHasRolledRef to hand off to promptPlayerRoll instead of the normal
+  // mid-round startPlayerTurn resume.
+  const beginRoundEnemyFirst = useCallback((rE, rP, currentRound)=>{
+    playerHasRolledRef.current = false;
+    setIsPlayerTurn(false);
+    setSelectedSummonId(null);
+    setSummonPhaseActive(false);
+    setValidSquares([]);
+    addLog("=== Initiative roll-off: Enemy wins — Enemy's Turn ===");
+    runEnemyTurn(rE, rP, summons, currentRound, obstacles);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[addLog,summons,obstacles,runEnemyTurn]);
+
+  // Locks in who won initiative (see firstMoverRef) and starts the round
+  // accordingly. Normally reached from InitiativeRollModal's "Begin Battle"
+  // button, which already ran the roll itself as part of the reveal
+  // ceremony -- this just applies whatever `winner` it was given.
+  const applyInitiativeResult = useCallback((winner, rP, rE, currentRound)=>{
+    firstMoverRef.current = winner;
+    addLog(winner==='enemy'
+      ? '// Initiative roll-off: Enemy wins -- Enemy acts first every round from here'
+      : '// Initiative roll-off: You win -- You act first every round from here');
+    if(winner==='enemy') beginRoundEnemyFirst(rE, rP, currentRound);
+    else beginRound(rP, rE, currentRound);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[addLog,beginRound,beginRoundEnemyFirst]);
+
+  // Starts the round following the established turn order (Gauntlet/Training,
+  // 1v1 mode only). Every round after the first just continues whichever
+  // side won the initiative roll-off (see firstMoverRef) rather than
+  // re-contesting it -- called from checkEndOfRound and startNextWave. The
+  // `firstMoverRef.current===null` branch is a defensive fallback only (rolls
+  // invisibly rather than getting stuck) -- in normal play, round 1 always
+  // goes through InitiativeRollModal -> applyInitiativeResult first, which
+  // already sets firstMoverRef before this could ever be called with it null.
+  const startContestedRound = useCallback((rP, rE, currentRound)=>{
+    if(firstMoverRef.current === null){
+      const { winner } = rollInitiative();
+      applyInitiativeResult(winner, rP, rE, currentRound);
+      return;
+    }
+    if(firstMoverRef.current==='enemy'){
+      beginRoundEnemyFirst(rE, rP, currentRound);
+    } else {
+      beginRound(rP, rE, currentRound);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[applyInitiativeResult,beginRound,beginRoundEnemyFirst]);
+
   const finishEnemyToPlayer = useCallback((latestPlayer, latestEnemy, currentRound)=>{
+    // playerHasRolledRef stays false until the player's first Energy roll of
+    // the round -- if the enemy won initiative and just finished going
+    // first, the player hasn't rolled yet, so this hand-off must open with a
+    // fresh roll prompt (promptPlayerRoll) rather than resuming a mid-round
+    // alternation via startPlayerTurn, which assumes Energy was already
+    // rolled earlier this round. actionpts<=0 can't disambiguate this on its
+    // own since it means either "unrolled" or "rolled and fully spent."
+    if(!playerHasRolledRef.current){
+      setPlayer(latestPlayer);
+      setEnemy(latestEnemy);
+      promptPlayerRoll(latestPlayer, latestEnemy);
+      return;
+    }
     if(latestPlayer.actionpts<=0 && latestEnemy.actionpts<=0){
       checkEndOfRound(latestPlayer, latestEnemy, currentRound);
       return;
@@ -3429,7 +3790,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setEnemy(latestEnemy);
     startPlayerTurn(latestPlayer);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[checkEndOfRound,startPlayerTurn]);
+  },[promptPlayerRoll,checkEndOfRound,startPlayerTurn]);
 
   // ── ENERGY ROLL ──
   const handleRollEnergy = useCallback(()=>{
@@ -3441,6 +3802,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const total = roll + rollover;
     const newAP = Math.max(0, total - frozenPenalty);
     setPlayerRolledEnergy(total);
+    playerHasRolledRef.current = true;
     addLog(`You roll d12=${roll}${rollover>0?` +${rollover} rollover`:''} = ${total} Energy${frozenPenalty>0?` (freeze -${frozenPenalty})`:''}  ->  ${newAP} AP`);
     const rolledPlayer = { ...burnedPlayer, actionpts:newAP, frozen:0, energyRollover:0 };
     setPlayer(rolledPlayer);
@@ -3508,13 +3870,16 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setSummonPhaseActive(false);
     setPlayerRolledEnergy(0);
     setEnemyRolledEnergy(0);
-    setEnergyPhase('roll');
     setLockedRoll(null);
     setHealingConsumed(false);
-    setIsPlayerTurn(true);
     const bossTag = enemyTier(enemyLevel).isBoss ? ' [BOSS]' : '';
     addLog(`=== Wave ${nextWave} — ${freshEnemy.name} (Lv${enemyLevel})${bossTag} ===`);
-  },[wave,addLog]);
+    // A new wave's opening round is still a round -- same initiative
+    // roll-off as any other (Gauntlet/Training only; Campaign doesn't use
+    // startNextWave at all, it has its own multi-enemy wave handling).
+    startContestedRound(resetPlayer, freshEnemy, 1);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[wave,addLog,startContestedRound]);
 
   // ── ROUTING AFTER A PLAYER ACTION ──
   // The enemy always gets exactly one turn per round, right after the
@@ -3690,17 +4055,19 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(flank.bonus>0) dmg+=flank.bonus;
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Fire');
     if(tileBoost>0) dmg+=tileBoost;
+    dmg=Math.round(dmg*(1+accBonus('Fire')))+dmgBonus('Fire');
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-3),skillUsed:true};
     const appliesBurn=pulses>=3;
     let updatedEnemy={...enemy,health:Math.max(0,enemy.health-dmg)};
     if(appliesBurn) updatedEnemy=applyBurn(updatedEnemy);
-    addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tileBoost>0?' [Fire tile +20]':''}${appliesBurn?' [Burn]':''}`);
+    if(appliesBurn) setTiles(prev=>{ const g=prev.map(r=>r.slice()); g[enemy.boardPosition.y][enemy.boardPosition.x]=TILE_TYPES.FIRE_BOOST; return g; });
+    addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tileBoost>0?' [Fire tile +20]':''}${appliesBurn?' [Burn, Scorch]':''}`);
     triggerCastFx(enemy.boardPosition, ELEMENTS.base.Fire.color);
     resetDiceModal();
     if(updatedEnemy.health<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[diceRolls,lockedRoll,player,enemy,tiles,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction,triggerCastFx]);
+  },[diceRolls,lockedRoll,player,enemy,tiles,dmgBonus,accBonus,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction,triggerCastFx]);
 
   // Earth handlers
   const handleSetEarthRange = useCallback((r)=>setEarthRange(r),[]);
@@ -3708,24 +4075,24 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const handleEarthApplyWithAccuracy = useCallback((acc)=>{
     const origin=lockedRoll.origin;
     const dieRoll=diceRolls[0].value;
-    const base=dieRoll*SKILL_DICE_MULT;
-    const {hitObstacle,hitTarget,newObstacleTiles}=resolveEarthTremor(origin, earthRange, [enemy], obstacles, [enemy.boardPosition]);
+    const base=dieRoll*EARTH_DICE_MULT;
+    const {hitObstacle,hitTarget,newObstacleTiles}=resolveEarthTremor(origin, earthRange, [enemy], obstacles, [enemy.boardPosition, ...summons.map(s=>s.boardPosition)], tiles);
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Earth');
     // Guaranteed floor on a landed hit — Earth should never tick for single digits.
-    const rawDmg=Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost;
+    const rawDmg=Math.round((Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost)*(1+accBonus('Earth')))+dmgBonus('Earth');
     const dmg=hitTarget?rawDmg:0;
     const cost=1+earthRange;
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
     const updatedEnemy={...enemy,health:Math.max(0,enemy.health-dmg)};
-    const outcome=hitTarget?`${dmg} dmg${tileBoost>0?' [Earth tile +20]':''}`:hitObstacle?'struck rubble instead':'MISS (nothing in line)';
+    const outcome=hitTarget?`${dmg} dmg${tileBoost>0?' [Earth tile +20]':''}`:hitObstacle?'reinforced rubble instead':'MISS (nothing in line)';
     addLog(`Tremor [d6=${dieRoll}, ${earthRange} tile${earthRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${outcome}${newObstacleTiles.length>0?` (+${newObstacleTiles.length} rubble)`:''}`);
     if(newObstacleTiles.length>0) setObstacles(prev=>[...prev, ...newObstacleTiles.map(t=>makeObstacle(t))]);
     if(hitObstacle){
       setObstacles(prev=>{
         const hitOne=prev.find(o=>o.id===hitObstacle.id);
-        const newHP=hitOne?Math.max(0,hitOne.health-rawDmg):0;
-        addLog(newHP<=0?'Rubble destroyed!':`Rubble takes ${rawDmg} dmg (${newHP}/${hitOne.maxHealth}).`);
-        return newHP<=0 ? prev.filter(o=>o.id!==hitObstacle.id) : prev.map(o=>o.id===hitObstacle.id?{...o,health:newHP}:o);
+        const newHP=hitOne?Math.min(hitOne.maxHealth,hitOne.health+rawDmg):0;
+        addLog(`Rubble reinforced +${rawDmg} (${newHP}/${hitOne?.maxHealth}).`);
+        return prev.map(o=>o.id===hitObstacle.id?{...o,health:newHP}:o);
       });
     }
     if(hitTarget) triggerCastFx(enemy.boardPosition, ELEMENTS.base.Earth.color);
@@ -3733,7 +4100,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(updatedEnemy.health<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[diceRolls,lockedRoll,player,enemy,tiles,obstacles,earthRange,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction,triggerCastFx]);
+  },[diceRolls,lockedRoll,player,enemy,tiles,obstacles,earthRange,summons,dmgBonus,accBonus,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction,triggerCastFx]);
 
   // Air handlers
   const handleAirProceedToAccuracy = useCallback(()=>{ setDicePhase('accuracy'); setAccuracyRoll(null); },[]);
@@ -3748,15 +4115,24 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const hit=!blocked&&dist>0&&dist<=dieRoll;
     const base=airGaleForceDamage(dieRoll);
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Air');
-    const rawDmg=Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost;
+    const rawDmg=Math.round((Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost)*(1+accBonus('Air')))+dmgBonus('Air');
     let dmg=hit?rawDmg:0;
     let updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),skillUsed:true};
     let updatedEnemy={...enemy,health:Math.max(0,enemy.health-dmg)};
     if(hit){
       const knockDist=Math.max(1,dieRoll-dist);
-      const kbPos=getKnockbackTile(enemy.boardPosition,origin.facing,knockDist,[origin.boardPosition,...obstacles.map(o=>o.boardPosition)]);
-      updatedEnemy.boardPosition=kbPos;
-      addLog(`Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} + knockback ${knockDist} tile${knockDist>1?'s':''}`);
+      const kb=getKnockbackTile(enemy.boardPosition,origin.facing,knockDist,[origin.boardPosition],obstacles);
+      updatedEnemy.boardPosition={x:kb.x,y:kb.y};
+      addLog(`Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} + knockback ${knockDist} tile${knockDist>1?'s':''}${kb.hitObstacle?' [knocked into rubble]':''}`);
+      if(kb.hitObstacle){
+        const hitId=kb.hitObstacle.id;
+        setObstacles(prev=>{
+          const hitOne=prev.find(o=>o.id===hitId);
+          const newHP=hitOne?Math.max(0,hitOne.health-rawDmg):0;
+          addLog(newHP<=0?'Rubble destroyed!':`Rubble takes ${rawDmg} dmg (${newHP}/${hitOne.maxHealth}).`);
+          return newHP<=0 ? prev.filter(o=>o.id!==hitId) : prev.map(o=>o.id===hitId?{...o,health:newHP}:o);
+        });
+      }
     } else if(blocked){
       setObstacles(prev=>{
         const hitOne=prev.find(o=>o.id===lineObstacle.obstacle.id);
@@ -3771,7 +4147,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     resetDiceModal();
     if(updatedEnemy.health<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
-  },[diceRolls,lockedRoll,player,enemy,tiles,obstacles,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction,triggerCastFx]);
+  },[diceRolls,lockedRoll,player,enemy,tiles,obstacles,dmgBonus,accBonus,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction,triggerCastFx]);
 
   // Water handlers
   const handleSetWaterAoe = useCallback((aoe)=>setWaterAoe(aoe),[]);
@@ -3784,19 +4160,19 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const footprint=getTorrentFootprint(anchor,waterAoe);
     const hit=footprint.some(t=>t.x===enemy.boardPosition.x&&t.y===enemy.boardPosition.y);
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Water');
-    const dmg=hit?applyAccuracy(res.damage,acc)+tileBoost:0;
+    const dmg=hit?Math.round((applyAccuracy(res.damage,acc)+tileBoost)*(1+accBonus('Water')))+dmgBonus('Water'):0;
     const cost=TORRENT_AOE_COST[waterAoe];
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
     const updatedEnemy={...enemy,health:Math.max(0,enemy.health-dmg)};
     const flooded=dieRoll>=10;
-    if(flooded) setTiles(prev=>{ if(prev[anchor.y][anchor.x]===TILE_TYPES.WATER_BOOST) return prev; const g=prev.map(r=>r.slice()); g[anchor.y][anchor.x]=TILE_TYPES.WATER_BOOST; return g; });
+    if(flooded) setTiles(prev=>{ const g=prev.map(r=>r.slice()); footprint.forEach(ft=>{ g[ft.y][ft.x]=TILE_TYPES.WATER_BOOST; }); return g; });
     addLog(`Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[waterAoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${hit?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS (enemy outside blast)'}${flooded?' [Flood]':''}`);
     if(hit) triggerCastFx(enemy.boardPosition, ELEMENTS.base.Water.color);
     resetDiceModal();
     if(updatedEnemy.health<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[diceRolls,lockedRoll,player,enemy,tiles,waterAoe,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction,triggerCastFx]);
+  },[diceRolls,lockedRoll,player,enemy,tiles,waterAoe,dmgBonus,accBonus,wave,addLog,handleEnemyDefeated,resetDiceModal,routeAfterPlayerAction,triggerCastFx]);
 
   // ── ROTATE (0 cost, once per turn) ──
   const handleRotateOpen = useCallback(()=>{
@@ -3836,7 +4212,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       routeAfterPlayerAction(updatedPlayer, enemy);
       return;
     }
-    const dmg=60;
+    const dmg=Math.round(60*(1+accBonus('compassSlash')))+dmgBonus('compassSlash');
     const slashFacing=facingToward(player.boardPosition,targetTile);
     const newHP=Math.max(0,enemy.health-dmg);
     addLog(`Compass Slash -> ${dmg} dmg (${newHP}/${enemy.maxHealth})`);
@@ -3846,7 +4222,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(newHP<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[player,enemy,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx]);
+  },[player,enemy,wave,dmgBonus,accBonus,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx]);
 
   // ── DARK WEB (Tactical Skill) ──
   // Chess-knight strike pattern. Per Codex Protocols §V (Melee & Displacement):
@@ -3887,11 +4263,28 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         ...(occupied?{}:{boardPosition:targetTile,facing:leapFacing})},'darkWeb');
       addLog(occupied ? '// Dark Web strikes an occupied tile — 2 Energy spent, no leap'
         : `Dark Web leaps to (${targetTile.x},${targetTile.y}) — 2 Energy spent`);
+      // Dark Web's leap is a genuine reposition, same as a normal move — so
+      // it can also land the player on a Longshot Protocol diagonal.
+      if(!occupied && loadout.includes('longshotProtocol')){
+        const blockers=summons.map(s=>s.boardPosition);
+        const hits=checkLongshotProtocol(updatedPlayer.boardPosition,[enemy],blockers);
+        if(hits.length>0){
+          const hit=hits[0];
+          const snipeDmg=Math.round(LONGSHOT_DMG*(1+accBonus('longshotProtocol')))+dmgBonus('longshotProtocol');
+          const newHP=Math.max(0,hit.health-snipeDmg);
+          addLog(`◎ Longshot Protocol -> ${snipeDmg} dmg (${newHP}/${hit.maxHealth})`);
+          triggerCastFx(hit.boardPosition,'#88e0c0');
+          const updatedEnemy={...enemy,health:newHP};
+          if(newHP<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
+          routeAfterPlayerAction(updatedPlayer, updatedEnemy);
+          return;
+        }
+      }
       routeAfterPlayerAction(updatedPlayer, enemy);
       return;
     }
     const acc=rollD100Accuracy();
-    const dmg=applyAccuracy(70,acc);
+    const dmg=Math.round(applyAccuracy(70,acc)*(1+accBonus('darkWeb')))+dmgBonus('darkWeb');
     const strikeFacing=facingToward(player.boardPosition,targetTile);
     const newHP=Math.max(0,enemy.health-dmg);
     const updatedEnemy={...enemy,health:newHP};
@@ -3909,7 +4302,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),facing:strikeFacing},'darkWeb');
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[player,enemy,summons,obstacles,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx,applyHealingIfLanded]);
+  },[player,enemy,summons,obstacles,loadout,dmgBonus,accBonus,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx,applyHealingIfLanded]);
 
   // ── PULSE WAVE (Tactical Skill) ──
   // Your own equipped element, cast a second time down a chosen axis (any
@@ -3928,10 +4321,11 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(!dir || dist>3){ addLog('// Target not on a straight or diagonal line within 3 tiles'); return; }
     const strike = computePulseWaveDamage({element:selElement,elementCategory:selCategory});
     if(!strike){ addLog('// No element equipped'); return; }
+    strike.dmg = Math.round(strike.dmg*(1+accBonus('pulseWave'))) + dmgBonus('pulseWave');
     const line = getAxisLine(player.boardPosition, dir, 3);
     const hitsEnemy = line.some(t=>t.x===enemy.boardPosition.x&&t.y===enemy.boardPosition.y);
     const newFacing=facingToward(player.boardPosition,targetTile);
-    const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-4),facing:newFacing},'pulseWave');
+    const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-3),facing:newFacing},'pulseWave');
     if(!hitsEnemy){
       addLog(`Pulse Wave [${strike.rollsLabel}, ${strike.acc}% (${accuracyTierLabel(strike.acc)})] -> no targets on the line`);
       routeAfterPlayerAction(updatedPlayer, enemy);
@@ -3943,7 +4337,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const updatedEnemy={...enemy,health:newHP};
     if(newHP<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
-  },[player,enemy,wave,selCategory,selElement,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx]);
+  },[player,enemy,wave,selCategory,selElement,dmgBonus,accBonus,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx]);
 
   // ── PIERCING LIGHT (Tactical Skill) ──
   // A 2-tile-forward thrust, using current facing — no grid targeting
@@ -3955,7 +4349,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
 
   const resolvePiercingLight = useCallback((energySpent)=>{
     setPiercingLightCtx(null);
-    const dmg = piercingLightDamage(energySpent);
+    const dmg = Math.round(piercingLightDamage(energySpent)*(1+accBonus('piercingLight'))) + dmgBonus('piercingLight');
     const line = getForwardTiles(player.boardPosition, player.facing, 2);
     const hitsEnemy = line.some(t=>t.x===enemy.boardPosition.x&&t.y===enemy.boardPosition.y);
     const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-energySpent)},'piercingLight');
@@ -3970,7 +4364,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const updatedEnemy={...enemy,health:newHP};
     if(newHP<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
-  },[player,enemy,wave,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx]);
+  },[player,enemy,wave,dmgBonus,accBonus,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx]);
 
   // ── CIRCUIT SIGIL (Core Skill, crafting-locked — dormant until BATTLE_SKILLS
   // drops the `locked` flag) ── canDeployMulti is defined later in the file
@@ -4157,7 +4551,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           // act themselves this round (the sequence already started), but
           // present and player-attackable starting next round.
           setEnemies([...allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e), ...res.promoted]);
-          if(updatedPlayer.health<=0){ addLog('=== DEFEAT ==='); return; }
+          if(updatedPlayer.health<=0){ addLog('=== DEFEAT ==='); setShowDefeatModal(true); return; }
         }
       }
 
@@ -4241,7 +4635,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           updatedPlayer={...updatedPlayer,health:newHP};
           updatedEnemy=markSkillUsed({...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-2),facing},'compassSlash');
           setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
-          if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
+          if(newHP<=0){ addLog('=== DEFEAT ==='); setShowDefeatModal(true); return; }
           finishStep();
           return;
         }
@@ -4274,7 +4668,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           updatedEnemy=markSkillUsed({...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-2),facing,
             boardPosition: newHP<=0 ? updatedPlayer.boardPosition : updatedEnemy.boardPosition},'darkWeb');
           setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
-          if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
+          if(newHP<=0){ addLog('=== DEFEAT ==='); setShowDefeatModal(true); return; }
           finishStep();
           return;
         }
@@ -4287,7 +4681,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           updatedPlayer={...updatedPlayer,health:newHP};
           updatedEnemy=markSkillUsed({...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-energySpent),facing:decision.facing},'piercingLight');
           setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
-          if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
+          if(newHP<=0){ addLog('=== DEFEAT ==='); setShowDefeatModal(true); return; }
           finishStep();
           return;
         }
@@ -4298,31 +4692,42 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
           addLog(`${updatedEnemy.name} Pulse Wave [${strike.rollsLabel}, ${strike.acc}% (${accuracyTierLabel(strike.acc)})] -> ${strike.dmg} dmg`);
           triggerCastFx(updatedPlayer.boardPosition, ELEMENTS[updatedEnemy.elementCategory]?.[updatedEnemy.element]?.color||'#c9a7f7');
           updatedPlayer={...updatedPlayer,health:newHP};
-          updatedEnemy=markSkillUsed({...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-4),facing:newFacing},'pulseWave');
+          updatedEnemy=markSkillUsed({...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-3),facing:newFacing},'pulseWave');
           setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
-          if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
+          if(newHP<=0){ addLog('=== DEFEAT ==='); setShowDefeatModal(true); return; }
           finishStep();
           return;
         }
       }
 
       if(canUseElement){
-        const strike = computeElementalStrike(updatedEnemy, updatedPlayer, tiles, updatedObstacles);
+        const otherUnitPositions=[...allEnemies.filter(e=>e.id!==updatedEnemy.id&&e.health>0).map(e=>e.boardPosition), ...updatedSummons.map(s=>s.boardPosition)];
+        const strike = computeElementalStrike(updatedEnemy, updatedPlayer, tiles, updatedObstacles, otherUnitPositions);
         if(strike){
           addLog(strike.log);
           updatedEnemy={...updatedEnemy,actionpts:Math.max(0,updatedEnemy.actionpts-strike.eCost),skillUsed:true,facing:strike.castFacing};
           if(strike.newObstacles?.length>0){ updatedObstacles=[...updatedObstacles, ...strike.newObstacles]; setObstacles(updatedObstacles); }
           if(strike.obstacleHit){
-            const {id,dmg:obsDmg}=strike.obstacleHit;
+            const {id,dmg:obsDmg,heal}=strike.obstacleHit;
             const hitOne=updatedObstacles.find(o=>o.id===id);
-            const newHP=hitOne?Math.max(0,hitOne.health-obsDmg):0;
-            addLog(newHP<=0?`Rubble destroyed!`:`Rubble takes ${obsDmg} dmg (${newHP}/${hitOne.maxHealth}).`);
-            updatedObstacles = newHP<=0 ? updatedObstacles.filter(o=>o.id!==id) : updatedObstacles.map(o=>o.id===id?{...o,health:newHP}:o);
+            if(heal){
+              const newHP=hitOne?Math.min(hitOne.maxHealth,hitOne.health+obsDmg):0;
+              addLog(hitOne?`Rubble reinforced +${obsDmg} (${newHP}/${hitOne.maxHealth}).`:'');
+              updatedObstacles = updatedObstacles.map(o=>o.id===id?{...o,health:newHP}:o);
+            } else {
+              const newHP=hitOne?Math.max(0,hitOne.health-obsDmg):0;
+              addLog(newHP<=0?`Rubble destroyed!`:`Rubble takes ${obsDmg} dmg (${newHP}/${hitOne.maxHealth}).`);
+              updatedObstacles = newHP<=0 ? updatedObstacles.filter(o=>o.id!==id) : updatedObstacles.map(o=>o.id===id?{...o,health:newHP}:o);
+            }
             setObstacles(updatedObstacles);
           }
-          if(strike.floodTile){
-            const ft=strike.floodTile;
-            setTiles(prev=>{ if(prev[ft.y][ft.x]===TILE_TYPES.WATER_BOOST) return prev; const g=prev.map(r=>r.slice()); g[ft.y][ft.x]=TILE_TYPES.WATER_BOOST; return g; });
+          if(strike.floodTiles){
+            const fts=strike.floodTiles;
+            setTiles(prev=>{ const g=prev.map(r=>r.slice()); fts.forEach(ft=>{ g[ft.y][ft.x]=TILE_TYPES.WATER_BOOST; }); return g; });
+          }
+          if(strike.scorchTile){
+            const st=strike.scorchTile;
+            setTiles(prev=>{ const g=prev.map(r=>r.slice()); g[st.y][st.x]=TILE_TYPES.FIRE_BOOST; return g; });
           }
           if(strike.dmg>0){
             const newHP=Math.max(0,updatedPlayer.health-strike.dmg);
@@ -4330,7 +4735,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
             updatedPlayer={...updatedPlayer,health:newHP,boardPosition:strike.knockbackPos||updatedPlayer.boardPosition};
             if(strike.appliesBurn) updatedPlayer=applyBurn(updatedPlayer);
             setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
-            if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
+            if(newHP<=0){ addLog('=== DEFEAT ==='); setShowDefeatModal(true); return; }
           } else {
             setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
           }
@@ -4352,7 +4757,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         const eMeleeFacing=facingToward(updatedEnemy.boardPosition,updatedPlayer.boardPosition);
         updatedEnemy={...updatedEnemy,actionpts:updatedEnemy.actionpts-mult,facing:eMeleeFacing};
         setPlayer(updatedPlayer); setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
-        if(newHP<=0){ addLog('=== DEFEAT ==='); return; }
+        if(newHP<=0){ addLog('=== DEFEAT ==='); setShowDefeatModal(true); return; }
         finishStep();
         return;
       }
@@ -4390,18 +4795,11 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       const tier=enemyTier(updatedEnemy.level);
       const target=pickApproachTile(updatedEnemy.boardPosition,updatedPlayer.boardPosition,updatedPlayer.facing,tier,[updatedPlayer.boardPosition,...moveBlockers]);
       const goal=target||updatedPlayer.boardPosition;
-      const curDist=manhattan(updatedEnemy.boardPosition,goal);
-      const moves=getMoveToward(updatedEnemy.boardPosition.x,updatedEnemy.boardPosition.y,goal.x,goal.y);
-      let moved=false;
-      for(const m of moves){
-        const blocked=moveBlockers.some(b=>b.x===m.x&&b.y===m.y);
-        if(m.x>=0&&m.x<SIZE&&m.y>=0&&m.y<SIZE&&!(m.x===updatedPlayer.boardPosition.x&&m.y===updatedPlayer.boardPosition.y)&&!blocked){
-          if(manhattan(m,goal)<curDist){
-            const nf=facingFromMove(updatedEnemy.boardPosition,m);
-            updatedEnemy={...updatedEnemy,boardPosition:m,facing:nf,actionpts:updatedEnemy.actionpts-1};
-            addLog(`${updatedEnemy.name} -> (${m.x},${m.y})`); moved=true; break;
-          }
-        }
+      const walk=walkTowardGoal(updatedEnemy.boardPosition,updatedEnemy.facing,goal,[updatedPlayer.boardPosition,...moveBlockers],updatedEnemy.actionpts,ENEMY_MOVE_SPEED);
+      let moved=walk.steps>0;
+      if(moved){
+        updatedEnemy={...updatedEnemy,boardPosition:walk.pos,facing:walk.facing,actionpts:updatedEnemy.actionpts-walk.steps};
+        addLog(`${updatedEnemy.name} -> (${walk.pos.x},${walk.pos.y})${walk.steps>1?` [${walk.steps} tiles]`:''}`);
       }
       if(!moved){
         const saved=updatedEnemy.actionpts;
@@ -4413,14 +4811,14 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       }
       // Longshot Protocol — a repositioning move, so it checks right here.
       if((updatedEnemy.loadout||[]).includes('longshotProtocol')){
-        const hit=checkLongshotProtocol(updatedEnemy.boardPosition,[updatedPlayer],moveBlockers);
-        if(hit){
+        const hits=checkLongshotProtocol(updatedEnemy.boardPosition,[updatedPlayer],moveBlockers);
+        if(hits.length>0){
           const newHP=Math.max(0,updatedPlayer.health-LONGSHOT_DMG);
           addLog(`◎ ${updatedEnemy.name} Longshot Protocol -> ${LONGSHOT_DMG} dmg (${newHP}/${updatedPlayer.maxHealth})`);
           triggerCastFx(updatedPlayer.boardPosition,'#88e0c0');
           updatedPlayer={...updatedPlayer,health:newHP};
           setPlayer(updatedPlayer);
-          if(newHP<=0){ setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e)); addLog('=== DEFEAT ==='); return; }
+          if(newHP<=0){ setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e)); addLog('=== DEFEAT ==='); setShowDefeatModal(true); return; }
         }
       }
       setEnemies(allEnemies.map(e=>e.id===updatedEnemy.id?updatedEnemy:e));
@@ -4525,6 +4923,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(remaining.length>0) return; // battle continues with the survivors
     const battle = CAMPAIGN_BATTLES[campaignBattle-1];
     addLog(battle.isFinale ? '=== CAMPAIGN COMPLETE — the army falls. ===' : `=== Battle ${campaignBattle}/${CAMPAIGN_BATTLES.length} cleared! ===`);
+    onBattleCleared?.(campaignBattle);
     if(battle.isFinale){
       setCampaignComplete(true);
       setPlayer(p=>({...p, equipment:[...(p.equipment||[]), FIRST_EQUIPMENT],
@@ -4532,7 +4931,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       addLog(`◈ ${FIRST_EQUIPMENT.name} acquired — ${FIRST_EQUIPMENT.statBonus}.`);
     }
     setShowBattleComplete(true);
-  },[campaignBattle,addLog,applyLevelUp]);
+  },[campaignBattle,addLog,applyLevelUp,onBattleCleared]);
 
   const startNextCampaignBattle = useCallback((curPlayer, nextStage)=>{
     const battle = CAMPAIGN_BATTLES[nextStage-1];
@@ -4562,16 +4961,46 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     addLog(`=== Battle ${nextStage}/${CAMPAIGN_BATTLES.length} — ${battle.name} ===`);
   },[addLog,loadout,selElement]);
 
-  const handleCampaignIntroSubmit = useCallback((name, pickedLoadout, element)=>{
-    setPlayer(p=>({...p, name}));
-    setLoadout(pickedLoadout);
-    setLoadoutUnlocked(true);
-    setSelCategory('base');
-    setSelElement(element);
-    setShowCampaignIntro(false);
-    const skillNames = pickedLoadout.map(id=>BATTLE_SKILLS.find(s=>s.id===id)?.name).filter(Boolean).join(', ');
-    addLog(`=== ${name} deployed — ${skillNames} · ${element} ===`);
-  },[addLog]);
+  // Retry after a defeat — same stage, fresh roster, full heal (unlike a
+  // normal Continue, which deliberately carries HP forward between battles).
+  // Hexas/materials/XP already earned this run stay banked either way.
+  const handleCampaignRetry = useCallback(()=>{
+    setShowDefeatModal(false);
+    startNextCampaignBattle({...player, health:player.maxHealth}, campaignBattle);
+  },[player,campaignBattle,startNextCampaignBattle]);
+
+  // Just a navigation hop back to the main menu — NOT a quit. The Campaign
+  // session (player HP/level, roster, battle stage, and this very modal's
+  // open/closed state) stays exactly as it is; App.jsx keeps this component
+  // mounted (just hidden) the same way it already does for the floating
+  // menu button, so coming back to Campaign resumes right where this left
+  // off, modal and all -- *if* the battle was already decided (this modal's
+  // own "Return to Menu" only fires from the Battle Complete / Defeat
+  // modals, both post-decision). Deliberately distinct from
+  // onQuit/onCampaignComplete, which really do end the run and reset
+  // progress. See the `leaveSignal` effect below for the other exit path —
+  // the floating "Main" button, which *can* fire mid-fight.
+  const handleCampaignReturnToMenu = useCallback(()=>{
+    onReturnToMenu?.();
+  },[onReturnToMenu]);
+
+  // App.jsx bumps `leaveSignal` whenever the player backs all the way out to
+  // the main menu (the floating "Main" button, or the NavBar's) while this
+  // Campaign session stays mounted-but-hidden. If that happened mid-fight —
+  // no Battle Complete/Defeat modal open to have already paused things at a
+  // decision point — the fight itself would otherwise just sit there
+  // half-finished and resume exactly as abandoned. Quit no longer exists as
+  // its own button (Main replaces it), so this is what makes leaving mid-
+  // battle actually mean something: the current stage restarts fresh, full
+  // HP, same as clicking Retry after a defeat — nothing about the run
+  // (level, XP, loadout, stage number, Hexas/materials) is lost, only the
+  // fight in progress.
+  useEffect(()=>{
+    if(!isCampaign || !leaveSignal) return;
+    if(showBattleComplete || showDefeatModal || campaignComplete) return;
+    startNextCampaignBattle({...player, health:player.maxHealth}, campaignBattle);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[leaveSignal]);
 
   const handleRollEnergyMulti = useCallback(()=>{
     const {unit:burnedPlayer, tickLog}=tickBurn(player);
@@ -4758,38 +5187,41 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(flank.bonus>0) dmg+=flank.bonus;
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Fire');
     if(tileBoost>0) dmg+=tileBoost;
+    dmg=Math.round(dmg*(1+accBonus('Fire')))+dmgBonus('Fire');
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-3),skillUsed:true};
     const appliesBurn=pulses>=3;
-    if(target) addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tileBoost>0?' [Fire tile +20]':''}${appliesBurn?' [Burn]':''}`);
+    if(appliesBurn && target) setTiles(prev=>{ const g=prev.map(r=>r.slice()); g[target.boardPosition.y][target.boardPosition.x]=TILE_TYPES.FIRE_BOOST; return g; });
+    if(target) addLog(`Ember Strike [${pulses}x${dmgEach*SKILL_DICE_MULT}=${base}] ${acc}% (${accuracyTierLabel(acc)}) -> ${dmg} dmg${flank.label?' ['+flank.label+']':''}${tileBoost>0?' [Fire tile +20]':''}${appliesBurn?' [Burn, Scorch]':''}`);
     resetDiceModal();
     applySkillResultMulti(target, dmg, updatedPlayer, appliesBurn?{burn:{turns:BURN_TURNS,dmg:BURN_DMG}}:{}, ELEMENTS.base.Fire.color);
-  },[diceRolls,lockedRoll,player,tiles,addLog,resetDiceModal,resolveTargetForSkill,applySkillResultMulti]);
+  },[diceRolls,lockedRoll,player,tiles,dmgBonus,accBonus,addLog,resetDiceModal,resolveTargetForSkill,applySkillResultMulti]);
 
   const handleEarthApplyWithAccuracyMulti = useCallback((acc)=>{
     const origin=lockedRoll.origin;
     const dieRoll=diceRolls[0].value;
-    const base=dieRoll*SKILL_DICE_MULT;
+    const base=dieRoll*EARTH_DICE_MULT;
     const strikeables=[...enemies, ...summons.filter(s=>s.side==='enemy')];
-    const {hitObstacle,hitTarget,newObstacleTiles}=resolveEarthTremor(origin, earthRange, strikeables, obstacles, strikeables.map(e=>e.boardPosition));
+    const occupiedExtra=[...strikeables.map(e=>e.boardPosition), ...summons.filter(s=>s.side==='player').map(s=>s.boardPosition)];
+    const {hitObstacle,hitTarget,newObstacleTiles}=resolveEarthTremor(origin, earthRange, strikeables, obstacles, occupiedExtra, tiles);
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Earth');
-    const rawDmg=Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost;
+    const rawDmg=Math.round((Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost)*(1+accBonus('Earth')))+dmgBonus('Earth');
     const dmg=hitTarget?rawDmg:0;
     const cost=1+earthRange;
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
-    const outcome=hitTarget?`${dmg} dmg${tileBoost>0?' [Earth tile +20]':''}`:hitObstacle?'struck rubble instead':'MISS (nothing in line)';
+    const outcome=hitTarget?`${dmg} dmg${tileBoost>0?' [Earth tile +20]':''}`:hitObstacle?'reinforced rubble instead':'MISS (nothing in line)';
     addLog(`Tremor [d6=${dieRoll}, ${earthRange} tile${earthRange>1?'s':''}, ${acc}% (${accuracyTierLabel(acc)})] -> ${outcome}${newObstacleTiles.length>0?` (+${newObstacleTiles.length} rubble)`:''}`);
     if(newObstacleTiles.length>0) setObstacles(prev=>[...prev, ...newObstacleTiles.map(t=>makeObstacle(t))]);
     if(hitObstacle){
       setObstacles(prev=>{
         const hitOne=prev.find(o=>o.id===hitObstacle.id);
-        const newHP=hitOne?Math.max(0,hitOne.health-rawDmg):0;
-        addLog(newHP<=0?'Rubble destroyed!':`Rubble takes ${rawDmg} dmg (${newHP}/${hitOne.maxHealth}).`);
-        return newHP<=0 ? prev.filter(o=>o.id!==hitObstacle.id) : prev.map(o=>o.id===hitObstacle.id?{...o,health:newHP}:o);
+        const newHP=hitOne?Math.min(hitOne.maxHealth,hitOne.health+rawDmg):0;
+        addLog(`Rubble reinforced +${rawDmg} (${newHP}/${hitOne?.maxHealth}).`);
+        return prev.map(o=>o.id===hitObstacle.id?{...o,health:newHP}:o);
       });
     }
     resetDiceModal();
     applySkillResultMulti(hitTarget, dmg, updatedPlayer, {}, ELEMENTS.base.Earth.color);
-  },[diceRolls,lockedRoll,player,tiles,obstacles,earthRange,enemies,summons,addLog,resetDiceModal,applySkillResultMulti]);
+  },[diceRolls,lockedRoll,player,tiles,obstacles,earthRange,enemies,summons,dmgBonus,accBonus,addLog,resetDiceModal,applySkillResultMulti]);
 
   const handleAirApplyWithAccuracyMulti = useCallback((acc)=>{
     const origin=lockedRoll.origin;
@@ -4804,15 +5236,25 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const target = hit ? strikeables.find(u=>u.boardPosition.x===line[step].x&&u.boardPosition.y===line[step].y) : null;
     const base=airGaleForceDamage(dieRoll);
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Air');
-    const rawDmg=Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost;
+    const rawDmg=Math.round((Math.max(RANGED_SKILL_MIN_DMG,applyAccuracy(base,acc))+tileBoost)*(1+accBonus('Air')))+dmgBonus('Air');
     const dmg=target?rawDmg:0;
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-2),skillUsed:true};
     let extra={};
     if(target){
       const knockDist=Math.max(1,dieRoll-dist);
-      const blockers=[origin.boardPosition,...strikeables.filter(u=>u.id!==target.id).map(u=>u.boardPosition),...obstacles.map(o=>o.boardPosition)];
-      extra.boardPosition=getKnockbackTile(target.boardPosition,origin.facing,knockDist,blockers);
-      addLog(`Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} + knockback ${knockDist} tile${knockDist>1?'s':''}`);
+      const blockers=[origin.boardPosition,...strikeables.filter(u=>u.id!==target.id).map(u=>u.boardPosition)];
+      const kb=getKnockbackTile(target.boardPosition,origin.facing,knockDist,blockers,obstacles);
+      extra.boardPosition={x:kb.x,y:kb.y};
+      addLog(`Gale Force [d8=${dieRoll}, ${acc}% (${accuracyTierLabel(acc)})] -> ${dmg} dmg${tileBoost>0?' [Air tile +20]':''} + knockback ${knockDist} tile${knockDist>1?'s':''}${kb.hitObstacle?' [knocked into rubble]':''}`);
+      if(kb.hitObstacle){
+        const hitId=kb.hitObstacle.id;
+        setObstacles(prev=>{
+          const hitOne=prev.find(o=>o.id===hitId);
+          const newHP=hitOne?Math.max(0,hitOne.health-rawDmg):0;
+          addLog(newHP<=0?'Rubble destroyed!':`Rubble takes ${rawDmg} dmg (${newHP}/${hitOne.maxHealth}).`);
+          return newHP<=0 ? prev.filter(o=>o.id!==hitId) : prev.map(o=>o.id===hitId?{...o,health:newHP}:o);
+        });
+      }
     } else if(blocked){
       setObstacles(prev=>{
         const hitOne=prev.find(o=>o.id===lineObstacle.obstacle.id);
@@ -4825,7 +5267,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     }
     resetDiceModal();
     applySkillResultMulti(target, dmg, updatedPlayer, extra, ELEMENTS.base.Air.color);
-  },[diceRolls,lockedRoll,player,tiles,obstacles,enemies,summons,addLog,resetDiceModal,applySkillResultMulti]);
+  },[diceRolls,lockedRoll,player,tiles,obstacles,enemies,summons,dmgBonus,accBonus,addLog,resetDiceModal,applySkillResultMulti]);
 
   const handleWaterApplyWithAccuracyMulti = useCallback((acc)=>{
     const origin=lockedRoll.origin;
@@ -4836,15 +5278,15 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     const strikeables=[...enemies, ...summons.filter(s=>s.side==='enemy')];
     const target = strikeables.find(u=>footprint.some(t=>t.x===u.boardPosition.x&&t.y===u.boardPosition.y));
     const tileBoost=getTileBoost(tiles,origin.boardPosition,'Water');
-    const dmg=target?applyAccuracy(res.damage,acc)+tileBoost:0;
+    const dmg=target?Math.round((applyAccuracy(res.damage,acc)+tileBoost)*(1+accBonus('Water')))+dmgBonus('Water'):0;
     const cost=TORRENT_AOE_COST[waterAoe];
     const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
     const flooded=dieRoll>=10;
-    if(flooded) setTiles(prev=>{ if(prev[anchor.y][anchor.x]===TILE_TYPES.WATER_BOOST) return prev; const g=prev.map(r=>r.slice()); g[anchor.y][anchor.x]=TILE_TYPES.WATER_BOOST; return g; });
+    if(flooded) setTiles(prev=>{ const g=prev.map(r=>r.slice()); footprint.forEach(ft=>{ g[ft.y][ft.x]=TILE_TYPES.WATER_BOOST; }); return g; });
     addLog(`Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[waterAoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${target?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS (no enemy in blast)'}${flooded?' [Flood]':''}`);
     resetDiceModal();
     applySkillResultMulti(target, dmg, updatedPlayer, {}, ELEMENTS.base.Water.color);
-  },[diceRolls,lockedRoll,player,tiles,waterAoe,enemies,summons,addLog,resetDiceModal,applySkillResultMulti]);
+  },[diceRolls,lockedRoll,player,tiles,waterAoe,enemies,summons,dmgBonus,accBonus,addLog,resetDiceModal,applySkillResultMulti]);
 
   // ── Compass Slash / Dark Web targeting resolution ──
   const deployTilesMulti = getDeployTiles(tiles, player.boardPosition, enemies.map(e=>e.boardPosition), [...summons, ...obstacles]);
@@ -4863,12 +5305,38 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       routeAfterPlayerActionMulti(markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2)},'compassSlash'), enemies);
       return;
     }
-    const dmg=60;
+    const dmg=Math.round(60*(1+accBonus('compassSlash')))+dmgBonus('compassSlash');
     const slashFacing=facingToward(player.boardPosition,targetTile);
     addLog(`Compass Slash -> ${dmg} dmg`);
     const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),facing:slashFacing},'compassSlash');
     applySkillResultMulti(target, dmg, updatedPlayer, {}, '#9b6cff');
-  },[player,enemies,summons,addLog,applySkillResultMulti,routeAfterPlayerActionMulti]);
+  },[player,enemies,summons,dmgBonus,accBonus,addLog,applySkillResultMulti,routeAfterPlayerActionMulti]);
+
+  // Shared tail for a multi-hit skill (Pulse Wave, Piercing Light, Dark
+  // Web's leap, Longshot Protocol) once damage has already been applied to
+  // every hit enemy in `damaged`: routes a no-kill result normally, a single
+  // kill through the real defeat pipeline (XP/Hexas/battle-clear), and any
+  // *additional* simultaneous kills by granting their XP/Hexas directly and
+  // folding them out of the roster before that one pipeline call, so nothing
+  // double-counts and the "battle cleared" check still sees the true final
+  // roster. Defined ahead of its callers below — its own deps array is read
+  // eagerly every render, so a forward reference here would be a genuine
+  // temporal-dead-zone crash, not just a lazy-closure non-issue.
+  const resolveMultiHitKills = useCallback((hitIds, damaged, updatedPlayer, skillLabel)=>{
+    const firstKillId = damaged.find(e=>hitIds.has(e.id)&&e.health<=0)?.id;
+    if(!firstKillId){ routeAfterPlayerActionMulti(updatedPlayer, damaged); return; }
+    const otherDeadIds = damaged.filter(e=>hitIds.has(e.id)&&e.id!==firstKillId&&e.health<=0).map(e=>e.id);
+    const rosterForDefeat = otherDeadIds.length===0 ? damaged : damaged.filter(e=>!otherDeadIds.includes(e.id));
+    if(otherDeadIds.length>0){
+      const extraXp=(150+campaignBattle*150)*otherDeadIds.length;
+      const extraHex=(40+campaignBattle*30)*otherDeadIds.length;
+      addLog(`+${extraXp} XP, +${extraHex} Hexas from ${otherDeadIds.length} more ${skillLabel} kill${otherDeadIds.length>1?'s':''}`);
+      setHexas(h=>h+extraHex);
+      handleEnemyDefeatedMulti(firstKillId, {...updatedPlayer, playerXp:(updatedPlayer.playerXp||0)+extraXp}, rosterForDefeat);
+    } else {
+      handleEnemyDefeatedMulti(firstKillId, updatedPlayer, rosterForDefeat);
+    }
+  },[campaignBattle,addLog,handleEnemyDefeatedMulti,routeAfterPlayerActionMulti]);
 
   const resolveDarkWebMulti = useCallback((targetTile)=>{
     if(!isKnightMove(player.boardPosition,targetTile)){ addLog('// Target not a knight-move tile'); return; }
@@ -4885,11 +5353,28 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         ...(occupied?{}:{boardPosition:targetTile,facing:leapFacing})},'darkWeb');
       addLog(occupied ? '// Dark Web strikes an occupied tile — 2 Energy spent, no leap'
         : `Dark Web leaps to (${targetTile.x},${targetTile.y}) — 2 Energy spent`);
+      // Dark Web's leap is a genuine reposition, same as a normal move — so
+      // it can also land the player on a Longshot Protocol diagonal.
+      if(!occupied && loadout.includes('longshotProtocol')){
+        const blockers=[...summons.map(s=>s.boardPosition), ...enemies.map(e=>e.boardPosition)];
+        const hits=checkLongshotProtocol(updatedPlayer.boardPosition, enemies, blockers);
+        if(hits.length>0){
+          const snipeDmg=Math.round(LONGSHOT_DMG*(1+accBonus('longshotProtocol')))+dmgBonus('longshotProtocol');
+          hits.forEach(hit=>{
+            addLog(`◎ Longshot Protocol -> ${hit.name} takes ${snipeDmg} dmg`);
+            triggerCastFx(hit.boardPosition,'#88e0c0');
+          });
+          const hitIds=new Set(hits.map(h=>h.id));
+          const damaged=enemies.map(e=>hitIds.has(e.id)?{...e,health:Math.max(0,e.health-snipeDmg)}:e);
+          resolveMultiHitKills(hitIds, damaged, updatedPlayer, 'Longshot Protocol');
+          return;
+        }
+      }
       routeAfterPlayerActionMulti(updatedPlayer, enemies);
       return;
     }
     const acc=rollD100Accuracy();
-    const dmg=applyAccuracy(70,acc);
+    const dmg=Math.round(applyAccuracy(70,acc)*(1+accBonus('darkWeb')))+dmgBonus('darkWeb');
     const strikeFacing=facingToward(player.boardPosition,targetTile);
     const newHP=Math.max(0,target.health-dmg);
     let updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-2),facing:strikeFacing},'darkWeb');
@@ -4899,30 +5384,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     }
     addLog(`Dark Web -> ${dmg} dmg (${acc}% ${accuracyTierLabel(acc)})${newHP<=0?' — finishing blow, claims tile':''}`);
     applySkillResultMulti(target, dmg, updatedPlayer, {}, '#a0a0a0');
-  },[player,enemies,summons,obstacles,addLog,applySkillResultMulti,routeAfterPlayerActionMulti,applyHealingIfLanded]);
-
-  // Shared tail for a multi-hit skill (Pulse Wave, Piercing Light) once
-  // damage has already been applied to every hit enemy in `damaged`: routes
-  // a no-kill result normally, a single kill through the real defeat
-  // pipeline (XP/Hexas/battle-clear), and any *additional* simultaneous
-  // kills by granting their XP/Hexas directly and folding them out of the
-  // roster before that one pipeline call, so nothing double-counts and the
-  // "battle cleared" check still sees the true final roster.
-  const resolveMultiHitKills = useCallback((hitIds, damaged, updatedPlayer, skillLabel)=>{
-    const firstKillId = damaged.find(e=>hitIds.has(e.id)&&e.health<=0)?.id;
-    if(!firstKillId){ routeAfterPlayerActionMulti(updatedPlayer, damaged); return; }
-    const otherDeadIds = damaged.filter(e=>hitIds.has(e.id)&&e.id!==firstKillId&&e.health<=0).map(e=>e.id);
-    const rosterForDefeat = otherDeadIds.length===0 ? damaged : damaged.filter(e=>!otherDeadIds.includes(e.id));
-    if(otherDeadIds.length>0){
-      const extraXp=(150+campaignBattle*150)*otherDeadIds.length;
-      const extraHex=(40+campaignBattle*30)*otherDeadIds.length;
-      addLog(`+${extraXp} XP, +${extraHex} Hexas from ${otherDeadIds.length} more ${skillLabel} kill${otherDeadIds.length>1?'s':''}`);
-      setHexas(h=>h+extraHex);
-      handleEnemyDefeatedMulti(firstKillId, {...updatedPlayer, playerXp:(updatedPlayer.playerXp||0)+extraXp}, rosterForDefeat);
-    } else {
-      handleEnemyDefeatedMulti(firstKillId, updatedPlayer, rosterForDefeat);
-    }
-  },[campaignBattle,addLog,handleEnemyDefeatedMulti,routeAfterPlayerActionMulti]);
+  },[player,enemies,summons,obstacles,loadout,dmgBonus,accBonus,addLog,applySkillResultMulti,routeAfterPlayerActionMulti,resolveMultiHitKills,triggerCastFx,applyHealingIfLanded]);
 
   // Applies flat `dmg` to every enemy-side summon in `hitSummons` (the
   // summon half of a multi-hit AoE skill's damage — see resolveMultiHitKills
@@ -4948,11 +5410,12 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(!dir || dist>3){ addLog('// Target not on a straight or diagonal line within 3 tiles'); return; }
     const strike = computePulseWaveDamage({element:selElement,elementCategory:selCategory});
     if(!strike){ addLog('// No element equipped'); return; }
+    strike.dmg = Math.round(strike.dmg*(1+accBonus('pulseWave'))) + dmgBonus('pulseWave');
     const line = getAxisLine(player.boardPosition, dir, 3);
     const hitIds = new Set(enemies.filter(e=>line.some(t=>t.x===e.boardPosition.x&&t.y===e.boardPosition.y)).map(e=>e.id));
     const hitSummons = summons.filter(s=>s.side==='enemy' && line.some(t=>t.x===s.boardPosition.x&&t.y===s.boardPosition.y));
     const newFacing=facingToward(player.boardPosition,targetTile);
-    const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-4),facing:newFacing},'pulseWave');
+    const updatedPlayer=markSkillUsed({...player,actionpts:Math.max(0,player.actionpts-3),facing:newFacing},'pulseWave');
     if(hitIds.size===0 && hitSummons.length===0){
       addLog(`Pulse Wave [${strike.rollsLabel}, ${strike.acc}% (${accuracyTierLabel(strike.acc)})] -> no targets on the line`);
       routeAfterPlayerActionMulti(updatedPlayer, enemies);
@@ -4967,12 +5430,12 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(hitIds.size===0){ routeAfterPlayerActionMulti(updatedPlayer, enemies); return; }
     const damaged = enemies.map(e=>hitIds.has(e.id)?{...e,health:Math.max(0,e.health-strike.dmg)}:e);
     resolveMultiHitKills(hitIds, damaged, updatedPlayer, 'Pulse Wave');
-  },[player,enemies,summons,selCategory,selElement,addLog,resolveMultiHitKills,applyAoeDamageToSummons,routeAfterPlayerActionMulti,triggerCastFx]);
+  },[player,enemies,summons,selCategory,selElement,dmgBonus,accBonus,addLog,resolveMultiHitKills,applyAoeDamageToSummons,routeAfterPlayerActionMulti,triggerCastFx]);
 
   // ── PIERCING LIGHT (Tactical Skill) — Campaign ──
   const resolvePiercingLightMulti = useCallback((energySpent)=>{
     setPiercingLightCtx(null);
-    const dmg = piercingLightDamage(energySpent);
+    const dmg = Math.round(piercingLightDamage(energySpent)*(1+accBonus('piercingLight'))) + dmgBonus('piercingLight');
     const line = getForwardTiles(player.boardPosition, player.facing, 2);
     const hitIds = new Set(enemies.filter(e=>line.some(t=>t.x===e.boardPosition.x&&t.y===e.boardPosition.y)).map(e=>e.id));
     const hitSummons = summons.filter(s=>s.side==='enemy' && line.some(t=>t.x===s.boardPosition.x&&t.y===s.boardPosition.y));
@@ -4990,7 +5453,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(hitIds.size===0){ routeAfterPlayerActionMulti(updatedPlayer, enemies); return; }
     const damaged = enemies.map(e=>hitIds.has(e.id)?{...e,health:Math.max(0,e.health-dmg)}:e);
     resolveMultiHitKills(hitIds, damaged, updatedPlayer, 'Piercing Light');
-  },[player,enemies,summons,addLog,resolveMultiHitKills,applyAoeDamageToSummons,routeAfterPlayerActionMulti,triggerCastFx]);
+  },[player,enemies,summons,dmgBonus,accBonus,addLog,resolveMultiHitKills,applyAoeDamageToSummons,routeAfterPlayerActionMulti,triggerCastFx]);
 
   const resolveDeployPlacementMulti = useCallback((tile)=>{
     const legal=deployTilesMulti.some(t=>t.x===tile.x&&t.y===tile.y);
@@ -5222,16 +5685,39 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     if(loadout.includes('longshotProtocol')){
       const targets = isCampaign ? enemies : [enemy];
       const blockers = [...summons.map(s=>s.boardPosition), ...(isCampaign?enemies.map(e=>e.boardPosition):[])];
-      const hit = checkLongshotProtocol(updatedPlayer.boardPosition, targets, blockers);
-      if(hit){
-        const newHP=Math.max(0,hit.health-LONGSHOT_DMG);
-        addLog(`◎ Longshot Protocol -> ${hit.name} takes ${LONGSHOT_DMG} dmg (${newHP}/${hit.maxHealth})`);
-        triggerCastFx(hit.boardPosition,'#88e0c0');
+      const hits = checkLongshotProtocol(updatedPlayer.boardPosition, targets, blockers);
+      if(hits.length>0){
+        const snipeDmg=Math.round(LONGSHOT_DMG*(1+accBonus('longshotProtocol')))+dmgBonus('longshotProtocol');
+        hits.forEach(hit=>{
+          const newHP=Math.max(0,hit.health-snipeDmg);
+          addLog(`◎ Longshot Protocol -> ${hit.name} takes ${snipeDmg} dmg (${newHP}/${hit.maxHealth})`);
+          triggerCastFx(hit.boardPosition,'#88e0c0');
+        });
         if(isCampaign){
-          const updatedEnemies=enemies.map(e=>e.id===hit.id?{...e,health:newHP}:e);
-          setEnemies(updatedEnemies);
-          if(newHP<=0) setTimeout(()=>handleEnemyDefeatedMulti(hit.id,updatedPlayer,updatedEnemies),300);
+          const hitIds=new Set(hits.map(h=>h.id));
+          const damaged=enemies.map(e=>hitIds.has(e.id)?{...e,health:Math.max(0,e.health-snipeDmg)}:e);
+          const firstKill=damaged.find(e=>hitIds.has(e.id)&&e.health<=0);
+          if(!firstKill){
+            setEnemies(damaged);
+          } else {
+            // Multiple simultaneous kills need the same fold-out-then-defeat
+            // sequencing as resolveMultiHitKills, so a second kill doesn't
+            // get resurrected by a stale roster snapshot in the first call.
+            const otherDeadIds=damaged.filter(e=>hitIds.has(e.id)&&e.id!==firstKill.id&&e.health<=0).map(e=>e.id);
+            const rosterForDefeat=otherDeadIds.length===0?damaged:damaged.filter(e=>!otherDeadIds.includes(e.id));
+            let playerForDefeat=updatedPlayer;
+            if(otherDeadIds.length>0){
+              const extraXp=(150+campaignBattle*150)*otherDeadIds.length;
+              const extraHex=(40+campaignBattle*30)*otherDeadIds.length;
+              addLog(`+${extraXp} XP, +${extraHex} Hexas from ${otherDeadIds.length} more Longshot Protocol kill${otherDeadIds.length>1?'s':''}`);
+              setHexas(h=>h+extraHex);
+              playerForDefeat={...updatedPlayer, playerXp:(updatedPlayer.playerXp||0)+extraXp};
+            }
+            setTimeout(()=>handleEnemyDefeatedMulti(firstKill.id,playerForDefeat,rosterForDefeat),300);
+          }
         } else {
+          const hit=hits[0];
+          const newHP=Math.max(0,hit.health-snipeDmg);
           setEnemy({...enemy,health:newHP});
           if(newHP<=0) setTimeout(()=>handleEnemyDefeated(updatedPlayer,wave),300);
         }
@@ -5240,7 +5726,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     setPlayerSel(false);
     setValidSquares([]);
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[isCampaign,showDeploy,awaitingPlacement,compassTargeting,darkWebTargeting,pulseWaveTargeting,summonPhaseActive,energyPhase,summons,obstacles,actedSummonIds,selectedSummonId,isPlayerTurn,player,enemy,enemies,playerSel,validSquares,tiles,loadout,wave,addLog,triggerCastFx,handleEnemyDefeated,handleEnemyDefeatedMulti,resolveDeployPlacement,resolveDeployPlacementMulti,resolveCompassSlash,resolveCompassSlashMulti,resolveDarkWeb,resolveDarkWebMulti,resolvePulseWave,resolvePulseWaveMulti,summonActionAt,summonActionAtMulti,resolveSummonAction,resolveSummonActionMulti]);
+  },[isCampaign,showDeploy,awaitingPlacement,compassTargeting,darkWebTargeting,pulseWaveTargeting,summonPhaseActive,energyPhase,summons,obstacles,actedSummonIds,selectedSummonId,isPlayerTurn,player,enemy,enemies,playerSel,validSquares,tiles,loadout,wave,campaignBattle,dmgBonus,accBonus,addLog,triggerCastFx,handleEnemyDefeated,handleEnemyDefeatedMulti,resolveDeployPlacement,resolveDeployPlacementMulti,resolveCompassSlash,resolveCompassSlashMulti,resolveDarkWeb,resolveDarkWebMulti,resolvePulseWave,resolvePulseWaveMulti,summonActionAt,summonActionAtMulti,resolveSummonAction,resolveSummonActionMulti]);
 
   // Auto-end the summon command phase once all of the PLAYER's own summons
   // have acted (or pool is empty) — enemy-deployed summons in Campaign act
@@ -5293,6 +5779,72 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[]);
 
+  // Match-start ceremony -- see PlacementRollModal/InitiativeRollModal.
+  // Once the placement step has fully resolved (roll revealed and, on a
+  // free-choice roll, a tile actually picked), show the initiative roll-off
+  // next -- Gauntlet/Training only; Campaign keeps its own fixed Summons ->
+  // Player -> Enemy order and never shows this. Runs once, ever: nothing
+  // ever sets showPlacementRollModal or showPlacementPicker back to true
+  // after they close, so this effect's condition can only become true a
+  // single time in the component's life.
+  useEffect(()=>{
+    if(isCampaign) return;
+    if(!showPlacementRollModal && !showPlacementPicker && firstMoverRef.current===null){
+      setShowInitiativeRollModal(true);
+    }
+  },[showPlacementRollModal, showPlacementPicker, isCampaign]);
+
+  // Rolls the (already-determined, see newHero/rollBackRowPosition) placement
+  // value and animates its reveal -- same roll-then-reveal pattern as
+  // handleDeployRoll's d100.
+  const handlePlacementRoll = useCallback(()=>{
+    setPlacementRolling(true);
+    setTimeout(()=>{
+      const roll = player._placementRoll ?? 0;
+      setPlacementRollValue(roll);
+      setPlacementRolling(false);
+      addLog(roll===0 ? 'Placement d10=0 -> Free choice.' : `Placement d10=${roll} -> Tile ${roll}.`);
+    },600);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[player,addLog]);
+
+  const handlePlacementContinue = useCallback(()=>{
+    setShowPlacementRollModal(false);
+  },[]);
+
+  // Confirms a free-choice placement (see PlacementPickerModal): moves the
+  // player to the chosen back-row column and regenerates tiles around the
+  // new position (the initial tiles were built before this choice existed).
+  // The mount effect above picks up from here to show the initiative modal.
+  const handleConfirmPlacement = useCallback((col)=>{
+    setShowPlacementPicker(false);
+    setPlayer(p => {
+      const updated = {...p, boardPosition:{x:col,y:8}};
+      if(isCampaign){
+        setTiles(makeTiles(updated.boardPosition, {x:-1,y:-1}, enemies.map(e=>e.boardPosition)));
+      } else {
+        setTiles(sceneIncludeTerrain ? makeTiles(updated.boardPosition, enemy.boardPosition) : makePlainTiles());
+      }
+      return updated;
+    });
+  },[isCampaign,enemy,enemies,sceneIncludeTerrain]);
+
+  // Rolls initiative and animates the reveal -- the actual roll happens here
+  // (unlike placement, this one genuinely hasn't happened yet).
+  const handleInitiativeRoll = useCallback(()=>{
+    setInitiativeRolling(true);
+    setTimeout(()=>{
+      const { winner, p, e } = rollInitiative();
+      setInitiativeResult({p, e, winner});
+      setInitiativeRolling(false);
+    },600);
+  },[]);
+
+  const handleBeginBattle = useCallback(()=>{
+    setShowInitiativeRollModal(false);
+    applyInitiativeResult(initiativeResult.winner, player, enemy, round);
+  },[initiativeResult,player,enemy,round,applyInitiativeResult]);
+
   // Mirror the live Proxy/session state up to a host shell (e.g. a Character
   // screen elsewhere in the app) that isn't otherwise able to see this
   // component's internal state. No-op if no callback was passed in.
@@ -5323,15 +5875,23 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   useLayoutEffect(()=>{
     const recompute = () => {
       if(!battleRowRef.current || !gridSlotRef.current) return;
+      // Portrait stacks Stats/Grid/Log vertically instead of side-by-side
+      // (see the battleRowRef JSX below), so there are no side panels eating
+      // into the grid's available width anymore — just the column's own
+      // horizontal padding.
+      const portrait = window.innerHeight > window.innerWidth;
       const rowWidth = battleRowRef.current.clientWidth;
       const availableHeight = gridSlotRef.current.clientHeight;
-      const availableWidth = rowWidth - SIDE_PANEL_MIN_WIDTH*2 - MID_COL_H_PADDING;
+      const availableWidth = portrait
+        ? rowWidth - MID_COL_H_PADDING
+        : rowWidth - SIDE_PANEL_MIN_WIDTH*2 - MID_COL_H_PADDING;
       const next = Math.max(GRID_MIN_SIZE, Math.floor(Math.min(availableHeight, availableWidth)));
       setGridSize(prev => Math.abs(prev-next)>1 ? next : prev);
     };
     recompute();
     const ro = new ResizeObserver(recompute);
     if(battleRowRef.current) ro.observe(battleRowRef.current);
+    if(gridSlotRef.current) ro.observe(gridSlotRef.current);
     window.addEventListener('resize', recompute);
     return () => { ro.disconnect(); window.removeEventListener('resize', recompute); };
   },[]);
@@ -5370,17 +5930,12 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   return (
     <div style={{minHeight:'100vh',background:'#0a0a0a',backgroundImage:'radial-gradient(circle at 50% 0%, rgba(0,200,255,0.06), transparent 60%)',color:'#b0dff4',fontFamily:"'Rajdhani','Share Tech Mono',sans-serif",padding:'10px 12px 24px'}}>
 
-      {/* Landscape-only: cover the screen with a rotate prompt in portrait. */}
-      {isPortrait&&(
-        <div style={{position:'fixed',inset:0,zIndex:9000,background:'#060a0e',display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',textAlign:'center',padding:'2rem',gap:18}}>
-          <div style={{fontSize:54,animation:'rotateHint 2s ease-in-out infinite',transformOrigin:'center'}}>📱</div>
-          <div style={{fontFamily:"'Advent Pro',sans-serif",fontSize:'1.4rem',letterSpacing:'0.14em',textTransform:'uppercase',color:'#00c8ff',textShadow:'0 0 18px rgba(0,200,255,0.4)'}}>Rotate Your Device</div>
-          <div style={{fontSize:'0.85rem',color:'#7a9db5',maxWidth:300,lineHeight:1.5}}>
-            Paradigm Grid Battler is built for landscape. Turn your device sideways to play.
-          </div>
-          <div style={{fontSize:'0.62rem',letterSpacing:'0.15em',color:'#2a4a5e',fontFamily:'monospace',marginTop:6}}>// awaiting landscape //</div>
-        </div>
-      )}
+      {/* Portrait used to be hard-blocked behind a "rotate your device" full-
+          screen prompt. It's now a first-class layout (see isPortrait usage
+          below: battleRowRef switches to a stacked column, the grid is
+          reordered to the top via CSS `order`, and Stats/Log split the
+          remaining height instead of sitting beside the grid at full row
+          height) rather than landscape being the only supported shape. */}
 
       <div style={{maxWidth:1180,margin:'0 auto'}}>
 
@@ -5395,32 +5950,27 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
             {!scene&&!isCampaign&&<span style={{color:'#7a9db5'}}>Wave <span style={{color:'#00c8ff',fontWeight:'bold'}}>{wave}</span></span>}
             <span style={{color:'#7a9db5'}}>Round <span style={{color:'#00c8ff',fontWeight:'bold'}}>{round}</span></span>
             {!scene&&<span style={{color:'#7a9db5'}}>Hexas <span style={{color:'#ffd700',fontWeight:'bold'}}>{hexas}</span></span>}
-            {loadout.length>0&&(
-              <span style={{display:'flex',alignItems:'center',gap:8}}>
-                {loadout.map(id=>{const m=BATTLE_SKILLS.find(s=>s.id===id); return m ? <span key={id} style={{color:m.color,fontWeight:'bold',display:'flex',alignItems:'center',gap:3}}>{m.icon}{m.name}</span> : null;})}
-              </span>
-            )}
           </div>
-        </div>
-
-        {/* Proxy HP banner */}
-        <div style={{marginBottom:8}}>
-          <PanelBox style={{padding:'7px 12px'}}>
-            <div style={{display:'flex',alignItems:'center',justifyContent:'space-between',gap:12}}>
-              <span style={{fontSize:'0.72rem',letterSpacing:'0.14em',textTransform:'uppercase',color:'#00c8ff',whiteSpace:'nowrap'}}>Proxy — {player.name} <span style={{color:'#7a9db5'}}>Lv{player.level}</span></span>
-              <div style={{flex:1,maxWidth:520}}><HealthBar current={player.health} max={player.maxHealth} /></div>
-            </div>
-          </PanelBox>
         </div>
 
         {/* Main row: ONE unified panel. Three sections (Proxy/Enemy + Skills,
             Grid, Combat Log) separated by vertical dividers instead of gaps
             between floating boxes — reclaims the inter-panel gutters for the
-            cramped stat sections. Grid stays a height-limited square. */}
+            cramped stat sections. Grid stays a height-limited square.
+            Portrait stacks these vertically instead of side-by-side (there's
+            no room for three ~260px-minimum columns on a phone): the grid
+            gets a fixed share of the column's height and is reordered to the
+            top via CSS `order` (DOM order is unchanged, so tab order/reading
+            order stay Stats -> Grid -> Log), while Stats and Log split the
+            remaining height evenly and rely on the internal overflow-y:auto
+            scrolling both already have (see PlayerStatsPanel/CombatLog)
+            rather than needing new scroll handling here. */}
         <PanelBox style={{height:'calc(100dvh - 92px)',minHeight:320,padding:'12px',overflow:'hidden'}}>
-          <div ref={battleRowRef} style={{display:'flex',minWidth:0,height:'100%'}}>
+          <div ref={battleRowRef} style={{display:'flex',flexDirection:isPortrait?'column':'row',minWidth:0,height:'100%'}}>
             {/* Left section: Proxy + Enemy stats + action buttons */}
-            <div style={{flex:1,minWidth:SIDE_PANEL_MIN_WIDTH,display:'flex',flexDirection:'column',minHeight:0,paddingRight:12}}>
+            <div style={isPortrait
+              ? {order:2,width:'100%',flex:'1 1 0',display:'flex',flexDirection:'column',minHeight:0,paddingTop:8}
+              : {flex:1,minWidth:SIDE_PANEL_MIN_WIDTH,display:'flex',flexDirection:'column',minHeight:0,paddingRight:12}}>
               <PlayerStatsPanel
                 player={player} playerRolledEnergy={playerRolledEnergy}
                 selectedCategory={selCategory} selectedElement={selElement}
@@ -5451,7 +6001,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
                 so it can never overflow into the side columns as the window
                 is resized — previously it was sized purely off height, which
                 let it grow past its column's width and overlap the neighbors. */}
-            <div style={{flexShrink:0,width:gridSize+MID_COL_H_PADDING,height:'100%',display:'flex',flexDirection:'column',minHeight:0,alignItems:'center',padding:'0 12px'}}>
+            <div style={isPortrait
+              ? {order:1,flexShrink:0,width:'100%',height:'42%',display:'flex',flexDirection:'column',minHeight:0,alignItems:'center',padding:'0 4px'}
+              : {flexShrink:0,width:gridSize+MID_COL_H_PADDING,height:'100%',display:'flex',flexDirection:'column',minHeight:0,alignItems:'center',padding:'0 12px'}}>
               <div ref={gridSlotRef} style={{flex:1,minHeight:0,width:'100%',display:'flex',alignItems:'center',justifyContent:'center'}}>
                 <div style={{width:gridSize,height:gridSize,flexShrink:0,display:'flex'}}>
                   <Grid
@@ -5482,7 +6034,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
             </div>
 
             {/* Right section: Combat Log */}
-            <div style={{flex:1,minWidth:SIDE_PANEL_MIN_WIDTH,display:'flex',flexDirection:'column',minHeight:0,paddingLeft:12}}>
+            <div style={isPortrait
+              ? {order:3,width:'100%',flex:'1 1 0',display:'flex',flexDirection:'column',minHeight:0,paddingTop:8}
+              : {flex:1,minWidth:SIDE_PANEL_MIN_WIDTH,display:'flex',flexDirection:'column',minHeight:0,paddingLeft:12}}>
               <CombatLog logs={logs} gridHeight />
             </div>
           </div>
@@ -5567,6 +6121,9 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         onClose={()=>setPiercingLightCtx(null)}
       />
       <RewardModal show={reward.show} html={reward.html} />
+      <PlacementRollModal show={showPlacementRollModal} rolling={placementRolling} roll={placementRollValue} onRoll={handlePlacementRoll} onContinue={handlePlacementContinue} />
+      <PlacementPickerModal show={showPlacementPicker && !showPlacementRollModal} onSelect={handleConfirmPlacement} />
+      <InitiativeRollModal show={showInitiativeRollModal} rolling={initiativeRolling} result={initiativeResult} onRoll={handleInitiativeRoll} onBegin={handleBeginBattle} />
       <SceneCompleteModal show={sceneComplete} sceneMeta={sceneMeta} onReturn={()=>onSceneComplete?.()} />
       <CampaignBattleCompleteModal
         show={isCampaign&&showBattleComplete}
@@ -5576,8 +6133,14 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
         equipmentReward={FIRST_EQUIPMENT}
         onContinue={()=>{ setShowBattleComplete(false); startNextCampaignBattle(player, campaignBattle+1); }}
         onFinish={()=>{ setShowBattleComplete(false); onCampaignComplete?.(true); }}
+        onReturnToMenu={handleCampaignReturnToMenu}
       />
-      <CampaignIntroModal show={isCampaign&&showCampaignIntro} onSubmit={handleCampaignIntroSubmit} craftedSkillIds={craftedSkillIds} />
+      <CampaignDefeatModal
+        show={isCampaign&&showDefeatModal}
+        battle={CAMPAIGN_BATTLES[campaignBattle-1]}
+        onRetry={handleCampaignRetry}
+        onReturnToMenu={handleCampaignReturnToMenu}
+      />
 
       {/* Change Loadout — Training Mode's Battle Skills scene only, lets the
           player reopen the picker and swap freely instead of a one-time

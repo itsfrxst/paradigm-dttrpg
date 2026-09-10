@@ -6,14 +6,15 @@ const ITEMS = [
   { id:'inventory', label:'Inventory', icon:'🎒' },
   { id:'crafting',  label:'Crafting',  icon:'🔧' },
   { id:'social',    label:'Social',    icon:'💬' },
-  { id:'start',     label:'Main Menu', icon:'◄' },
+  { id:'start',     label:'Main', icon:'◄' },
 ];
 
-// Fixed-position corner menu shown only while Gauntlet is active. Gauntlet
+// Fixed-position corner menu shown only while Campaign is active. Campaign
 // owns its own full-viewport header and height math (calc(100dvh - 92px)),
 // so this stays out of document flow entirely rather than stacking a NavBar
-// above it.
-const FloatingMenuButton = ({ onNavigate }) => {
+// above it. `items` defaults to the full extension-build list; the mobile
+// Artifact build passes a trimmed array instead (see AppMobile.jsx).
+const FloatingMenuButton = ({ onNavigate, items=ITEMS }) => {
   const [open, setOpen] = useState(false);
   return (
     <div style={{position:'fixed',top:10,right:12,zIndex:5000}}>
@@ -24,7 +25,7 @@ const FloatingMenuButton = ({ onNavigate }) => {
       {open&&(
         <div onMouseLeave={()=>setOpen(false)}
           style={{position:'absolute',top:42,right:0,background:'#080e14',border:'1px solid #1e3a4a',borderRadius:8,padding:6,minWidth:150,boxShadow:'0 8px 24px rgba(0,0,0,0.5)'}}>
-          {ITEMS.map(item=>(
+          {items.map(item=>(
             <button key={item.id} onClick={()=>{setOpen(false);onNavigate(item.id);}}
               style={{display:'flex',alignItems:'center',gap:8,width:'100%',padding:'8px 10px',background:'transparent',border:'none',color:'#b0dff4',fontSize:12,cursor:'pointer',textAlign:'left',borderRadius:4,fontFamily:"'Rajdhani',sans-serif"}}
               onMouseEnter={e=>e.currentTarget.style.background='rgba(0,200,255,0.1)'}
