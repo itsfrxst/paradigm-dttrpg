@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useLayoutEffect, useCallback, useRef } from 'react';
-import { MATERIALS, rollEnemyDrop } from './ItemData.jsx';
+import { MATERIALS, rollEnemyDrop, MODIFIABLE_ELEMENTS, CUSTOM_SKILL_ENERGY_COST } from './ItemData.jsx';
 
 const SIZE = 9;
 
@@ -1299,6 +1299,85 @@ const computeAgentStep = (agent, target, blockers) => {
 // skills, so a starting loadout is really just "pick your Tacticals."
 const CORE_SKILL_CAP = 3;
 const TACTICAL_SKILL_CAP = 2;
+
+// A saved Custom Synthesis design (see CraftingScreen.jsx) isn't a
+// BATTLE_SKILLS entry -- it's stored separately as `customSkillDef`, one per
+// player rather than one shared definition -- but every place a skill gets
+// picked, priced, or cast expects that same {id,name,icon,color,tagline}
+// shape, so this builds a synthetic one on the fly from whatever the player
+// designed. `null` (no design saved yet) is handled by callers, not here.
+export const customSkillEntry = (def) => {
+  const elMeta = def.element ? MODIFIABLE_ELEMENTS.find(e=>e.id===def.element) : null;
+  return {
+    id:'customSkill', category:'core', baseline:false,
+    name:def.name, icon:elMeta?.icon || '⚙', color:elMeta?.color || '#9b6cff',
+    tagline:'Custom Synthesis', locked:false,
+  };
+};
+
+// ─── CUSTOM SYNTHESIS BATTLE RESOLUTION ──────────────────────────────────
+// Turns a saved design into an actual in-battle footprint. The design board
+// (CraftingScreen.jsx) always draws relative to "up" -- the caster facing
+// away from the viewer -- so rotateForFacing reorients whatever {dx,dy}
+// offset was authored there onto the caster's real 4-way facing at cast
+// time. Same transform for a single AoE tile and for a Range/Warp vector.
+const CUSTOM_SKILL_DIR_VECS = {
+  up:{dx:0,dy:-1}, 'up-right':{dx:1,dy:-1}, right:{dx:1,dy:0}, 'down-right':{dx:1,dy:1},
+  down:{dx:0,dy:1}, 'down-left':{dx:-1,dy:1}, left:{dx:-1,dy:0}, 'up-left':{dx:-1,dy:-1},
+};
+const rotateForFacing = ({dx,dy}, facing) => {
+  switch(facing){
+    case 'right': return {dx:-dy, dy:dx};
+    case 'down':  return {dx:-dx, dy:-dy};
+    case 'left':  return {dx:dy,  dy:-dx};
+    default:      return {dx,dy}; // 'up'
+  }
+};
+// The 8 tiles Melee auto-targets -- rotation-invariant (the ring around the
+// caster is the same from any facing), so it's just isAdjacent8's own
+// offsets rather than anything rotateForFacing needs to touch.
+const CUSTOM_SKILL_MELEE_OFFSETS = [
+  {dx:-1,dy:-1},{dx:0,dy:-1},{dx:1,dy:-1},{dx:-1,dy:0},{dx:1,dy:0},{dx:-1,dy:1},{dx:0,dy:1},{dx:1,dy:1},
+];
+// Returns the actual board tiles (in-bounds) this cast covers, plus --
+// for Range/Warp only -- the tile it would reposition the caster to if that
+// option is set. Callers decide whether that move is actually legal (not
+// blocked by an ally/obstacle) before applying it.
+const customSkillFootprint = (def, casterPos, facing) => {
+  const inBounds = (t) => t.x>=0 && t.x<SIZE && t.y>=0 && t.y<SIZE;
+  if(def.archetype==='melee'){
+    return { tiles: CUSTOM_SKILL_MELEE_OFFSETS.map(o=>({x:casterPos.x+o.dx,y:casterPos.y+o.dy})).filter(inBounds), moveTo:null };
+  }
+  if(def.archetype==='aoe'){
+    const tiles = (def.tiles||[]).map(t=>rotateForFacing(t,facing))
+      .map(r=>({x:casterPos.x+r.dx,y:casterPos.y+r.dy})).filter(inBounds);
+    return { tiles, moveTo:null };
+  }
+  if(def.archetype==='range'){
+    const dirVec = CUSTOM_SKILL_DIR_VECS[def.rangeDirection] || CUSTOM_SKILL_DIR_VECS.up;
+    const rotDir = rotateForFacing(dirVec, facing);
+    const tiles = getAxisLine(casterPos, rotDir, def.length||1);
+    return { tiles, moveTo: def.moveCasterOnRange && tiles.length>0 ? tiles[tiles.length-1] : null };
+  }
+  if(def.archetype==='warp'){
+    if(!def.warpTile) return { tiles:[], moveTo:null };
+    const r = rotateForFacing(def.warpTile, facing);
+    const t = {x:casterPos.x+r.dx, y:casterPos.y+r.dy};
+    return inBounds(t) ? { tiles:[t], moveTo:t } : { tiles:[], moveTo:null };
+  }
+  return { tiles:[], moveTo:null };
+};
+// Rolls the design's Special Effects die (only if it has any if/then rules)
+// and returns which rules fired -- "Always" rules fire unconditionally,
+// "Roll >=" rules check against this one shared roll, same idea as
+// Fire/Water's own pulse/gating die.
+const resolveCustomSkillEffects = (def) => {
+  if(!def.effects || def.effects.length===0) return { roll:null, triggered:[] };
+  const roll = rollDie(parseInt((def.rollDie||'d6').slice(1),10));
+  const triggered = def.effects.filter(e => e.condition==='always' || roll>=e.threshold);
+  return { roll, triggered };
+};
+
 export const BATTLE_SKILLS = [
   {
     id:'melee', category:'core', baseline:true,
@@ -1537,7 +1616,7 @@ const LoadoutModal = ({show, loadout, onToggle, onConfirm, onClose, freeSelect, 
 // the main component below), it just requires one of these to already
 // exist. Exported so CharacterScreen can render it without duplicating
 // BATTLE_SKILLS/cap logic.
-export const CharacterCreatorForm = ({ initial, craftedSkillIds=[], onSubmit, onCancel, submitLabel='Save' }) => {
+export const CharacterCreatorForm = ({ initial, craftedSkillIds=[], customSkillDef, onSubmit, onCancel, submitLabel='Save' }) => {
   const [name, setName] = useState(initial?.name || '');
   const [loadout, setLoadout] = useState(initial?.loadout || []);
   const [element, setElement] = useState(initial?.element || null);
@@ -1545,12 +1624,17 @@ export const CharacterCreatorForm = ({ initial, craftedSkillIds=[], onSubmit, on
   const elMeta = element ? ELEMENTS.base[element] : null;
   const tactical = BATTLE_SKILLS.filter(s=>s.category==='tactical');
   // Crafted Core skills (Circuit Sigil once learned) are selectable here too
-  // — baseline Melee is excluded since it's always equipped, not a pick.
-  const availableCore = BATTLE_SKILLS.filter(s=>s.category==='core' && !s.baseline && isSkillUnlocked(s, craftedSkillIds));
+  // — baseline Melee is excluded since it's always equipped, not a pick. A
+  // saved Custom Synthesis design (see customSkillEntry above) is appended
+  // the same way once one exists -- it's not in BATTLE_SKILLS at all.
+  const availableCore = [
+    ...BATTLE_SKILLS.filter(s=>s.category==='core' && !s.baseline && isSkillUnlocked(s, craftedSkillIds)),
+    ...(customSkillDef ? [customSkillEntry(customSkillDef)] : []),
+  ];
   const tacticalCount = loadout.filter(id=>tactical.some(s=>s.id===id)).length;
   const coreCount = loadout.filter(id=>availableCore.some(s=>s.id===id)).length;
   const toggleSkill = (id) => {
-    const skill = BATTLE_SKILLS.find(s=>s.id===id);
+    const skill = BATTLE_SKILLS.find(s=>s.id===id) || availableCore.find(s=>s.id===id);
     if(!skill) return;
     setLoadout(prev=>{
       if(prev.includes(id)) return prev.filter(x=>x!==id);
@@ -1813,7 +1897,7 @@ const ElementPickerModal = ({selectedCategory,selectedElement,onSelect,onClose,r
   );
 };
 
-const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedElement,onElementSelect,canAttack,canSkill,onMelee,onSkill,onEndTurn,onRollEnergy,energyPhase,onSurrender,enemy,enemyRolledEnergy,enemies,enemyRolledEnergyById,selectedEnemyId,onSelectEnemy,isPlayerTurn,loadout,summons,canCompassSlash,onCompassSlash,canCircuitSigil,onCircuitSigil,circuitSigilReason,canRotate,onRotate,canDarkWeb,onDarkWeb,canPulseWave,onPulseWave,canPiercingLight,onPiercingLight,hideElementalSkill,restrictElementsToBase,lockElementPicker}) => {
+const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedElement,onElementSelect,canAttack,canSkill,onMelee,onSkill,onEndTurn,onRollEnergy,energyPhase,onSurrender,enemy,enemyRolledEnergy,enemies,enemyRolledEnergyById,selectedEnemyId,onSelectEnemy,isPlayerTurn,loadout,summons,canCompassSlash,onCompassSlash,canCircuitSigil,onCircuitSigil,circuitSigilReason,canRotate,onRotate,canDarkWeb,onDarkWeb,canPulseWave,onPulseWave,canPiercingLight,onPiercingLight,canCustomSkill,onCustomSkill,customSkillDef,customSkillCost,hideElementalSkill,restrictElementsToBase,lockElementPicker}) => {
   const [showPicker,setShowPicker]=useState(false);
   const allEl={...ELEMENTS.base,...ELEMENTS.minor,...ELEMENTS.major};
   const elData=allEl[selectedElement];
@@ -1822,13 +1906,14 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
   const showRollBtn = isPlayerTurn && energyPhase==='roll';
   const showActions = isPlayerTurn && energyPhase==='act';
   const skillCost = getSkillCost(selectedCategory, selectedElement);
-  const loadoutMeta = loadout.map(id=>BATTLE_SKILLS.find(s=>s.id===id)).filter(Boolean);
+  const loadoutMeta = loadout.map(id=>id==='customSkill'&&customSkillDef?customSkillEntry(customSkillDef):BATTLE_SKILLS.find(s=>s.id===id)).filter(Boolean);
   const hasCompassSlash = loadout.includes('compassSlash');
   const hasCircuitSigil = loadout.includes('circuitSigil');
   const hasDarkWeb = loadout.includes('darkWeb');
   const hasPulseWave = loadout.includes('pulseWave');
   const hasPiercingLight = loadout.includes('piercingLight');
-  const hasTacticalAction = hasCompassSlash || hasCircuitSigil || hasDarkWeb || hasPulseWave || hasPiercingLight;
+  const hasCustomSkill = loadout.includes('customSkill') && !!customSkillDef;
+  const hasTacticalAction = hasCompassSlash || hasCircuitSigil || hasDarkWeb || hasPulseWave || hasPiercingLight || hasCustomSkill;
   // Campaign always renders alongside a floating "Main" nav button (see
   // App.jsx) that already gets you out of the session — a second, separate
   // Quit button next to it was pure redundancy. Training scenes have no such
@@ -1994,6 +2079,12 @@ const PlayerStatsPanel = ({player,playerRolledEnergy,selectedCategory,selectedEl
                 <button onClick={onPiercingLight} disabled={!canPiercingLight}
                   style={{flex:1.2,padding:'7px 4px',background:canPiercingLight?'rgba(255,221,119,0.18)':'rgba(20,30,40,0.6)',border:`1px solid ${canPiercingLight?'#ffdd77':'#1e3a4a'}`,borderRadius:'4px',color:canPiercingLight?'#ffdd77':'#2a4a5e',fontSize:'11px',fontWeight:600,cursor:canPiercingLight?'pointer':'not-allowed',letterSpacing:'.03em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
                   PIERCING LIGHT<div style={{fontSize:'8px',opacity:0.7}}>{player.usedSkillIds.includes('piercingLight')?'used':`${PIERCING_LIGHT_BASE_COST}E+`}</div>
+                </button>
+              )}
+              {hasCustomSkill&&(
+                <button onClick={onCustomSkill} disabled={!canCustomSkill}
+                  style={{flex:1.2,padding:'7px 4px',background:canCustomSkill?`${customSkillEntry(customSkillDef).color}30`:'rgba(20,30,40,0.6)',border:`1px solid ${canCustomSkill?customSkillEntry(customSkillDef).color:'#1e3a4a'}`,borderRadius:'4px',color:canCustomSkill?customSkillEntry(customSkillDef).color:'#2a4a5e',fontSize:'11px',fontWeight:600,cursor:canCustomSkill?'pointer':'not-allowed',letterSpacing:'.03em',fontFamily:"'Rajdhani',sans-serif",transition:'all 0.2s'}}>
+                  {customSkillDef.name.toUpperCase()}<div style={{fontSize:'8px',opacity:0.7}}>{player.usedSkillIds.includes('customSkill')?'used':`${customSkillCost}E`}</div>
                 </button>
               )}
               <button onClick={onEndTurn}
@@ -2829,7 +2920,7 @@ const CampaignDefeatModal = ({show, battle, onRetry, onReturnToMenu}) => {
 };
 // ─── MAIN GAME COMPONENT ───────────────────────────────────────────────────────
 
-export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, campaign, character, leaveSignal = 0, onCampaignComplete, onReturnToMenu, onBattleCleared, onQuit, craftedSkillIds = [], skillMods = {}, initialHexas = 0, initialMaterials = {} } = {}) {
+export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, campaign, character, leaveSignal = 0, onCampaignComplete, onReturnToMenu, onBattleCleared, onQuit, craftedSkillIds = [], skillMods = {}, initialHexas = 0, initialMaterials = {}, customSkillDef = null } = {}) {
   // Training Mode scene config. `scene` is undefined for normal Gauntlet play
   // (every flag below defaults to current behavior). Each scene isolates one
   // new mechanic on top of core movement/melee rather than accumulating —
@@ -2937,7 +3028,7 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const [logs,           setLogs]           = useState(()=>{
     const base = ['=== Battle Initiated ===','Move adjacent to attack. Position for bonuses.'];
     if(isCampaign && character){
-      const skillNames = character.loadout.map(id=>BATTLE_SKILLS.find(s=>s.id===id)?.name).filter(Boolean).join(', ');
+      const skillNames = character.loadout.map(id=>id==='customSkill'&&customSkillDef?customSkillDef.name:BATTLE_SKILLS.find(s=>s.id===id)?.name).filter(Boolean).join(', ');
       base.push(`=== ${character.name} deployed — ${skillNames} · ${character.element} ===`);
     }
     return base;
@@ -3054,6 +3145,11 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
   const canDarkWeb = loadout.includes('darkWeb') && isPlayerTurn && energyPhase==='act' && !player.usedSkillIds.includes('darkWeb') && player.actionpts >= 2;
   const canPulseWave = loadout.includes('pulseWave') && isPlayerTurn && energyPhase==='act' && !player.usedSkillIds.includes('pulseWave') && player.actionpts >= 3;
   const canPiercingLight = loadout.includes('piercingLight') && isPlayerTurn && energyPhase==='act' && !player.usedSkillIds.includes('piercingLight') && player.actionpts >= PIERCING_LIGHT_BASE_COST;
+  // Custom Synthesis: cost is fixed per archetype (see CUSTOM_SKILL_ENERGY_COST
+  // in ItemData.jsx, mirrored by CraftingScreen's creation-cost preview) --
+  // melee is cheapest at 1, aoe priciest at 3, same ordering as its Hexas cost.
+  const customSkillCost = customSkillDef ? (CUSTOM_SKILL_ENERGY_COST[customSkillDef.archetype] ?? 2) : 0;
+  const canCustomSkill = !!customSkillDef && loadout.includes('customSkill') && isPlayerTurn && energyPhase==='act' && !player.usedSkillIds.includes('customSkill') && player.actionpts >= customSkillCost;
   // Rotate: 0 Energy, once per turn — a free facing change for tactical
   // repositioning (evade a flank, line up a ranged skill) without spending AP.
   const canRotate = isPlayerTurn && energyPhase==='act' && !player.rotateUsed;
@@ -4374,6 +4470,76 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     routeAfterPlayerAction(updatedPlayer, updatedEnemy);
   },[player,enemy,wave,dmgBonus,accBonus,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx]);
 
+  // ── CUSTOM SYNTHESIS (Core Skill — a saved design from CraftingScreen.jsx) ──
+  // No separate targeting click -- every archetype's shape is already fixed
+  // at design time (see customSkillFootprint), so casting just resolves
+  // immediately against whatever the rotated footprint actually covers, the
+  // same "auto-hits everything in the footprint" idea as Water Torrent.
+  // Warp/Range-with-move reposition the caster the same way Dark Web's leap
+  // and Piercing Light's thrust already do.
+  const handleCustomSkill = useCallback(()=>{
+    if(!canCustomSkill || !customSkillDef) return;
+    const def = customSkillDef;
+    const {tiles:footprint, moveTo} = customSkillFootprint(def, player.boardPosition, player.facing);
+    const hitsEnemy = footprint.some(t=>t.x===enemy.boardPosition.x&&t.y===enemy.boardPosition.y);
+    const meta = customSkillEntry(def);
+
+    let newFacing = player.facing;
+    let newPos = player.boardPosition;
+    let newHealth = player.health;
+    if(!hitsEnemy && moveTo){
+      const blocked = [...summons, ...obstacles].some(s=>s.boardPosition.x===moveTo.x&&s.boardPosition.y===moveTo.y);
+      if(!blocked){
+        newFacing = facingFromMove(player.boardPosition, moveTo);
+        newPos = moveTo;
+        newHealth = applyHealingIfLanded(moveTo, player.health, player.maxHealth);
+      }
+    } else if(hitsEnemy && (def.archetype==='range'||def.archetype==='warp')){
+      newFacing = facingToward(player.boardPosition, enemy.boardPosition);
+    }
+
+    let updatedPlayer = markSkillUsed({...player, actionpts:Math.max(0,player.actionpts-customSkillCost),
+      facing:newFacing, boardPosition:newPos, health:newHealth}, 'customSkill');
+
+    if(!hitsEnemy){
+      addLog(`${def.name} -> no target hit (${customSkillCost} Energy spent)`);
+      routeAfterPlayerAction(updatedPlayer, enemy);
+      return;
+    }
+
+    const dmg = Math.round((def.damage||0)*(1+accBonus('customSkill'))) + dmgBonus('customSkill');
+    const newHP = Math.max(0,enemy.health-dmg);
+    let updatedEnemy = {...enemy,health:newHP};
+    const {roll,triggered} = resolveCustomSkillEffects(def);
+    addLog(`${def.name} -> ${dmg} dmg${roll!==null?` [rolled ${roll}]`:''} (${newHP}/${enemy.maxHealth})`);
+    triggerCastFx(enemy.boardPosition, meta.color);
+
+    const kbMagnitude = triggered.filter(e=>e.type==='knockback').reduce((s,e)=>s+e.magnitude,0);
+    if(kbMagnitude>0 && newHP>0){
+      // Pushed away from the tile the caster struck from, not necessarily
+      // `newFacing` -- an AoE footprint can hit a tile behind the caster,
+      // where the cast-direction facing would push the target the wrong way.
+      const kbFacing = facingToward(player.boardPosition, enemy.boardPosition);
+      const kb = getKnockbackTile(updatedEnemy.boardPosition, kbFacing, kbMagnitude, [updatedPlayer.boardPosition,...summons.map(s=>s.boardPosition)], obstacles);
+      updatedEnemy = {...updatedEnemy, boardPosition:{x:kb.x,y:kb.y}};
+      if(kb.hitObstacle) setObstacles(prev=>prev.map(o=>o.id===kb.hitObstacle.id?{...o,health:Math.max(0,o.health-dmg)}:o).filter(o=>o.health>0));
+    }
+    if(triggered.some(e=>e.type==='burn') && newHP>0){
+      updatedEnemy = applyBurn(updatedEnemy);
+      setTiles(prev=>{ const g=prev.map(r=>r.slice()); g[updatedEnemy.boardPosition.y][updatedEnemy.boardPosition.x]=TILE_TYPES.FIRE_BOOST; return g; });
+    }
+    if(triggered.some(e=>e.type==='flood') && footprint.length>0){
+      setTiles(prev=>{ const g=prev.map(r=>r.slice()); footprint.forEach(t=>{ g[t.y][t.x]=TILE_TYPES.WATER_BOOST; }); return g; });
+    }
+    if(triggered.some(e=>e.type==='rubble') && !obstacles.some(o=>o.boardPosition.x===player.boardPosition.x&&o.boardPosition.y===player.boardPosition.y)){
+      setObstacles(prev=>[...prev, makeObstacle(player.boardPosition)]);
+    }
+
+    if(newHP<=0){ setPlayer(updatedPlayer); setEnemy(updatedEnemy); handleEnemyDefeated(updatedPlayer,wave); return; }
+    routeAfterPlayerAction(updatedPlayer, updatedEnemy);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[canCustomSkill,customSkillDef,customSkillCost,player,enemy,summons,obstacles,wave,dmgBonus,accBonus,addLog,handleEnemyDefeated,routeAfterPlayerAction,triggerCastFx,applyHealingIfLanded]);
+
   // ── CIRCUIT SIGIL (Core Skill, crafting-locked — dormant until BATTLE_SKILLS
   // drops the `locked` flag) ── canDeployMulti is defined later in the file
   // (const, TDZ) — referenced only inside this handler's own body, invoked
@@ -5478,6 +5644,101 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     resolveMultiHitKills(hitIds, damaged, updatedPlayer, 'Piercing Light');
   },[player,enemies,summons,dmgBonus,accBonus,addLog,resolveMultiHitKills,applyAoeDamageToSummons,routeAfterPlayerActionMulti,triggerCastFx]);
 
+  // ── CUSTOM SYNTHESIS (Core Skill) — Campaign ──
+  // Same fixed-footprint, no-targeting-click resolution as the single-enemy
+  // version, but every enemy (and enemy summon) anywhere in the footprint
+  // takes the hit, same "everyone in the blast" pattern as Torrent/Pulse
+  // Wave/Piercing Light above. Special Effects (Burn/Knockback) only touch
+  // the hit enemies, not summons -- Flood/Rubble are tile-based so they're
+  // unaffected by that distinction.
+  const handleCustomSkillMulti = useCallback(()=>{
+    if(!canCustomSkill || !customSkillDef) return;
+    const def = customSkillDef;
+    const {tiles:footprint, moveTo} = customSkillFootprint(def, player.boardPosition, player.facing);
+    const hitIds = new Set(enemies.filter(e=>footprint.some(t=>t.x===e.boardPosition.x&&t.y===e.boardPosition.y)).map(e=>e.id));
+    const hitSummons = summons.filter(s=>s.side==='enemy' && footprint.some(t=>t.x===s.boardPosition.x&&t.y===s.boardPosition.y));
+    const meta = customSkillEntry(def);
+    const hasTargets = hitIds.size>0 || hitSummons.length>0;
+
+    let newFacing = player.facing;
+    let newPos = player.boardPosition;
+    let newHealth = player.health;
+    if(!hasTargets && moveTo){
+      const blocked = [...summons, ...obstacles].some(s=>s.boardPosition.x===moveTo.x&&s.boardPosition.y===moveTo.y);
+      if(!blocked){
+        newFacing = facingFromMove(player.boardPosition, moveTo);
+        newPos = moveTo;
+        newHealth = applyHealingIfLanded(moveTo, player.health, player.maxHealth);
+      }
+    } else if(hasTargets && (def.archetype==='range'||def.archetype==='warp') && hitIds.size>0){
+      const firstHit = enemies.find(e=>hitIds.has(e.id));
+      newFacing = facingToward(player.boardPosition, firstHit.boardPosition);
+    }
+
+    const updatedPlayer = markSkillUsed({...player, actionpts:Math.max(0,player.actionpts-customSkillCost),
+      facing:newFacing, boardPosition:newPos, health:newHealth}, 'customSkill');
+
+    if(!hasTargets){
+      addLog(`${def.name} -> no target hit (${customSkillCost} Energy spent)`);
+      routeAfterPlayerActionMulti(updatedPlayer, enemies);
+      return;
+    }
+
+    const dmg = Math.round((def.damage||0)*(1+accBonus('customSkill'))) + dmgBonus('customSkill');
+    const totalHits = hitIds.size+hitSummons.length;
+    const {roll,triggered} = resolveCustomSkillEffects(def);
+    addLog(`${def.name} -> ${dmg} dmg${roll!==null?` [rolled ${roll}]`:''} to ${totalHits} target${totalHits>1?'s':''}`);
+    enemies.forEach(e=>{ if(hitIds.has(e.id)) triggerCastFx(e.boardPosition, meta.color); });
+    hitSummons.forEach(s=>triggerCastFx(s.boardPosition, meta.color));
+    applyAoeDamageToSummons(hitSummons, dmg);
+
+    if(triggered.some(e=>e.type==='flood') && footprint.length>0){
+      setTiles(prev=>{ const g=prev.map(r=>r.slice()); footprint.forEach(t=>{ g[t.y][t.x]=TILE_TYPES.WATER_BOOST; }); return g; });
+    }
+    // Rubble and Knockback's own obstacle-collision damage both touch
+    // `obstacles` -- folded into one workingObstacles chain (rather than two
+    // separate setObstacles calls) so a cast with both effects can't have the
+    // second call's plain array overwrite the first's queued update.
+    let workingObstacles = obstacles;
+    if(triggered.some(e=>e.type==='rubble') && !obstacles.some(o=>o.boardPosition.x===player.boardPosition.x&&o.boardPosition.y===player.boardPosition.y)){
+      workingObstacles = [...workingObstacles, makeObstacle(player.boardPosition)];
+    }
+    if(hitIds.size===0){
+      if(workingObstacles!==obstacles) setObstacles(workingObstacles);
+      routeAfterPlayerActionMulti(updatedPlayer, enemies);
+      return;
+    }
+
+    const kbMagnitude = triggered.filter(e=>e.type==='knockback').reduce((s,e)=>s+e.magnitude,0);
+    const appliesBurn = triggered.some(e=>e.type==='burn');
+    let scorchedTiles = [];
+    const damaged = enemies.map(e=>{
+      if(!hitIds.has(e.id)) return e;
+      const newHP = Math.max(0,e.health-dmg);
+      let updated = {...e,health:newHP};
+      if(newHP>0){
+        if(kbMagnitude>0){
+          // Pushed away from the caster toward each individual target, not
+          // the shared cast-facing -- an AoE footprint can hit tiles on more
+          // than one side of the caster at once.
+          const kbFacing = facingToward(player.boardPosition, e.boardPosition);
+          const otherBlockers = [updatedPlayer.boardPosition, ...summons.map(s=>s.boardPosition), ...enemies.filter(o=>o.id!==e.id).map(o=>o.boardPosition)];
+          const kb = getKnockbackTile(updated.boardPosition, kbFacing, kbMagnitude, otherBlockers, workingObstacles);
+          updated = {...updated, boardPosition:{x:kb.x,y:kb.y}};
+          if(kb.hitObstacle){
+            workingObstacles = workingObstacles.map(o=>o.id===kb.hitObstacle.id?{...o,health:Math.max(0,o.health-dmg)}:o).filter(o=>o.health>0);
+          }
+        }
+        if(appliesBurn){ updated = applyBurn(updated); scorchedTiles.push(updated.boardPosition); }
+      }
+      return updated;
+    });
+    if(workingObstacles!==obstacles) setObstacles(workingObstacles);
+    if(scorchedTiles.length>0) setTiles(prev=>{ const g=prev.map(r=>r.slice()); scorchedTiles.forEach(t=>{ g[t.y][t.x]=TILE_TYPES.FIRE_BOOST; }); return g; });
+    resolveMultiHitKills(hitIds, damaged, updatedPlayer, def.name);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[canCustomSkill,customSkillDef,customSkillCost,player,enemies,summons,obstacles,dmgBonus,accBonus,addLog,resolveMultiHitKills,applyAoeDamageToSummons,routeAfterPlayerActionMulti,triggerCastFx,applyHealingIfLanded]);
+
   const resolveDeployPlacementMulti = useCallback((tile)=>{
     const legal=deployTilesMulti.some(t=>t.x===tile.x&&t.y===tile.y);
     if(!legal){ addLog('// Illegal deploy tile'); return; }
@@ -6013,6 +6274,8 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
                 canDarkWeb={canDarkWeb} onDarkWeb={handleDarkWeb}
                 canPulseWave={canPulseWave} onPulseWave={handlePulseWave}
                 canPiercingLight={canPiercingLight} onPiercingLight={handlePiercingLight}
+                canCustomSkill={canCustomSkill} onCustomSkill={isCampaign?handleCustomSkillMulti:handleCustomSkill}
+                customSkillDef={customSkillDef} customSkillCost={customSkillCost}
                 hideElementalSkill={!sceneAllowSkill} restrictElementsToBase={sceneRestrictBaseElements}
                 lockElementPicker={isCampaign}
               />

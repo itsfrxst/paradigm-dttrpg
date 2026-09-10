@@ -10,7 +10,7 @@ import InventoryScreen from './InventoryScreen.jsx'
 import PlaceholderScreen from './PlaceholderScreen.jsx'
 import ExploreScreen from './ExploreScreen.jsx'
 import { storageGet, storageSet, debounce, mergeCounts } from './storage.js'
-import { skillModTierCost, skillModMaxTier, MODIFIABLE_ELEMENTS } from './ItemData.jsx'
+import { skillModTierCost, skillModMaxTier, MODIFIABLE_ELEMENTS, computeCustomSkillCreationCost } from './ItemData.jsx'
 
 const PLACEHOLDER_CONTENT = {
   profile: {
@@ -222,9 +222,18 @@ function App() {
     setSkillMods(prev => ({...prev, [skillId]: {...prev[skillId], [statId]: clampedTarget}}))
   },[hexas,materials,skillMods])
 
+  // Mirrors handleUpgradeSkillMod's self-contained validate-then-deduct
+  // pattern: a stale click (cost changed under the player, or the CraftingScreen
+  // button was somehow not disabled) fails silently rather than erroring, since
+  // the UI itself is the real gate.
   const handleSaveCustomSkill = useCallback((def)=>{
+    const cost = computeCustomSkillCreationCost(def)
+    if(hexas < cost.hexas) return
+    if(cost.coreId && (materials[cost.coreId]||0) < cost.coreQty) return
+    setHexas(h => h - cost.hexas)
+    if(cost.coreId) setMaterials(m => ({...m, [cost.coreId]: (m[cost.coreId]||0) - cost.coreQty}))
     setCustomSkillDef(def)
-  },[])
+  },[hexas,materials])
 
   const startScene = useCallback((sceneId)=>{
     setActiveScene(sceneId)
@@ -307,7 +316,7 @@ function App() {
       {campaignStarted && (
         <div style={{display: screen==='campaign' ? 'block' : 'none'}}>
           <GridBattlerGame campaign character={characters.find(c=>c?.id===activeCharacterId)} leaveSignal={campaignLeaveSignal}
-            onCampaignComplete={handleCampaignComplete} onReturnToMenu={()=>setScreen('start')} onQuit={()=>handleCampaignComplete(false)} onBattleCleared={handleBattleCleared} onStateSync={handleStateSync} craftedSkillIds={craftedSkillIds} skillMods={skillMods} initialHexas={hexas} initialMaterials={materials} />
+            onCampaignComplete={handleCampaignComplete} onReturnToMenu={()=>setScreen('start')} onQuit={()=>handleCampaignComplete(false)} onBattleCleared={handleBattleCleared} onStateSync={handleStateSync} craftedSkillIds={craftedSkillIds} skillMods={skillMods} initialHexas={hexas} initialMaterials={materials} customSkillDef={customSkillDef} />
           <FloatingMenuButton onNavigate={goTo} />
         </div>
       )}
@@ -316,7 +325,7 @@ function App() {
           is a fresh instance (key forces remount even on replaying the same
           scene), since these are repeatable lessons, not sessions to resume. */}
       {screen==='trainingScene' && (
-        <GridBattlerGame key={`${activeScene}-${sceneNonce}`} scene={activeScene} onSceneComplete={handleSceneComplete} onQuit={()=>setScreen('training')} craftedSkillIds={craftedSkillIds} skillMods={skillMods} onStateSync={handleStateSync} initialHexas={hexas} initialMaterials={materials} />
+        <GridBattlerGame key={`${activeScene}-${sceneNonce}`} scene={activeScene} onSceneComplete={handleSceneComplete} onQuit={()=>setScreen('training')} craftedSkillIds={craftedSkillIds} skillMods={skillMods} onStateSync={handleStateSync} initialHexas={hexas} initialMaterials={materials} customSkillDef={customSkillDef} />
       )}
 
       {/* Explore is never kept mounted — it always reflects whatever the
@@ -334,7 +343,7 @@ function App() {
         <div style={{minHeight:'100vh',background:'#0a0a0a',backgroundImage:'radial-gradient(circle at 50% 0%, rgba(0,200,255,0.06), transparent 60%)',color:'#b0dff4',fontFamily:"'Rajdhani','Share Tech Mono',sans-serif",display:'flex',flexDirection:'column'}}>
           <NavBar current={screen} onNavigate={goTo} onMenu={()=>goTo('start')} />
           {screen==='character'
-            ? <CharacterScreen characters={characters} craftedSkillIds={craftedSkillIds} activeCharacterId={activeCharacterId} campaignStarted={campaignStarted} liveState={liveState}
+            ? <CharacterScreen characters={characters} craftedSkillIds={craftedSkillIds} activeCharacterId={activeCharacterId} campaignStarted={campaignStarted} liveState={liveState} customSkillDef={customSkillDef}
                 onSaveCharacter={handleSaveCharacter} onDeleteCharacter={handleDeleteCharacter} onLaunchCampaign={handleLaunchCampaign} />
             : screen==='crafting'
             ? <CraftingScreen hexas={hexas} materials={materials} craftedSkillIds={craftedSkillIds} onLearnSkill={handleLearnSkill} campaignCompletedOnce={campaignCompletedOnce} customSkillUnlocked={!!liveState?.player?.customSkillUnlocked} skillMods={skillMods} battle1Cleared={battle1Cleared} onUpgradeSkillMod={handleUpgradeSkillMod} customSkillDef={customSkillDef} onSaveCustomSkill={handleSaveCustomSkill} />

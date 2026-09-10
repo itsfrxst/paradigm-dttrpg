@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { BATTLE_SKILLS, isSkillUnlocked } from './GridBattlerGame.jsx';
-import { SKILL_MOD_STATS, SKILL_MOD_GROUPS, MODIFIABLE_ELEMENTS, skillModTierCost, skillModMaxTier, MATERIALS } from './ItemData.jsx';
+import { SKILL_MOD_STATS, SKILL_MOD_GROUPS, MODIFIABLE_ELEMENTS, skillModTierCost, skillModMaxTier, MATERIALS, computeCustomSkillCreationCost } from './ItemData.jsx';
 
 // Recipe-specific info layered on top of a BATTLE_SKILLS entry — the parts
 // that matter for a "crafting bench" view (cost, and the stat breakdown
@@ -41,6 +41,7 @@ const CUSTOM_SKILL_MAX_AOE_TILES = 9; // matches Water Torrent's biggest (3x3 sp
 const CUSTOM_SKILL_MAX_RANGE = CUSTOM_SKILL_CASTER.y; // center-to-edge reach in any of the 8 directions
 const CUSTOM_SKILL_DAMAGE = { min: 10, max: 150, step: 10 }; // spans existing skills' base damage (Compass Slash 60 .. Air's top roll 180)
 const CUSTOM_SKILL_ARCHETYPES = [
+  { id:'melee', label:'Melee', icon:'✦', hint:'Strikes whoever is directly adjacent when cast -- no shape to design, cheapest option.' },
   { id:'aoe',   label:'AoE',   icon:'▦', hint:'Toggle tiles to build a hit footprint around your Proxie.' },
   { id:'range', label:'Range', icon:'➔', hint:'Pick a direction, then click how far out the skill reaches.' },
   { id:'warp',  label:'Warp',  icon:'⇝', hint:'Pick one tile to leap to and strike from, like Dark Web.' },
@@ -95,6 +96,7 @@ const describeEffectRule = (eff) => {
   return `IF ${cond} → ${t.icon} ${t.label}${t.hasMagnitude?` +${eff.magnitude}`:''}`;
 };
 const describeCustomShape = (def) => {
+  if(def.archetype==='melee') return 'Strikes whoever is directly adjacent to your Proxie';
   if(def.archetype==='aoe') return `${def.tiles.length} AoE tile${def.tiles.length>1?'s':''} around your Proxie`;
   if(def.archetype==='range'){
     const dir = CUSTOM_SKILL_DIRECTIONS.find(d=>d.id===(def.rangeDirection||'up'));
@@ -190,7 +192,7 @@ const EffectRule = ({ effect, rollDie, onChange, onRemove }) => {
 // The editor itself: archetype tabs, the board, a Damage slider, an Element
 // picker, and the Special Effects if/then rule list. `existing` pre-fills
 // every field when re-opening a saved design to edit it.
-const CustomSkillEditor = ({ existing, onSave }) => {
+const CustomSkillEditor = ({ existing, onSave, hexas, materials }) => {
   const [archetype, setArchetype] = useState(existing?.archetype || 'aoe');
   const [aoeTiles, setAoeTiles] = useState(existing?.tiles || []);
   const [rangeDirection, setRangeDirection] = useState(existing?.rangeDirection || 'up');
@@ -219,11 +221,27 @@ const CustomSkillEditor = ({ existing, onSave }) => {
   const updateEffect = (id, patch) => setEffects(prev => prev.map(e=>e.id===id?{...e,...patch}:e));
   const removeEffect = (id) => setEffects(prev => prev.filter(e=>e.id!==id));
 
-  const valid = (archetype==='aoe' ? aoeTiles.length>0 : archetype==='range' ? rangeLength>0 : !!warpTile) && name.trim().length>0;
+  const shapeValid = archetype==='aoe' ? aoeTiles.length>0 : archetype==='range' ? rangeLength>0 : archetype==='warp' ? !!warpTile : true;
+  const valid = shapeValid && name.trim().length>0;
   const activeArchetype = CUSTOM_SKILL_ARCHETYPES.find(a=>a.id===archetype);
 
+  // Live draft, in whatever shape computeCustomSkillCreationCost expects --
+  // kept even when `valid` is false so the cost preview still updates as you
+  // build, same idea as CustomSkillSummary reading a finished def.
+  const draftDef = {
+    archetype, damage, element: elementId, effects,
+    tiles: archetype==='aoe' ? aoeTiles : undefined,
+    length: archetype==='range' ? rangeLength : undefined,
+    moveCasterOnRange: archetype==='range' ? moveCasterOnRange : undefined,
+  };
+  const cost = computeCustomSkillCreationCost(draftDef);
+  const coreMat = cost.coreId ? MATERIALS.find(m=>m.id===cost.coreId) : null;
+  const coreOwned = cost.coreId ? (materials?.[cost.coreId] ?? 0) : 0;
+  const affordable = (hexas ?? 0) >= cost.hexas && (!cost.coreId || coreOwned >= cost.coreQty);
+  const canSave = valid && affordable;
+
   const handleSave = () => {
-    if(!valid) return;
+    if(!canSave) return;
     onSave({
       archetype, name: name.trim(), damage, element: elementId, rollDie, effects,
       tiles: archetype==='aoe' ? aoeTiles : undefined,
@@ -260,10 +278,13 @@ const CustomSkillEditor = ({ existing, onSave }) => {
         </div>
       )}
 
-      <CustomSkillBoard archetype={archetype} aoeTiles={aoeTiles} rangeDirection={rangeDirection} rangeLength={rangeLength} warpTile={warpTile}
-        onToggleAoeTile={toggleAoeTile} onSetRange={setRangeLength} onSetWarp={setWarpTile} />
+      {archetype!=='melee' && (
+        <CustomSkillBoard archetype={archetype} aoeTiles={aoeTiles} rangeDirection={rangeDirection} rangeLength={rangeLength} warpTile={warpTile}
+          onToggleAoeTile={toggleAoeTile} onSetRange={setRangeLength} onSetWarp={setWarpTile} />
+      )}
 
       <div style={{fontSize:10,color:'#7a9db5',textAlign:'center',marginBottom:archetype==='range'?8:16}}>
+        {archetype==='melee' && 'Strikes whoever is directly adjacent — no shape to design'}
         {archetype==='aoe' && `${aoeTiles.length} / ${CUSTOM_SKILL_MAX_AOE_TILES} tiles selected`}
         {archetype==='range' && `Reach: ${rangeLength} tile${rangeLength>1?'s':''} (${CUSTOM_SKILL_DIRECTIONS.find(d=>d.id===rangeDirection).label}, max ${CUSTOM_SKILL_MAX_RANGE})`}
         {archetype==='warp' && (warpTile ? 'Destination tile picked' : 'Pick a destination tile')}
@@ -313,8 +334,13 @@ const CustomSkillEditor = ({ existing, onSave }) => {
         )}
       </div>
 
-      <button onClick={handleSave} disabled={!valid}
-        style={{width:'100%',padding:11,background:valid?'rgba(155,108,255,0.18)':'rgba(20,30,40,0.6)',color:valid?'#9b6cff':'#2a4a5e',border:`1px solid ${valid?'#9b6cff':'#1e3a4a'}`,borderRadius:6,cursor:valid?'pointer':'not-allowed',fontSize:13,fontWeight:'bold',letterSpacing:'0.06em'}}>
+      <div style={{display:'flex',alignItems:'center',justifyContent:'center',gap:10,fontSize:11,color:affordable?'#7a9db5':'#ff6644',marginBottom:8}}>
+        <span style={{color:'#ffd700',fontWeight:'bold'}}>{cost.hexas} Hexas</span>
+        {cost.coreId && <span>+ {cost.coreQty} {coreMat?.icon} {coreMat?.name}{cost.coreQty>1?'s':''}</span>}
+        {!affordable && <span>— can't afford this design yet</span>}
+      </div>
+      <button onClick={handleSave} disabled={!canSave}
+        style={{width:'100%',padding:11,background:canSave?'rgba(155,108,255,0.18)':'rgba(20,30,40,0.6)',color:canSave?'#9b6cff':'#2a4a5e',border:`1px solid ${canSave?'#9b6cff':'#1e3a4a'}`,borderRadius:6,cursor:canSave?'pointer':'not-allowed',fontSize:13,fontWeight:'bold',letterSpacing:'0.06em'}}>
         {existing ? 'Save Changes' : 'Finalize Custom Skill'}
       </button>
     </div>
@@ -571,7 +597,8 @@ const CraftingScreen = ({ hexas, materials, craftedSkillIds, onLearnSkill, campa
             Design your own skill's shape, a Damage value, an Element, and any if/then Special Effects (Burn, Flood, Rubble, Knockback). It counts as a Core skill in the Modifier Panel above once saved.
           </div>
           {editingCustomSkill || !customSkillDef ? (
-            <CustomSkillEditor existing={customSkillDef} onSave={(def)=>{ onSaveCustomSkill(def); setEditingCustomSkill(false); }} />
+            <CustomSkillEditor existing={customSkillDef} hexas={hexas ?? 0} materials={materials}
+              onSave={(def)=>{ onSaveCustomSkill(def); setEditingCustomSkill(false); }} />
           ) : (
             <CustomSkillSummary def={customSkillDef} onEdit={()=>setEditingCustomSkill(true)} />
           )}

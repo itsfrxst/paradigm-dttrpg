@@ -8,7 +8,7 @@ import CraftingScreen from './CraftingScreen.jsx'
 import InventoryScreen from './InventoryScreen.jsx'
 import ExploreScreenOffline from './ExploreScreenOffline.jsx'
 import { storageGet, storageSet, debounce, mergeCounts } from './storage.js'
-import { skillModTierCost, skillModMaxTier, MODIFIABLE_ELEMENTS } from './ItemData.jsx'
+import { skillModTierCost, skillModMaxTier, MODIFIABLE_ELEMENTS, computeCustomSkillCreationCost } from './ItemData.jsx'
 
 // Trimmed mode/nav lists for the mobile Artifact build -- Training and
 // Gauntlet are cut (per the user's ask), leaving Campaign + Explore as the
@@ -162,8 +162,13 @@ function AppMobile() {
   },[hexas,materials,skillMods])
 
   const handleSaveCustomSkill = useCallback((def)=>{
+    const cost = computeCustomSkillCreationCost(def)
+    if(hexas < cost.hexas) return
+    if(cost.coreId && (materials[cost.coreId]||0) < cost.coreQty) return
+    setHexas(h => h - cost.hexas)
+    if(cost.coreId) setMaterials(m => ({...m, [cost.coreId]: (m[cost.coreId]||0) - cost.coreQty}))
     setCustomSkillDef(def)
-  },[])
+  },[hexas,materials])
 
   const handleLearnSkill = useCallback((skillId)=>{
     setCraftedSkillIds(prev => prev.includes(skillId) ? prev : [...prev, skillId])
@@ -208,7 +213,7 @@ function AppMobile() {
         <div style={{display: screen==='campaign' ? 'block' : 'none'}}>
           <GridBattlerGame campaign character={characters.find(c=>c?.id===activeCharacterId)} leaveSignal={campaignLeaveSignal}
             onCampaignComplete={handleCampaignComplete} onReturnToMenu={()=>setScreen('start')} onQuit={()=>handleCampaignComplete(false)} onBattleCleared={handleBattleCleared}
-            onStateSync={handleStateSync} craftedSkillIds={craftedSkillIds} skillMods={skillMods} initialHexas={hexas} initialMaterials={materials} />
+            onStateSync={handleStateSync} craftedSkillIds={craftedSkillIds} skillMods={skillMods} initialHexas={hexas} initialMaterials={materials} customSkillDef={customSkillDef} />
           <FloatingMenuButton onNavigate={goTo} items={MOBILE_FLOATING_ITEMS} />
         </div>
       )}
@@ -225,7 +230,7 @@ function AppMobile() {
         <div style={{minHeight:'100vh',background:'#0a0a0a',backgroundImage:'radial-gradient(circle at 50% 0%, rgba(0,200,255,0.06), transparent 60%)',color:'#b0dff4',fontFamily:"'Rajdhani','Share Tech Mono',sans-serif",display:'flex',flexDirection:'column'}}>
           <NavBar current={screen} onNavigate={goTo} onMenu={()=>goTo('start')} items={MOBILE_NAV_ITEMS} />
           {screen==='character'
-            ? <CharacterScreen characters={characters} craftedSkillIds={craftedSkillIds} activeCharacterId={activeCharacterId} campaignStarted={campaignStarted} liveState={liveState}
+            ? <CharacterScreen characters={characters} craftedSkillIds={craftedSkillIds} activeCharacterId={activeCharacterId} campaignStarted={campaignStarted} liveState={liveState} customSkillDef={customSkillDef}
                 onSaveCharacter={handleSaveCharacter} onDeleteCharacter={handleDeleteCharacter} onLaunchCampaign={handleLaunchCampaign} />
             : screen==='crafting'
             ? <CraftingScreen hexas={hexas} materials={materials} craftedSkillIds={craftedSkillIds} onLearnSkill={handleLearnSkill} campaignCompletedOnce={campaignCompletedOnce} customSkillUnlocked={!!liveState?.player?.customSkillUnlocked} skillMods={skillMods} battle1Cleared={battle1Cleared} onUpgradeSkillMod={handleUpgradeSkillMod} customSkillDef={customSkillDef} onSaveCustomSkill={handleSaveCustomSkill} />

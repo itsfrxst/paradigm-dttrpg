@@ -127,6 +127,54 @@ export const MODIFIABLE_ELEMENTS = [
   { id: 'Air',   name: 'Air',   icon: el.Air.icon,   color: el.Air.color,   coreId: 'airCore' },
 ];
 
+// ─── CUSTOM SYNTHESIS CREATION COST ──────────────────────────────────────
+// What it costs to actually finalize a Custom Synthesis design (see
+// CustomSkillEditor in GridBattlerGame.jsx) into a usable Core skill --
+// distinct from the Modifier Panel's ongoing Damage/Accuracy *investment*
+// on it afterward, which reuses skillModTierCost above unchanged (the
+// 'customSkill' id is already in SKILL_MOD_GROUPS.core). Every aspect of
+// the design adds to the price, same spirit as an existing skill costing
+// more per Modifier Panel tier: a bigger footprint, a longer reach, more
+// damage, more if/then rules, all cost more Hexas. Elemental designs pay a
+// flat Core tax instead of a Hexas surcharge; non-elemental designs pay the
+// Hexas surcharge instead, same "Core substitutes for extra Hexas" trade
+// already established for the 4 base elements. Re-saving an *existing*
+// design (Edit Design) charges the same full cost again for whatever the
+// new configuration costs -- simplest rule that can't be gamed by cheaply
+// unlocking the Core slot then redesigning into something bigger for free.
+export const CUSTOM_SKILL_ARCHETYPE_BASE_COST = {
+  melee: 100, // cheapest -- auto-targets whoever's adjacent, no shape to design
+  range: 150,
+  warp:  200,
+  aoe:   250, // priciest -- can hit the most targets at once
+};
+export const CUSTOM_SKILL_ENERGY_COST = { melee: 1, range: 2, warp: 2, aoe: 3 };
+export const CUSTOM_SKILL_CORE_COST = 10; // flat, elemental designs only
+export const CUSTOM_SKILL_NON_ELEMENTAL_SURCHARGE = 1.5; // Hexas multiplier when there's no Core cost to offset it
+const CUSTOM_SKILL_COST_PER_DAMAGE_TIER = 15; // per +10 of authored Damage
+const CUSTOM_SKILL_COST_PER_AOE_TILE = 20;
+const CUSTOM_SKILL_COST_PER_RANGE_TILE = 25;
+const CUSTOM_SKILL_COST_PER_EFFECT_RULE = 40;
+const CUSTOM_SKILL_MOVE_ON_RANGE_COST = 60;
+
+// Returns { hexas, coreId, coreQty } for finalizing `def` (a CustomSkillEditor
+// draft) as-is. `coreId`/`coreQty` are null/0 for a non-elemental design.
+export const computeCustomSkillCreationCost = (def) => {
+  const archetypeBase = CUSTOM_SKILL_ARCHETYPE_BASE_COST[def.archetype] ?? CUSTOM_SKILL_ARCHETYPE_BASE_COST.melee;
+  const damageTiers = Math.round((def.damage || 0) / 10);
+  let hexas = archetypeBase
+    + damageTiers * CUSTOM_SKILL_COST_PER_DAMAGE_TIER
+    + (def.effects?.length || 0) * CUSTOM_SKILL_COST_PER_EFFECT_RULE;
+  if (def.archetype === 'aoe') hexas += (def.tiles?.length || 0) * CUSTOM_SKILL_COST_PER_AOE_TILE;
+  if (def.archetype === 'range') {
+    hexas += (def.length || 0) * CUSTOM_SKILL_COST_PER_RANGE_TILE;
+    if (def.moveCasterOnRange) hexas += CUSTOM_SKILL_MOVE_ON_RANGE_COST;
+  }
+  const coreId = def.element ? MODIFIABLE_ELEMENTS.find(e => e.id === def.element)?.coreId ?? null : null;
+  if (!coreId) hexas = Math.round(hexas * CUSTOM_SKILL_NON_ELEMENTAL_SURCHARGE);
+  return { hexas, coreId, coreQty: coreId ? CUSTOM_SKILL_CORE_COST : 0 };
+};
+
 // ─── BATTLE ACQUISITION ──────────────────────────────────────────────────
 // Campaign enemy rank doubles as a drop-odds tier, same as it doubles as an
 // HP tier (see RANK_HP in GridBattlerGame.jsx). Every Campaign enemy always

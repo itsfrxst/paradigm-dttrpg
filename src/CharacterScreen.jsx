@@ -1,5 +1,13 @@
 import React, { useState } from 'react';
-import { CharacterCreatorForm, BATTLE_SKILLS, ELEMENTS, getXPThreshold } from './GridBattlerGame.jsx';
+import { CharacterCreatorForm, BATTLE_SKILLS, ELEMENTS, getXPThreshold, customSkillEntry } from './GridBattlerGame.jsx';
+
+// A character's loadout can include 'customSkill' -- not a BATTLE_SKILLS
+// entry, so it needs `customSkillDef` (the player's saved design) to resolve
+// to a displayable {icon,name,color}, same synthetic-entry trick GridBattlerGame
+// itself uses for the in-battle action bar.
+const resolveLoadoutMeta = (loadout, customSkillDef) => loadout
+  .map(id => id==='customSkill' && customSkillDef ? customSkillEntry(customSkillDef) : BATTLE_SKILLS.find(s=>s.id===id))
+  .filter(Boolean);
 
 const MAX_CHARACTER_SLOTS = 3;
 
@@ -29,9 +37,9 @@ const EmptySlotCard = ({ onCreate }) => (
 // liveState (the same onStateSync mirror the old Gauntlet-only version of
 // this screen used) instead of the static saved build, since HP/level/XP
 // only exist once a session is actually live.
-const ActiveSlotCard = ({ character, liveState, onOpen }) => {
+const ActiveSlotCard = ({ character, liveState, customSkillDef, onOpen }) => {
   const player = liveState?.player;
-  const loadoutMeta = (liveState?.loadout || character.loadout).map(id=>BATTLE_SKILLS.find(s=>s.id===id)).filter(Boolean);
+  const loadoutMeta = resolveLoadoutMeta(liveState?.loadout || character.loadout, customSkillDef);
   return (
     <div style={{background:'rgba(10,18,28,0.92)',border:'1px solid #00c8ff',borderRadius:10,padding:'16px 18px',boxShadow:'0 0 16px rgba(0,200,255,0.15)'}}>
       <div style={{display:'flex',alignItems:'center',gap:10,marginBottom:10}}>
@@ -69,8 +77,8 @@ const ActiveSlotCard = ({ character, liveState, onOpen }) => {
 // Campaign, locking this loadout/element in for the run), edit it, or
 // delete it. Launch is disabled while a *different* character is already
 // mid-run, since only one Campaign session can exist at a time.
-const SavedSlotCard = ({ character, launchDisabled, onLaunch, onEdit, onDelete }) => {
-  const loadoutMeta = character.loadout.map(id=>BATTLE_SKILLS.find(s=>s.id===id)).filter(Boolean);
+const SavedSlotCard = ({ character, launchDisabled, customSkillDef, onLaunch, onEdit, onDelete }) => {
+  const loadoutMeta = resolveLoadoutMeta(character.loadout, customSkillDef);
   const elMeta = ELEMENTS.base[character.element];
   return (
     <div style={{background:'rgba(10,18,28,0.9)',border:'1px solid #1e3a4a',borderRadius:10,padding:'16px 18px'}}>
@@ -109,7 +117,7 @@ const SavedSlotCard = ({ character, launchDisabled, onLaunch, onEdit, onDelete }
 // GridBattlerGame.jsx); App.jsx routes any attempt to start a new run
 // through this screen instead, so a build always exists before the first
 // battle does.
-const CharacterScreen = ({ characters, craftedSkillIds=[], activeCharacterId, campaignStarted, liveState, onSaveCharacter, onDeleteCharacter, onLaunchCampaign }) => {
+const CharacterScreen = ({ characters, craftedSkillIds=[], activeCharacterId, campaignStarted, liveState, customSkillDef, onSaveCharacter, onDeleteCharacter, onLaunchCampaign }) => {
   const [editingSlot, setEditingSlot] = useState(null);
 
   if(editingSlot!==null){
@@ -123,6 +131,7 @@ const CharacterScreen = ({ characters, craftedSkillIds=[], activeCharacterId, ca
         <CharacterCreatorForm
           initial={existing}
           craftedSkillIds={craftedSkillIds}
+          customSkillDef={customSkillDef}
           submitLabel={existing ? 'Save Changes' : 'Create Character'}
           onSubmit={(data)=>{ onSaveCharacter(editingSlot, data); setEditingSlot(null); }}
           onCancel={()=>setEditingSlot(null)}
@@ -146,10 +155,11 @@ const CharacterScreen = ({ characters, craftedSkillIds=[], activeCharacterId, ca
           const character = characters[i];
           if(!character) return <EmptySlotCard key={i} onCreate={()=>setEditingSlot(i)} />;
           const isActive = campaignStarted && character.id===activeCharacterId;
-          if(isActive) return <ActiveSlotCard key={i} character={character} liveState={liveState} onOpen={()=>onLaunchCampaign(character.id)} />;
+          if(isActive) return <ActiveSlotCard key={i} character={character} liveState={liveState} customSkillDef={customSkillDef} onOpen={()=>onLaunchCampaign(character.id)} />;
           return (
             <SavedSlotCard key={i} character={character}
               launchDisabled={campaignStarted}
+              customSkillDef={customSkillDef}
               onLaunch={()=>onLaunchCampaign(character.id)}
               onEdit={()=>setEditingSlot(i)}
               onDelete={()=>onDeleteCharacter(i)}
