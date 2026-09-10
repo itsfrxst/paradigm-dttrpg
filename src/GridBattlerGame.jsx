@@ -125,14 +125,22 @@ const rollD100 = () => Math.floor(Math.random() * 100) + 1;
 // whiff accuracy" gut-punch — clearing 79 gives full damage, and even a poor
 // roll floors at quarter rather than as low as 10%.
 //   roll >= 79  -> full damage
-//   40..78      -> half  (rounded down)
-//   < 40        -> quarter (rounded down)
-// Applies to both player and enemy (all damage routes through here).
+//   40..78      -> half  (rounded to the nearest 10)
+//   < 40        -> quarter (rounded to the nearest 10)
+// Every base damage value already lands on a multiple of 10 at full
+// accuracy (Fire/Earth/Air/Water's own dice formulas are all multiples of
+// 20), but half/quarter used to floor() straight off the raw fraction,
+// which produces an odd number (e.g. 70 -> 35 -> 17) whenever the base
+// isn't itself a multiple of 40. Rounding to the nearest 10 here instead
+// keeps every possible result -- at any tier, for any skill -- a clean
+// base-10 number, without having to retune each skill's own base damage
+// constant individually. Applies to both player and enemy (all damage
+// routes through here).
 const ACCURACY_FULL = 79, ACCURACY_HALF = 40;
 const applyAccuracy = (base, roll) => {
   if(roll >= ACCURACY_FULL) return base;
-  if(roll >= ACCURACY_HALF) return Math.floor(base * 0.5);
-  return Math.floor(base * 0.25);
+  const raw = roll >= ACCURACY_HALF ? base * 0.5 : base * 0.25;
+  return Math.round(raw / 10) * 10;
 };
 // Label for a given accuracy roll's tier (for combat-log clarity).
 const accuracyTierLabel = (roll) => roll>=ACCURACY_FULL ? 'full' : roll>=ACCURACY_HALF ? 'half' : 'quarter';
@@ -5269,25 +5277,6 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
     applySkillResultMulti(target, dmg, updatedPlayer, extra, ELEMENTS.base.Air.color);
   },[diceRolls,lockedRoll,player,tiles,obstacles,enemies,summons,dmgBonus,accBonus,addLog,resetDiceModal,applySkillResultMulti]);
 
-  const handleWaterApplyWithAccuracyMulti = useCallback((acc)=>{
-    const origin=lockedRoll.origin;
-    const dieRoll=diceRolls[0].value;
-    const res=resolveTorrent(dieRoll);
-    const anchor=getTorrentAnchor(origin.boardPosition,origin.facing);
-    const footprint=getTorrentFootprint(anchor,waterAoe);
-    const strikeables=[...enemies, ...summons.filter(s=>s.side==='enemy')];
-    const target = strikeables.find(u=>footprint.some(t=>t.x===u.boardPosition.x&&t.y===u.boardPosition.y));
-    const tileBoost=getTileBoost(tiles,origin.boardPosition,'Water');
-    const dmg=target?Math.round((applyAccuracy(res.damage,acc)+tileBoost)*(1+accBonus('Water')))+dmgBonus('Water'):0;
-    const cost=TORRENT_AOE_COST[waterAoe];
-    const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
-    const flooded=dieRoll>=10;
-    if(flooded) setTiles(prev=>{ const g=prev.map(r=>r.slice()); footprint.forEach(ft=>{ g[ft.y][ft.x]=TILE_TYPES.WATER_BOOST; }); return g; });
-    addLog(`Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[waterAoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${target?dmg+' dmg'+(tileBoost>0?' [Water tile +20]':''):'MISS (no enemy in blast)'}${flooded?' [Flood]':''}`);
-    resetDiceModal();
-    applySkillResultMulti(target, dmg, updatedPlayer, {}, ELEMENTS.base.Water.color);
-  },[diceRolls,lockedRoll,player,tiles,waterAoe,enemies,summons,dmgBonus,accBonus,addLog,resetDiceModal,applySkillResultMulti]);
-
   // ── Compass Slash / Dark Web targeting resolution ──
   const deployTilesMulti = getDeployTiles(tiles, player.boardPosition, enemies.map(e=>e.boardPosition), [...summons, ...obstacles]);
   const canDeployMulti = canCircuitSigil && summons.filter(s=>s.side==='player'&&!s.promoted).length < BANDWIDTH && deployTilesMulti.length > 0;
@@ -5401,6 +5390,40 @@ export default function GridBattlerGame({ onStateSync, scene, onSceneComplete, c
       return acc;
     },[]));
   },[addLog]);
+
+  // ── WATER TORRENT — Campaign ── (moved below resolveMultiHitKills /
+  // applyAoeDamageToSummons since it depends on both -- referencing a
+  // useCallback's own dependency array before that const is declared throws
+  // a TDZ error even though the callback body itself wouldn't run until later)
+  const handleWaterApplyWithAccuracyMulti = useCallback((acc)=>{
+    const origin=lockedRoll.origin;
+    const dieRoll=diceRolls[0].value;
+    const res=resolveTorrent(dieRoll);
+    const anchor=getTorrentAnchor(origin.boardPosition,origin.facing);
+    const footprint=getTorrentFootprint(anchor,waterAoe);
+    const tileBoost=getTileBoost(tiles,origin.boardPosition,'Water');
+    const dmg=Math.round((applyAccuracy(res.damage,acc)+tileBoost)*(1+accBonus('Water')))+dmgBonus('Water');
+    const cost=TORRENT_AOE_COST[waterAoe];
+    const updatedPlayer={...player,actionpts:Math.max(0,player.actionpts-cost),skillUsed:true};
+    const flooded=dieRoll>=10;
+    if(flooded) setTiles(prev=>{ if(prev[anchor.y][anchor.x]===TILE_TYPES.WATER_BOOST) return prev; const g=prev.map(r=>r.slice()); g[anchor.y][anchor.x]=TILE_TYPES.WATER_BOOST; return g; });
+    // Every enemy AND enemy summon standing anywhere in the footprint takes
+    // the hit, not just the first one found -- a cross or 3x3 spread that
+    // catches multiple units is supposed to hit all of them (see
+    // resolvePulseWaveMulti/resolvePiercingLightMulti for the same pattern).
+    const hitIds = new Set(enemies.filter(e=>footprint.some(t=>t.x===e.boardPosition.x&&t.y===e.boardPosition.y)).map(e=>e.id));
+    const hitSummons = summons.filter(s=>s.side==='enemy' && footprint.some(t=>t.x===s.boardPosition.x&&t.y===s.boardPosition.y));
+    const totalHits=hitIds.size+hitSummons.length;
+    addLog(`Torrent [d20=${dieRoll}, ${res.damage} dmg, ${AOE_LABEL[waterAoe]}, ${acc}% (${accuracyTierLabel(acc)})] -> ${totalHits>0?`${dmg} dmg to ${totalHits} target${totalHits>1?'s':''}`+(tileBoost>0?' [Water tile +20]':''):'MISS (no enemy in blast)'}${flooded?' [Flood]':''}`);
+    resetDiceModal();
+    if(totalHits===0){ routeAfterPlayerActionMulti(updatedPlayer, enemies); return; }
+    enemies.forEach(e=>{ if(hitIds.has(e.id)) triggerCastFx(e.boardPosition, ELEMENTS.base.Water.color); });
+    hitSummons.forEach(s=>triggerCastFx(s.boardPosition, ELEMENTS.base.Water.color));
+    applyAoeDamageToSummons(hitSummons, dmg);
+    if(hitIds.size===0){ routeAfterPlayerActionMulti(updatedPlayer, enemies); return; }
+    const damaged = enemies.map(e=>hitIds.has(e.id)?{...e,health:Math.max(0,e.health-dmg)}:e);
+    resolveMultiHitKills(hitIds, damaged, updatedPlayer, 'Torrent');
+  },[diceRolls,lockedRoll,player,tiles,waterAoe,enemies,summons,dmgBonus,accBonus,addLog,resetDiceModal,routeAfterPlayerActionMulti,applyAoeDamageToSummons,resolveMultiHitKills,triggerCastFx]);
 
   // ── PULSE WAVE (Tactical Skill) — Campaign ──
   const resolvePulseWaveMulti = useCallback((targetTile)=>{
